@@ -1,0 +1,6 @@
+id: "scenario_001"
+name: "Example full closure"
+description: "Example: remove links by id"
+changes:
+  - type: "remove_links"
+    link_ids: [123, 456]

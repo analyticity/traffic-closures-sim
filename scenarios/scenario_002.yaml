@@ -1,0 +1,7 @@
+id: "scenario_002"
+name: "Example capacity reduction"
+description: "Example: reduce capacity on selected links"
+changes:
+  - type: "capacity_reduction"
+    link_ids: [789]
+    factor: 0.4   # new_capacity = old_capacity * factor

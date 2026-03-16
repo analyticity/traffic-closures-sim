@@ -6,8 +6,9 @@ crs_epsg: 5514
 osm:
   place_name: "Brno, Czechia"
 
-# Síť – výstupní adresáře
+# Síť
 network:
+  experiment_profile: "motorway_push"
   output_dir: "outputs/baseline/network"
   maps_dir: "outputs/baseline/maps"
 
@@ -18,22 +19,29 @@ zoning:
       admin_level: "9"
     - place: "Okres Brno-venkov, Czechia"
       admin_level: "9"
+
   zone_area_filter:
     enabled: true
     rel_factor: 10
     abs_max_km2: 250
-  pre_filter:
-    enabled: false
-    reference: "both"
-    max_distance_m: 2500
-  fallback:
-    enabled: false
-    min_area_m2: 8000
-  max_connectors: 4
-  max_distance_m: 30000
+
+  max_connectors: 6
+  max_distance_m: 3000
+  connector_speed_kmh: 20
+  connector_capacity_vph: 2000
+  connector_lanes: 1
+  connector_access_penalty_s: 300
+
   cache_file: "data/zones/zones.gpkg"
   output_dir: "outputs/baseline/zones"
   map_dpi: 250
+
+  external_gateways:
+    enabled: true
+    zone_offset_m: 4000
+    zone_size_m: 800
+    connectors_per_gateway: 2
+    candidate_outer_quantile: 0.90
 
 # OD matice
 demand:
@@ -41,9 +49,11 @@ demand:
   matrix_name: "demand"
   output_dir: "outputs/baseline/demand"
 
+  use_gateway_fallback_in_commuting: true
+
   sldb:
     include_lokalizace: ["0_na_adrese_OP", "1_meziobecni"]
-    only_internal_pairs: true
+    only_internal_pairs: false
 
   conversion:
     work:
@@ -54,6 +64,44 @@ demand:
       car_share: 0.25
       occupancy: 1.30
       trips_per_person: 2.0
+
+  gateways:
+    - name: "D1_north"
+      direction_deg: 340
+      angle_range: [300, 20]
+    - name: "D2_east"
+      direction_deg: 80
+      angle_range: [50, 110]
+    - name: "D52_south"
+      direction_deg: 200
+      angle_range: [170, 230]
+    - name: "I43_northwest"
+      direction_deg: 330
+      angle_range: [295, 340]
+    - name: "I50_east"
+      direction_deg: 90
+      angle_range: [60, 120]
+    - name: "I41_south"
+      direction_deg: 190
+      angle_range: [160, 210]
+    - name: "I23_west"
+      direction_deg: 260
+      angle_range: [230, 295]
+
+  segments:
+    other:
+      source: "gravity"
+      trip_rate: 1.5
+      car_share: 0.45
+      occupancy: 1.40
+
+    external:
+      source: "gateway_gravity"
+      total_daily_trips: 150000
+      through_share: 0.35
+
+  distribution:
+    enabled: false
 
   time_slices:
     periods: ["am", "ip", "pm", "ev"]
@@ -67,25 +115,43 @@ demand:
 
 # Kalibrace a validace
 calibration:
-  # Assignment parametry
   algorithm: "bfw"
   max_iter: 100
   rgap_target: 0.001
   core_name: "wd_daily"
-  match_buffer_m: 50.0
 
-  # Iterativní kalibrace
+  match_buffer_m: 50.0
+  match_direction_aware: false
+  match_conflict_resolution: "nearest"
+  count_target: "car_only"
+  aggregate_corridor: false
+  save_skims: true
+
   max_iterations: 10
   convergence:
     geh_lt5_target_pct: 85.0
-    min_improvement_pct: 1.0
+    min_improvement_pct: 0.1
+
   scaling:
     method: "global"
     damping: 0.3
     min_factor: 0.7
-    max_factor: 1.5
+    max_factor: 1.3
+    sectors:
+      n_sectors: 5
 
-# Datové sady (vstupní + kalibrační + validační)
+  screenlines_path: "config/screenlines.yaml"
+
+  journey_time_validation:
+    enabled: false
+
+  supply_tuning:
+    enabled: false
+
+  period_calibration:
+    enabled: false
+
+# Datové sady
 datasets:
   enabled: true
   root_dir: "data/sources"
@@ -115,7 +181,6 @@ datasets:
       filter:
         enabled: true
         origin:
-          # Sloupce v CSU dojížďka CSV: op_okres (okres bydliště), op_orp (ORP bydliště)
           keep_if_any_matches:
             - field: "op_okres"
               values: ["Brno-město", "Brno-venkov"]
@@ -133,6 +198,9 @@ datasets:
       output:
         format: "geojson"
         out_epsg: 5514
+      units:
+        car_24_multiplier: 1000
+        truc_24_multiplier: 1000
       query:
         where: "1=1"
         out_fields: ["*"]
@@ -154,6 +222,18 @@ datasets:
         area_filter:
           enabled: true
           region_hint: "Jihomoravský kraj"
+
+    population_sldb2021:
+      enabled: true
+      provider: "http_file"
+      url: "https://csu.gov.cz/docs/107508/79c509a0-261c-b4dd-d58d-c05955a24a2c/sldb2021_pohlavi.csv"
+      out_path: "data/sources/csu/sldb2021/populace_pohlavi.csv"
+      format:
+        type: "csv"
+        delimiter: ","
+        encoding: "utf-8"
+      usage:
+        socioeconomic: "population_per_zone"
 
 # REST API
 api:

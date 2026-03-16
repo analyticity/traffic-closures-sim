@@ -153,12 +153,17 @@ def arcgis_query_geojson(
     offset = 0
     page_size = 2000
 
+    # GeoJSON (RFC 7946) requires WGS84 coordinates. Always request EPSG:4326
+    # from ArcGIS regardless of config out_epsg. Reprojection to the target
+    # CRS happens after loading in GeoPandas where CRS metadata is correct.
+    query_sr = 4326
+
     params_common = {
         "f": "geojson",
         "where": where,
         "outFields": ",".join(out_fields) if out_fields else "*",
         "returnGeometry": "true",
-        "outSR": str(out_epsg),
+        "outSR": str(query_sr),
         "resultRecordCount": str(page_size),
     }
     if bbox_wgs84 is not None:
@@ -202,6 +207,45 @@ def arcgis_query_geojson(
     return {"type": "FeatureCollection", "features": all_features}
 
 
+def _load_aoi_bbox_wgs84(cfg: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    """Load AOI bounding box in WGS84 from config or generated files.
+
+    Priority: 1) explicit model_bbox in config, 2) zones/model_area.geojson,
+    3) maps/model_bbox_wgs84.geojson.
+    """
+    mb = cfg.get("model_bbox")
+    if mb and len(mb) == 4 and None not in mb:
+        return tuple(float(x) for x in mb)
+
+    zones_dir = Path(cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones"))
+    aoi_path = zones_dir / "model_area.geojson"
+    if aoi_path.exists():
+        try:
+            g = gpd.read_file(aoi_path)
+            if g.crs is not None and g.crs.to_epsg() != 4326:
+                g = g.to_crs(epsg=4326)
+            elif g.crs is None:
+                g = g.set_crs(epsg=4326)
+            bounds = tuple(float(x) for x in g.total_bounds)
+            print(f"  AOI bbox loaded from {aoi_path}: {bounds}")
+            return bounds
+        except Exception:
+            pass
+
+    maps_dir = Path(cfg.get("network", {}).get("maps_dir", "outputs/baseline/maps"))
+    mb_path = maps_dir / "model_bbox_wgs84.geojson"
+    if mb_path.exists():
+        try:
+            g = gpd.read_file(mb_path)
+            bounds = tuple(float(x) for x in g.total_bounds)
+            print(f"  AOI bbox loaded from {mb_path}: {bounds}")
+            return bounds
+        except Exception:
+            pass
+
+    return None
+
+
 def fetch_arcgis_feature_service(
     cfg: Dict[str, Any],
     source_cfg: Dict[str, Any],
@@ -228,9 +272,7 @@ def fetch_arcgis_feature_service(
     bbox = None
     geometry_clip = (query_cfg.get("geometry_clip") or {})
     if geometry_clip.get("enabled", False) and geometry_clip.get("use_aoi", False):
-        w, s, e, n = cfg.get("model_bbox", [None, None, None, None])
-        if None not in (w, s, e, n):
-            bbox = (float(w), float(s), float(e), float(n))
+        bbox = _load_aoi_bbox_wgs84(cfg)
 
     geojson = arcgis_query_geojson(
         service_url,
@@ -308,6 +350,201 @@ def preprocess_csd2020_xlsx(xlsx_path: Path, out_parquet: Path) -> Dict[str, Any
     return {"parquet": str(out_parquet), "summary": str(summary_path), **summary}
 
 
+_MC_TO_KU: Dict[str, List[str]] = {
+    "Brno-střed": ["Město Brno", "Staré Brno", "Veveří", "Pisárky", "Stránice",
+                    "Zábrdovice", "Trnitá", "Štýřice"],
+    "Brno-Žabovřesky": ["Žabovřesky"],
+    "Brno-Královo Pole": ["Královo Pole", "Ponava", "Sadová"],
+    "Brno-sever": ["Husovice", "Černá Pole", "Lesná", "Soběšice"],
+    "Brno-Židenice": ["Židenice"],
+    "Brno-Černovice": ["Černovice"],
+    "Brno-jih": ["Komárov", "Horní Heršpice", "Dolní Heršpice", "Přízřenice"],
+    "Brno-Bohunice": ["Bohunice"],
+    "Brno-Starý Lískovec": ["Starý Lískovec"],
+    "Brno-Nový Lískovec": ["Nový Lískovec"],
+    "Brno-Kohoutovice": ["Kohoutovice"],
+    "Brno-Jundrov": ["Jundrov"],
+    "Brno-Bystrc": ["Bystrc"],
+    "Brno-Kníničky": ["Kníničky"],
+    "Brno-Komín": ["Komín"],
+    "Brno-Medlánky": ["Medlánky"],
+    "Brno-Řečkovice a Mokrá Hora": ["Řečkovice", "Mokrá Hora"],
+    "Brno-Maloměřice a Obřany": ["Maloměřice", "Obřany"],
+    "Brno-Líšeň": ["Líšeň"],
+    "Brno-Slatina": ["Slatina"],
+    "Brno-Tuřany": ["Tuřany", "Brněnské Ivanovice", "Holásky", "Dvorska"],
+    "Brno-Chrlice": ["Chrlice"],
+    "Brno-Bosonohy": ["Bosonohy"],
+    "Brno-Ivanovice": ["Ivanovice"],
+    "Brno-Žebětín": ["Žebětín"],
+    "Brno-Jehnice": ["Jehnice"],
+    "Brno-Útěchov": ["Útěchov u Brna"],
+    "Brno-Ořešín": ["Ořešín"],
+}
+
+
+def preprocess_population_sldb2021(
+    csv_path: Path,
+    out_parquet: Path,
+    zones_geojson: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Parse CSU population CSV → zone_population.parquet.
+
+    Maps Brno městské části to katastrální území (our zones) using
+    the _MC_TO_KU table and distributes MC population proportionally
+    by zone polygon area.  Outer-Brno zones are matched by name.
+    """
+    import difflib
+    import unicodedata
+
+    def _norm(s: str) -> str:
+        s = unicodedata.normalize("NFKD", str(s).strip())
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
+        return s.lower().strip()
+
+    df = pd.read_csv(csv_path)
+    total = df[df["pohlavi_kod"].isna()].copy()
+    total["hodnota"] = pd.to_numeric(total["hodnota"], errors="coerce").fillna(0).astype(int)
+    total["nazev"] = total["uzemi_txt"].astype(str).str.strip()
+
+    # Build MC population lookup  {normalized_mc_name: population}
+    brno_mc = total[
+        (total["uzemi_cis"] == 44) & total["nazev"].str.startswith("Brno")
+    ]
+    mc_pop: Dict[str, int] = {}
+    for _, r in brno_mc.iterrows():
+        mc_pop[str(r["nazev"]).strip()] = int(r["hodnota"])
+
+    # Obce (uzemi_cis=43), de-duplicated by name
+    obce = total[total["uzemi_cis"] == 43][["uzemi_kod", "nazev", "hodnota"]].copy()
+    obce = obce.sort_values("hodnota", ascending=False).drop_duplicates(subset="nazev", keep="first")
+    obec_pop: Dict[str, int] = {str(r["nazev"]).strip(): int(r["hodnota"]) for _, r in obce.iterrows()}
+    obec_norm: Dict[str, str] = {_norm(k): k for k in obec_pop}
+
+    if not (zones_geojson and zones_geojson.exists()):
+        print("  [population] zones.geojson not found — saving raw CSU data")
+        rows = [{"zone_id": 0, "zone_name": n, "population": p, "match": "no_zones"}
+                for n, p in {**mc_pop, **obec_pop}.items()]
+        result = pd.DataFrame(rows)
+        _ensure_dir(out_parquet.parent)
+        result.to_parquet(out_parquet, index=False)
+        return {"parquet": str(out_parquet), "zones_total": len(rows),
+                "matched": 0, "total_population": int(result["population"].sum())}
+
+    import geopandas as gpd
+    zones = gpd.read_file(zones_geojson)
+
+    # Invert MC_TO_KU → {norm(ku_name): mc_name}
+    ku_to_mc: Dict[str, str] = {}
+    for mc_name, ku_list in _MC_TO_KU.items():
+        for ku in ku_list:
+            ku_to_mc[_norm(ku)] = mc_name
+
+    # Pre-compute zone areas in metric CRS for proportional distribution
+    zones_m = zones.to_crs(epsg=5514)
+    zone_area: Dict[int, float] = {
+        int(r["zone_id"]): r.geometry.area for _, r in zones_m.iterrows()
+    }
+
+    # Group our zones by MC (for area-proportional split)
+    mc_zone_ids: Dict[str, list] = {}
+    zone_mc_map: Dict[int, str] = {}
+    for _, zrow in zones.iterrows():
+        zid = int(zrow["zone_id"])
+        znorm = _norm(str(zrow["name"]))
+        if znorm in ku_to_mc:
+            mc = ku_to_mc[znorm]
+            mc_zone_ids.setdefault(mc, []).append(zid)
+            zone_mc_map[zid] = mc
+
+    # Sanity check: MC→KÚ coverage
+    max_zone_mc_share = 0.70
+    for mc_name, expected_kus in _MC_TO_KU.items():
+        expected_set = {_norm(ku) for ku in expected_kus}
+        found_set = set()
+        for zid in mc_zone_ids.get(mc_name, []):
+            zrow = zones[zones["zone_id"] == zid]
+            if not zrow.empty:
+                found_set.add(_norm(str(zrow.iloc[0]["name"])))
+        missing = expected_set - found_set
+        if missing:
+            print(f"  [population] WARNING: MC '{mc_name}': missing KÚ: {missing} "
+                  f"({len(missing)}/{len(expected_set)})")
+
+    result_rows = []
+    for _, zrow in zones.iterrows():
+        zid = int(zrow["zone_id"])
+        zname = str(zrow["name"])
+        znorm = _norm(zname)
+
+        # Path 1: Zone is a KÚ within a Brno MC → area-proportional split
+        if zid in zone_mc_map:
+            mc = zone_mc_map[zid]
+            mc_total = mc_pop.get(mc, 0)
+            siblings = mc_zone_ids.get(mc, [zid])
+            n_expected = len(_MC_TO_KU.get(mc, []))
+            n_found = len(siblings)
+
+            total_area = sum(zone_area.get(s, 1.0) for s in siblings)
+            share = zone_area.get(zid, 1.0) / max(total_area, 1.0)
+
+            # When siblings are missing, scale down the total to avoid inflation
+            coverage = n_found / max(n_expected, 1)
+            effective_mc_total = mc_total * min(coverage, 1.0)
+
+            pop = max(1, int(effective_mc_total * share))
+
+            # Cap: no single zone should exceed max_zone_mc_share of MC total
+            cap = max(1, int(mc_total * max_zone_mc_share))
+            if pop > cap and n_found > 1:
+                pop = cap
+                print(f"  [population] CAPPED: zone '{zname}' (MC {mc}) "
+                      f"from {int(effective_mc_total * share)} to {cap}")
+
+            result_rows.append({"zone_id": zid, "zone_name": zname,
+                                "population": pop, "match": f"mc_area:{mc}"})
+            continue
+
+        # Path 2: Direct name match against obce
+        if znorm in obec_norm:
+            orig = obec_norm[znorm]
+            result_rows.append({"zone_id": zid, "zone_name": zname,
+                                "population": obec_pop[orig], "match": "obec_exact"})
+            continue
+
+        # Path 3: Try stripping common suffixes ("u Brna", "nad Svitavou")
+        for suffix in [" u brna", " nad svitavou"]:
+            stripped = znorm.replace(suffix, "")
+            if stripped in obec_norm:
+                orig = obec_norm[stripped]
+                result_rows.append({"zone_id": zid, "zone_name": zname,
+                                    "population": obec_pop[orig], "match": f"obec_strip:{orig}"})
+                break
+        else:
+            # Path 4: Fuzzy match
+            close = difflib.get_close_matches(znorm, list(obec_norm.keys()), n=1, cutoff=0.7)
+            if close:
+                orig = obec_norm[close[0]]
+                result_rows.append({"zone_id": zid, "zone_name": zname,
+                                    "population": obec_pop[orig], "match": f"fuzzy:{orig}"})
+            else:
+                avg = int(mc_pop.get("Brno-střed", 70000) / 8)
+                result_rows.append({"zone_id": zid, "zone_name": zname,
+                                    "population": avg, "match": "default_avg"})
+
+    result = pd.DataFrame(result_rows)
+    _ensure_dir(out_parquet.parent)
+    result.to_parquet(out_parquet, index=False)
+
+    matched = len([r for r in result_rows if r["match"] != "default_avg"])
+    total_pop = int(result["population"].sum())
+    print(f"  [population] {matched}/{len(result_rows)} zones matched, total pop={total_pop:,}")
+    for r in result_rows:
+        print(f"    {r['zone_name']:30s}  pop={r['population']:>6d}  ({r['match']})")
+    return {"parquet": str(out_parquet), "zones_total": len(result_rows),
+            "matched": matched, "total_population": total_pop}
+
+
 def run_fetch_datasets(
     config_path: str | Path = "config/sim.yaml",
     force: bool = False,
@@ -352,6 +589,13 @@ def run_fetch_datasets(
             if fmt == "xlsx":
                 out_parquet = cache_dir / f"{_slug(out_path.stem)}.parquet"
                 info["preprocess"] = preprocess_csd2020_xlsx(out_path, out_parquet)
+
+            usage = scfg.get("usage") or {}
+            if usage.get("socioeconomic") == "population_per_zone":
+                zoning_dir = Path(cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones"))
+                zones_geojson = zoning_dir / "zones.geojson"
+                out_parquet = cache_dir / "zone_population.parquet"
+                info["preprocess"] = preprocess_population_sldb2021(out_path, out_parquet, zones_geojson)
 
             manifest["sources"][key] = info
             continue

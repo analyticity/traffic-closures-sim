@@ -1,0 +1,35 @@
+# Screenline / cordon / radial definitions for localized calibration.
+#
+# Three specification methods per screenline:
+#   1. Explicit link IDs:  links: [{link_id: 123, direction: 1}, ...]
+#   2. Geometry cut-line:  geometry_wkt: "LINESTRING(...)"  (auto-detects crossing links)
+#   3. Boundary polygon:   boundary_geojson: "path/to/boundary.geojson"  (for cordons)
+#
+# direction: 1 = a→b only, -1 = b→a only, 0 = both directions summed
+# type: "screenline" | "cordon" | "radial"
+#
+# Example entries (uncomment and fill link_ids from your network):
+#
+# screenlines:
+#   - name: "svratka_bridges"
+#     description: "All bridges crossing Svratka river"
+#     type: "screenline"
+#     links:
+#       - link_id: 12345
+#         direction: 0
+#       - link_id: 12346
+#         direction: 0
+#
+#   - name: "vmo_cordon"
+#     description: "VMO inner ring cordon"
+#     type: "cordon"
+#     boundary_geojson: "config/vmo_boundary.geojson"
+#
+#   - name: "outer_cordon_north"
+#     description: "Northern entry to model area"
+#     type: "radial"
+#     links:
+#       - link_id: 99001
+#         direction: 1
+
+screenlines: []

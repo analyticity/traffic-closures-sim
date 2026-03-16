@@ -14,11 +14,14 @@ POZNÁMKA:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import geopandas as gpd
 from aequilibrae import Project
 from shapely.affinity import translate
@@ -54,7 +57,8 @@ def _normalize_osmid(v: Any) -> int:
     try:
         return int(v)
     except Exception:
-        return abs(hash(str(v))) % 2_000_000_000
+        digest = hashlib.sha256(str(v).encode()).hexdigest()
+        return int(digest[:15], 16) % 2_000_000_000
 
 
 def _to_wgs84_point(point, crs_from) -> Any:
@@ -385,6 +389,135 @@ def remove_overlaps_by_priority(
 
     return _fix_polygons(out)
 
+def _angle_in_range(angle: float, lo: float, hi: float) -> bool:
+    angle = angle % 360.0
+    lo = lo % 360.0
+    hi = hi % 360.0
+    if lo <= hi:
+        return lo <= angle <= hi
+    return angle >= lo or angle <= hi
+
+
+def _angular_distance_deg(a: float, b: float) -> float:
+    d = abs((a - b) % 360.0)
+    return min(d, 360.0 - d)
+
+
+def _bearing_deg(cx: float, cy: float, x: float, y: float) -> float:
+    # 0 = north, 90 = east  (stejná konvence jako v build-demand.py)
+    return math.degrees(math.atan2(x - cx, y - cy)) % 360.0
+
+
+def _build_external_gateway_zones(
+    model_area: Any,
+    crs_epsg: int,
+    gateways_cfg: List[Dict[str, Any]],
+    *,
+    zone_offset_m: float = 4000.0,
+    zone_size_m: float = 800.0,
+    start_id: int = 8_000_000_000,
+) -> gpd.GeoDataFrame:
+    if not gateways_cfg:
+        return gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{crs_epsg}")
+
+    center = model_area.representative_point()
+    cx, cy = float(center.x), float(center.y)
+
+    boundary_coords = list(model_area.exterior.coords)
+    max_r = max(math.hypot(x - cx, y - cy) for x, y in boundary_coords)
+
+    half = zone_size_m / 2.0
+    rows = []
+
+    for i, gw in enumerate(gateways_cfg):
+        gw_name = str(gw.get("name", f"gw_{i}")).strip()
+        ang = math.radians(float(gw.get("direction_deg", 0.0)) % 360.0)
+
+        # 0=north, 90=east
+        x = cx + math.sin(ang) * (max_r + zone_offset_m)
+        y = cy + math.cos(ang) * (max_r + zone_offset_m)
+
+        geom = translate(
+            box(-half, -half, half, half),
+            xoff=x,
+            yoff=y,
+        )
+
+        rows.append({
+            "zone_id": start_id + i,
+            "name": f"EXT_{gw_name}",
+            "source_rank": 999,
+            "is_external": 1,
+            "gateway_name": gw_name,
+            "geometry": geom,
+        })
+
+    return gpd.GeoDataFrame(rows, crs=f"EPSG:{crs_epsg}")
+
+
+def _select_gateway_target_nodes(
+    project: Project,
+    target_epsg: int,
+    model_area: Any,
+    gateways_cfg: List[Dict[str, Any]],
+    *,
+    nodes_per_gateway: int = 2,
+    outer_quantile: float = 0.90,
+) -> Dict[str, List[int]]:
+    road_nids, node_weight = _eligible_road_nodes(project)
+    if not road_nids:
+        return {}
+
+    nodes_gdf = _network_ref(project, "nodes", target_epsg)
+    eligible = nodes_gdf[nodes_gdf["node_id"].astype(int).isin(road_nids)].copy()
+    if eligible.empty:
+        return {}
+
+    eligible["road_weight"] = eligible["node_id"].map(node_weight).fillna(0.5)
+
+    center = model_area.representative_point()
+    cx, cy = float(center.x), float(center.y)
+
+    eligible["_dist_center"] = np.sqrt(
+        (eligible.geometry.x - cx) ** 2 + (eligible.geometry.y - cy) ** 2
+    )
+    eligible["_angle"] = eligible.geometry.apply(
+        lambda g: _bearing_deg(cx, cy, float(g.x), float(g.y))
+    )
+
+    outer_thr = float(eligible["_dist_center"].quantile(outer_quantile))
+    outer = eligible[eligible["_dist_center"] >= outer_thr].copy()
+    if outer.empty:
+        outer = eligible.copy()
+
+    out: Dict[str, List[int]] = {}
+
+    for gw in gateways_cfg:
+        gw_name = str(gw.get("name", "")).strip()
+        lo, hi = gw.get("angle_range", [0, 360])
+        dir_deg = float(gw.get("direction_deg", 0.0)) % 360.0
+
+        cand = outer[
+            outer["_angle"].apply(lambda a: _angle_in_range(float(a), float(lo), float(hi)))
+        ].copy()
+
+        if cand.empty:
+            cand = outer.copy()
+
+        cand["_ang_err"] = cand["_angle"].apply(
+            lambda a: _angular_distance_deg(float(a), dir_deg)
+        )
+
+        cand = cand.sort_values(
+            ["_ang_err", "road_weight", "_dist_center"],
+            ascending=[True, False, False],
+        )
+
+        chosen = cand["node_id"].astype(int).head(nodes_per_gateway).tolist()
+        out[gw_name] = chosen
+        print(f"  gateway targets {gw_name}: {chosen}")
+
+    return out
 
 # ----------------------------
 # Download zones (OSM, generic)
@@ -598,10 +731,22 @@ def build_model_area(
     return aoi
 
 
-def filter_zones_centroid_in_bbox(zones: gpd.GeoDataFrame, model_area_bbox: Any, crs_epsg: int) -> gpd.GeoDataFrame:
-    """
-    Keep only zones whose representative_point is INSIDE model_area geometry (Polygon/box).
-    No tolerance.
+def filter_zones_centroid_in_bbox(
+    zones: gpd.GeoDataFrame,
+    model_area_bbox: Any,
+    crs_epsg: int,
+    *,
+    min_intersection_share: float = 0.05,
+) -> gpd.GeoDataFrame:
+    """Keep zones that significantly overlap the AOI.
+
+    A zone is kept if:
+    - its intersection area with AOI >= ``min_intersection_share`` of the
+      zone's own area, OR
+    - its representative_point lies within AOI (backward compatibility).
+
+    This prevents dropping zones whose polygon straddles the AOI boundary
+    but whose representative_point falls just outside.
     """
     if zones.empty:
         return zones
@@ -612,12 +757,20 @@ def filter_zones_centroid_in_bbox(zones: gpd.GeoDataFrame, model_area_bbox: Any,
     if z.crs.to_epsg() != crs_epsg:
         z = z.to_crs(epsg=crs_epsg)
 
-    pts = z.geometry.representative_point()
-    inside = pts.within(model_area_bbox)
+    rep_inside = z.geometry.representative_point().within(model_area_bbox)
 
-    kept = int(inside.sum())
-    print(f"Zoning: AOI filter zones kept={kept} dropped={len(z) - kept}")
-    return z.loc[inside].reset_index(drop=True)
+    inter = z.geometry.intersection(model_area_bbox)
+    inter_area = inter.area
+    zone_area = z.geometry.area.replace(0, np.nan)
+    share = (inter_area / zone_area).fillna(0.0)
+
+    keep = (share >= min_intersection_share) | rep_inside
+
+    n_kept = int(keep.sum())
+    n_share_only = int((keep & ~rep_inside).sum())
+    print(f"Zoning: AOI filter kept={n_kept} dropped={len(z) - n_kept} "
+          f"(by intersection share: {n_share_only}, min_share={min_intersection_share})")
+    return z.loc[keep].reset_index(drop=True)
 
 
 # ----------------------------
@@ -625,7 +778,11 @@ def filter_zones_centroid_in_bbox(zones: gpd.GeoDataFrame, model_area_bbox: Any,
 # ----------------------------
 
 def calculate_centroids(zones: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    pts = zones[["zone_id", "name"]].copy()
+    keep_cols = [
+        c for c in ["zone_id", "name", "source_rank", "is_external", "gateway_name"]
+        if c in zones.columns
+    ]
+    pts = zones[keep_cols].copy()
     pts["geometry"] = zones.geometry.representative_point()
     return gpd.GeoDataFrame(pts, crs=zones.crs)
 
@@ -793,15 +950,23 @@ def export_map_png(
 
     # Map extent = network extent (align view to network)
     sx, sy, sx2, sy2 = links_gdf.total_bounds
+    zx, zy, zx2, zy2 = zones.total_bounds
+
+    minx0 = min(float(sx), float(zx))
+    miny0 = min(float(sy), float(zy))
+    maxx0 = max(float(sx2), float(zx2))
+    maxy0 = max(float(sy2), float(zy2))
+
     margin_ratio = 0.02
-    w = sx2 - sx
-    h = sy2 - sy
+    w = maxx0 - minx0
+    h = maxy0 - miny0
     margin_x = max(w * margin_ratio, 50.0)
     margin_y = max(h * margin_ratio, 50.0)
-    minx = float(sx) - margin_x
-    maxx = float(sx2) + margin_x
-    miny = float(sy) - margin_y
-    maxy = float(sy2) + margin_y
+
+    minx = minx0 - margin_x
+    maxx = maxx0 + margin_x
+    miny = miny0 - margin_y
+    maxy = maxy0 + margin_y
 
     aoi_gdf = gpd.GeoDataFrame({"geometry": [model_area_bbox]}, crs=f"EPSG:{target_epsg}")
 
@@ -886,14 +1051,178 @@ def _delete_all_connectors_and_reset_centroids(project: Project) -> int:
         conn.close()
 
 
-def _road_network_node_ids(project: Project) -> set:
-    """Return node_ids that participate in at least one non-connector car link."""
-    links = project.network.links.data
+_EXCLUDED_LINK_TYPES = frozenset({
+    "footway", "path", "track", "steps", "cycleway", "pedestrian",
+    "corridor", "bridleway", "proposed", "construction", "elevator",
+    "service", "rest_area", "services", "traffic_mirror", "virtual",
+})
+
+_ROAD_CLASS_WEIGHT = {
+    "motorway": 5.0, "motorway_link": 4.0,
+    "trunk": 4.0, "trunk_link": 3.0,
+    "primary": 3.0, "primary_link": 2.5,
+    "secondary": 2.0, "secondary_link": 1.5,
+    "tertiary": 1.5, "tertiary_link": 1.2,
+    "unclassified": 0.8,
+    "residential": 0.5,
+    "living_street": 0.3,
+    "road": 0.5,
+}
+
+
+def _eligible_road_nodes(project: Project) -> Tuple[set[int], Dict[int, float]]:
+    """Return (node_ids, node_weight) for nodes on the main connected car network.
+
+    Rules:
+    - exclude clearly non-driveable / irrelevant connector targets
+    - require car mode in link.modes
+    - keep only nodes from the largest connected car component
+    - assign node weight from the highest-class road touching the node
+    """
+    import networkx as nx
+
+    links = project.network.links.data.copy()
+    if links.empty:
+        return set(), {}
+
+    excluded = {
+        "footway", "path", "track", "steps", "cycleway", "pedestrian",
+        "corridor", "bridleway", "proposed", "construction", "elevator",
+        "rest_area", "services", "traffic_mirror", "virtual",
+        "centroid_connector",
+    }
+
     car = links[
-        (links["link_type"].astype(str) != "centroid_connector")
-        & (links["modes"].astype(str).str.contains("c", na=False))
-    ]
-    return set(car["a_node"].tolist()) | set(car["b_node"].tolist())
+        links["modes"].astype(str).str.contains("c", na=False)
+        & ~links["link_type"].astype(str).isin(excluded)
+    ].copy()
+
+    if car.empty:
+        return set(), {}
+
+    # Largest connected component of the drivable graph
+    G = nx.Graph()
+    for _, r in car.iterrows():
+        a = int(r["a_node"])
+        b = int(r["b_node"])
+        G.add_edge(a, b)
+
+    if G.number_of_nodes() == 0:
+        return set(), {}
+
+    largest_component = max(nx.connected_components(G), key=len)
+    largest_component = set(int(x) for x in largest_component)
+
+    car = car[
+        car["a_node"].astype(int).isin(largest_component)
+        & car["b_node"].astype(int).isin(largest_component)
+    ].copy()
+
+    road_class_weight = {
+        "motorway": 8.0,
+        "motorway_link": 7.0,
+        "trunk": 7.0,
+        "trunk_link": 6.0,
+        "primary": 4.0,
+        "primary_link": 3.5,
+        "secondary": 2.0,
+        "secondary_link": 1.8,
+        "tertiary": 1.2,
+        "tertiary_link": 1.0,
+        "unclassified": 0.7,
+        "road": 0.7,
+        "residential": 0.4,
+        "service": 0.2,
+        "living_street": 0.05,
+    }
+
+    node_weight: Dict[int, float] = {}
+    for _, r in car.iterrows():
+        lt = str(r.get("link_type", "")).strip()
+        w = float(road_class_weight.get(lt, 0.5))
+        a = int(r["a_node"])
+        b = int(r["b_node"])
+        node_weight[a] = max(node_weight.get(a, 0.0), w)
+        node_weight[b] = max(node_weight.get(b, 0.0), w)
+
+    return set(node_weight.keys()), node_weight
+
+
+def _select_diverse_connectors(
+    eligible: gpd.GeoDataFrame,
+    centroid_pt,
+    max_connectors: int,
+    max_distance_m: float,
+    pool_size: int = 40,
+) -> gpd.GeoDataFrame:
+    """Pick connector targets that are nearby and directionally diverse.
+
+    Strategy:
+    1. Compute distance to all eligible nodes.
+    2. Keep only nodes within max_distance_m.
+    3. Score by road importance and proximity.
+    4. Prefer angular diversity across sectors.
+    5. If nothing is within max_distance_m, fall back to nearest nodes.
+    """
+    if eligible.empty or max_connectors <= 0:
+        return eligible.head(0).copy()
+
+    cand = eligible.copy()
+    cand["_dist"] = cand.geometry.distance(centroid_pt)
+
+    # Hard distance filter
+    nearby = cand[cand["_dist"] <= float(max_distance_m)].copy()
+
+    # Fallback if nothing is within the threshold
+    if nearby.empty:
+        nearby = cand.nsmallest(min(pool_size, len(cand)), "_dist").copy()
+    else:
+        nearby = nearby.nsmallest(min(pool_size, len(nearby)), "_dist").copy()
+
+    if nearby.empty:
+        return nearby
+
+    nearby["_dist"] = nearby["_dist"].clip(lower=1.0)
+
+    cx, cy = centroid_pt.x, centroid_pt.y
+    nearby["_angle"] = np.degrees(
+        np.arctan2(nearby.geometry.y - cy, nearby.geometry.x - cx)
+    ) % 360.0
+
+    # Prefer important roads, but still strongly prefer closer nodes
+    nearby["_score"] = nearby["road_weight"] / np.power(nearby["_dist"], 0.75)
+
+    n_sectors = min(max_connectors, 8)
+    sector_size = 360.0 / n_sectors
+    nearby["_sector"] = (nearby["_angle"] // sector_size).astype(int)
+
+    chosen_idx: List[int] = []
+
+    # First pass: best candidate per sector
+    for sec in range(n_sectors):
+        sec_df = nearby[nearby["_sector"] == sec]
+        if sec_df.empty:
+            continue
+        best_idx = sec_df["_score"].idxmax()
+        chosen_idx.append(best_idx)
+        if len(chosen_idx) >= max_connectors:
+            break
+
+    # Second pass: fill remaining slots globally by score
+    if len(chosen_idx) < max_connectors:
+        remaining = nearby.drop(index=chosen_idx, errors="ignore").nlargest(
+            max_connectors - len(chosen_idx), "_score"
+        )
+        chosen_idx.extend(remaining.index.tolist())
+
+    selected = nearby.loc[chosen_idx[:max_connectors]].copy()
+    selected = selected.sort_values(
+        ["_score", "road_weight", "_dist"],
+        ascending=[False, False, True],
+    ).copy()
+    selected["dist"] = selected["_dist"]
+
+    return selected
 
 
 def create_centroid_connectors(
@@ -901,9 +1230,11 @@ def create_centroid_connectors(
     centroids: gpd.GeoDataFrame,
     max_connectors: int,
     max_distance_m: float,
-    speed_kmh: float = 50.0,
-    capacity_vph: float = 10000.0,
-    lanes: int = 10,
+    speed_kmh: float = 30.0,
+    capacity_vph: float = 5000.0,
+    lanes: int = 4,
+    access_penalty_s: float = 120.0,
+    gateway_targets: Optional[Dict[str, List[int]]] = None,
 ) -> Dict[int, int]:
     """
     For each zone, create a small-ID centroid node and connect it to the
@@ -915,24 +1246,24 @@ def create_centroid_connectors(
 
     Returns ``{zone_id: centroid_node_id}`` mapping.
     """
-    import sqlite3
     print("\n=== CREATE centroid connectors ===")
 
+    gateway_targets = gateway_targets or {}
     nodes = project.network.nodes.data
     if "geometry" not in nodes.columns or len(nodes) == 0:
         raise RuntimeError("Network nodes missing geometry/empty")
 
-    road_nids = _road_network_node_ids(project)
+    road_nids, node_weight = _eligible_road_nodes(project)
     existing_nids = set(int(x) for x in nodes["node_id"].values)
 
     nodes_gdf = gpd.GeoDataFrame(nodes, geometry="geometry", crs=getattr(nodes, "crs", None))
     nodes_gdf = _force_to_target_crs(nodes_gdf, int(centroids.crs.to_epsg()),
                                      name="network.nodes(for connector candidates)")
 
-    eligible = nodes_gdf[
-        nodes_gdf["node_id"].isin(road_nids)
-    ].copy()
-    print(f"  Eligible road-network nodes: {len(eligible)} (from {len(nodes_gdf)} total)")
+    eligible = nodes_gdf[nodes_gdf["node_id"].isin(road_nids)].copy()
+    eligible["road_weight"] = eligible["node_id"].map(node_weight).fillna(0.5)
+    print(f"  Eligible road-network nodes: {len(eligible)} (from {len(nodes_gdf)} total, "
+          f"excluded {len(nodes_gdf) - len(eligible)} non-car types)")
 
     if eligible.empty:
         print("  WARNING: no eligible road-network nodes found")
@@ -972,15 +1303,25 @@ def create_centroid_connectors(
         new_node.geometry = centroid_wgs84
         new_node.save()
 
-        d = eligible.geometry.distance(centroid_pt)
-        cand = eligible.loc[d <= max_distance_m].copy()
-        if cand.empty:
-            cand = eligible.copy()
-            cand["dist"] = eligible.geometry.distance(centroid_pt)
-            cand = cand.nsmallest(max_connectors, "dist")
+        is_external = (
+            bool(int(c.get("is_external", 0))) if pd.notna(c.get("is_external", 0)) else False
+        )
+        gateway_name = str(c.get("gateway_name", "") or "").strip()
+
+        if is_external and gateway_name in gateway_targets:
+            target_ids = set(int(x) for x in gateway_targets[gateway_name])
+            cand = eligible[eligible["node_id"].astype(int).isin(target_ids)].copy()
+            cand["dist"] = cand.geometry.distance(centroid_pt)
+            cand = cand.sort_values(["dist", "road_weight"], ascending=[True, False]).head(
+                len(target_ids)
+            )
         else:
-            cand["dist"] = d[d <= max_distance_m]
-            cand = cand.nsmallest(max_connectors, "dist")
+            cand = _select_diverse_connectors(
+                eligible,
+                centroid_pt,
+                max_connectors,
+                max_distance_m,
+            )
 
         for _, n in cand.iterrows():
             target_node_id = int(n["node_id"])
@@ -1008,7 +1349,7 @@ def create_centroid_connectors(
             link.lanes_ab = lanes
             link.lanes_ba = lanes
 
-            time_s = (dist_m / 1000.0) / speed_kmh * 3600.0
+            time_s = (dist_m / 1000.0) / speed_kmh * 3600.0 + access_penalty_s
             if hasattr(link, "travel_time_ab"):
                 link.travel_time_ab = time_s
                 link.travel_time_ba = time_s
@@ -1023,6 +1364,47 @@ def create_centroid_connectors(
 
     print(f"  connectors created: {created}  ({len(zone_to_centroid)} zones, {max_connectors} per zone)")
     return zone_to_centroid
+
+
+def export_connector_diagnostics(
+    project: Project,
+    zone_to_centroid: Dict[int, int],
+    output_dir: Path,
+) -> None:
+    """Export CSV with per-connector info: zone, node, distance, link_type, penalty."""
+    import sqlite3
+    db = str(project.project_base_path) + "/project_database.sqlite"
+    conn = sqlite3.connect(db)
+    rows = conn.execute(
+        "SELECT link_id, a_node, b_node, distance, speed_ab, travel_time_ab "
+        "FROM links WHERE link_type='centroid_connector'"
+    ).fetchall()
+    conn.close()
+
+    centroid_to_zone = {v: k for k, v in zone_to_centroid.items()}
+    records = []
+    for lid, a, b, dist, speed, tt in rows:
+        zid = centroid_to_zone.get(a, centroid_to_zone.get(b))
+        road_node = b if a in centroid_to_zone.values() else a
+        travel_km = (dist or 0) / 1000.0
+        penalty_s = (tt or 0) - (travel_km / max(speed or 30, 1) * 3600) if tt and speed else 0
+        records.append({
+            "zone_id": zid,
+            "centroid_node": a,
+            "road_node": road_node,
+            "link_id": lid,
+            "distance_m": round(dist or 0, 1),
+            "speed_kmh": speed,
+            "travel_time_s": round(tt or 0, 1),
+            "access_penalty_s": round(max(penalty_s, 0), 1),
+        })
+
+    if records:
+        df = pd.DataFrame(records)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out = output_dir / "connector_diagnostics.csv"
+        df.to_csv(out, index=False)
+        print(f"  Connector diagnostics: {out} ({len(df)} connectors)")
 
 
 # ----------------------------
@@ -1046,8 +1428,12 @@ def build_zones_and_connectors(config_path: str | Path = "config/sim.yaml") -> N
     cache_file = zoning_cfg.get("cache_file")
     output_dir = Path(zoning_cfg.get("output_dir", "outputs/baseline/zones"))
 
-    max_connectors = int(zoning_cfg.get("max_connectors", 2))
-    max_distance_m = float(zoning_cfg.get("max_distance_m", 30000.0))
+    max_connectors = int(zoning_cfg.get("max_connectors", 4))
+    max_distance_m = float(zoning_cfg.get("max_distance_m", 5000.0))
+    connector_speed = float(zoning_cfg.get("connector_speed_kmh", 30.0))
+    connector_capacity = float(zoning_cfg.get("connector_capacity_vph", 5000.0))
+    connector_lanes = int(zoning_cfg.get("connector_lanes", 4))
+    connector_penalty = float(zoning_cfg.get("connector_access_penalty_s", 120.0))
 
     print("Zoning: opening project...")
     project = Project()
@@ -1073,6 +1459,36 @@ def build_zones_and_connectors(config_path: str | Path = "config/sim.yaml") -> N
         # 3) de-overlap again
         zones = remove_overlaps_by_priority(zones, rank_col="source_rank", min_area_m2=25.0)
         print(f"✓ zones after priority de-overlap: {len(zones)}")
+
+        gateway_targets: Dict[str, List[int]] = {}
+
+        ext_cfg = zoning_cfg.get("external_gateways", {}) or {}
+        if bool(ext_cfg.get("enabled", False)):
+            gw_list = cfg.get("demand", {}).get("gateways", []) or []
+
+            ext_zones = _build_external_gateway_zones(
+                model_area,
+                crs_epsg,
+                gw_list,
+                zone_offset_m=float(ext_cfg.get("zone_offset_m", 4000.0)),
+                zone_size_m=float(ext_cfg.get("zone_size_m", 800.0)),
+            )
+
+            if not ext_zones.empty:
+                zones = gpd.GeoDataFrame(
+                    pd.concat([zones, ext_zones], ignore_index=True),
+                    crs=zones.crs,
+                )
+                print(f"✓ synthetic external gateway zones added: {len(ext_zones)}")
+
+                gateway_targets = _select_gateway_target_nodes(
+                    project,
+                    crs_epsg,
+                    model_area,
+                    gw_list,
+                    nodes_per_gateway=int(ext_cfg.get("connectors_per_gateway", 2)),
+                    outer_quantile=float(ext_cfg.get("candidate_outer_quantile", 0.90)),
+                )
 
         # 4) centroids inside
         if zones.crs is None:
@@ -1108,12 +1524,35 @@ def build_zones_and_connectors(config_path: str | Path = "config/sim.yaml") -> N
             centroids=centroids,
             max_connectors=max_connectors,
             max_distance_m=max_distance_m,
+            speed_kmh=connector_speed,
+            capacity_vph=connector_capacity,
+            lanes=connector_lanes,
+            access_penalty_s=connector_penalty,
+            gateway_targets=gateway_targets,
         )
+
+        # Connector diagnostics
+        export_connector_diagnostics(project, zone_to_centroid, output_dir)
 
         # Add centroid_node_id to centroids GeoDataFrame
         centroids["centroid_node_id"] = centroids["zone_id"].map(
             lambda z: zone_to_centroid.get(int(z), int(z))
         ).astype(int)
+
+        # Add population data if available
+        pop_path = Path(cfg.get("datasets", {}).get("cache_dir", "data/cache")) / "zone_population.parquet"
+        if pop_path.exists():
+            pop_df = pd.read_parquet(pop_path)
+            pop_map = dict(zip(pop_df["zone_id"], pop_df["population"]))
+            centroids["population"] = centroids["zone_id"].map(
+                lambda z: pop_map.get(int(z), 0)
+            ).astype(int)
+            zones["population"] = zones["zone_id"].map(
+                lambda z: pop_map.get(int(z), 0)
+            ).astype(int)
+            print(f"  population data loaded: {len(pop_map)} zones, total={sum(pop_map.values()):,}")
+        else:
+            print(f"  [warn] {pop_path} not found — population not added to centroids")
 
         # 8) export final
         output_dir.mkdir(parents=True, exist_ok=True)

@@ -119,9 +119,23 @@ app.add_middleware(
 @app.get("/api/links")
 def get_links(
     min_volume: float = Query(0, description="Minimum wd_daily_tot to include"),
-    link_types: Optional[str] = Query(None, description="Comma-separated link types (e.g. motorway,primary)"),
+    link_types: Optional[str] = Query(None, description="Comma-separated link types"),
+    date: Optional[str] = Query(None, description="Date (YYYY-MM-DD) for temporal scaling"),
+    period: str = Query("daily", description="Period: daily, day, evening, night"),
 ):
     gdf = _get_links().copy()
+
+    # Apply temporal scaling if date is provided
+    if date and "wd_daily_tot" in gdf.columns:
+        try:
+            from sim.temporal import load_profile, get_combined_factor
+            profile = load_profile(_cfg)
+            factor = get_combined_factor(date, period, profile)
+            for col in ("wd_daily_tot", "wd_daily_ab", "wd_daily_ba"):
+                if col in gdf.columns:
+                    gdf[col] = gdf[col].fillna(0) * factor
+        except FileNotFoundError:
+            pass
 
     if "wd_daily_tot" in gdf.columns and min_volume > 0:
         gdf = gdf[gdf["wd_daily_tot"].fillna(0) >= min_volume]
@@ -130,9 +144,12 @@ def get_links(
         types = [t.strip() for t in link_types.split(",")]
         gdf = gdf[gdf["link_type"].isin(types)]
 
-    keep = ["link_id", "link_type", "name", "speed", "capacity",
+    keep = ["link_id", "link_type", "name", "speed", "capacity", "lanes", "distance",
             "wd_daily_tot", "wd_daily_ab", "wd_daily_ba",
-            "VOC_max", "Congested_Time_Max", "geometry"]
+            "VOC_max", "VOC_AB", "VOC_BA",
+            "Congested_Time_Max", "Congested_Time_AB", "Congested_Time_BA",
+            "Delay_factor_Max", "Delay_factor_AB", "Delay_factor_BA",
+            "geometry"]
     keep = [c for c in keep if c in gdf.columns]
     return JSONResponse(_gdf_to_geojson(gdf[keep]))
 
@@ -181,6 +198,25 @@ def get_model_area():
         raise HTTPException(404, "model_area.geojson not found")
     gdf = gpd.read_file(path)
     return JSONResponse(_gdf_to_geojson(gdf))
+
+
+# ---------------------------------------------------------------------------
+# Temporal
+# ---------------------------------------------------------------------------
+
+@app.get("/api/temporal/profile")
+def temporal_profile():
+    return JSONResponse(_read_json(_out("demand") / "temporal_profile.json"))
+
+
+@app.get("/api/temporal/day-info")
+def temporal_day_info(date: str = Query(..., description="Date YYYY-MM-DD")):
+    try:
+        from sim.temporal import load_profile, day_info
+        profile = load_profile(_cfg)
+        return JSONResponse(day_info(date, profile))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
 
 
 # ---------------------------------------------------------------------------

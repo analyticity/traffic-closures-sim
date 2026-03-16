@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -104,10 +104,15 @@ def execute_assignment(
     algorithm: str = "bfw",
     max_iter: int = 100,
     rgap_target: float = 0.001,
-) -> pd.DataFrame:
+    save_skims: bool = False,
+    select_links: Optional[Dict[str, list]] = None,
+) -> Tuple[pd.DataFrame, Optional[AequilibraeMatrix], Dict[str, np.ndarray]]:
     """Run assignment on an already-open project with a loaded matrix.
 
-    Returns a DataFrame with at least ``link_id`` and ``*_tot`` volume columns.
+    Returns ``(link_volume_df, skims, select_link_matrices)`` where
+    *skims* is an ``AequilibraeMatrix`` when ``save_skims=True``,
+    and *select_link_matrices* is ``{screenline_name: OD_array}``
+    when ``select_links`` is provided.
     """
     project.network.build_graphs(modes=["c"])
     graph = project.network.graphs["c"]
@@ -120,11 +125,43 @@ def execute_assignment(
     if time_field is None:
         raise RuntimeError(f"No time field in graph. Columns: {gcols}")
 
+    # Apply intersection/signal delay factors to create road class hierarchy.
+    # OSM gives all urban roads ~50 km/h (Czech built-up area limit), so
+    # without this, secondary/tertiary/residential are equally attractive
+    # as primary/trunk for route choice. These factors account for traffic
+    # signals, intersections, and urban friction that lower effective speed.
+    # Applied to the graph IN MEMORY only -- does NOT modify the DB.
+    _DELAY_FACTORS = {
+        "motorway": 1.0, "motorway_link": 1.0,
+        "trunk": 1.0, "trunk_link": 1.05,
+        "primary": 1.15, "primary_link": 1.20,
+        "secondary": 1.40, "secondary_link": 1.50,
+        "tertiary": 1.60, "tertiary_link": 1.70,
+        "residential": 1.80, "unclassified": 1.60,
+        "living_street": 2.00, "service": 2.00,
+    }
+    if "link_type" in graph.network.columns:
+        for lt, factor in _DELAY_FACTORS.items():
+            if factor <= 1.0:
+                continue
+            mask = graph.network["link_type"].astype(str) == lt
+            if mask.any():
+                graph.network.loc[mask, time_field] = (
+                    graph.network.loc[mask, time_field] * factor
+                )
+
     graph.set_graph(time_field)
     graph.set_skimming([time_field])
     graph.set_blocked_centroid_flows(True)
 
     tc = TrafficClass(name="car", graph=graph, matrix=mat)
+
+    if select_links:
+        try:
+            tc.set_select_links(select_links)
+        except Exception:
+            pass
+
     assig = TrafficAssignment()
     assig.set_classes([tc])
     assig.set_vdf("BPR")
@@ -149,7 +186,22 @@ def execute_assignment(
     elif df.index.name == "link_id":
         df = df.reset_index(drop=True)
 
-    return df
+    skims = None
+    if save_skims:
+        try:
+            skims = tc.results.skims
+        except Exception:
+            pass
+
+    sl_matrices: Dict[str, np.ndarray] = {}
+    if select_links:
+        for sl_name in select_links:
+            try:
+                sl_matrices[sl_name] = tc.results.select_link_od.matrix[sl_name][:, :].copy()
+            except Exception:
+                pass
+
+    return df, skims, sl_matrices
 
 
 def _detect_volume_col(df: pd.DataFrame) -> str | None:
@@ -203,14 +255,17 @@ def run_assignment(config_path: str | Path = "config/sim.yaml") -> None:
     total_demand = float(mat.matrix_view.sum())
     print(f"   Core '{core_name}': {mat.zones} zones, demand={total_demand:,.0f}")
 
+    save_skims = bool(calib_cfg.get("save_skims", False))
+
     # Run
     print(f"\n3) Running {algorithm.upper()} ...")
     project = Project()
     project.open(str(project_dir))
     try:
-        df = execute_assignment(
+        df, skims, _sl = execute_assignment(
             project, mat,
             algorithm=algorithm, max_iter=max_iter, rgap_target=rgap,
+            save_skims=save_skims,
         )
     finally:
         project.close()
@@ -242,3 +297,73 @@ def run_assignment(config_path: str | Path = "config/sim.yaml") -> None:
     out_path = output_dir / "assignment_results.parquet"
     df.to_parquet(str(out_path), index=False)
     print(f"   Saved: {out_path}")
+
+    if skims is not None:
+        skim_path = output_dir / "skims.aem"
+        try:
+            skims.export(str(skim_path))
+            print(f"   Skims saved: {skim_path}")
+        except Exception as e:
+            print(f"   WARNING: could not save skims: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Temporal assignment (date + period)
+# ---------------------------------------------------------------------------
+
+def run_temporal_assignment(
+    config_path: str | Path,
+    date_str: str,
+    period: str = "daily",
+) -> pd.DataFrame:
+    """Run assignment for a specific date, scaling the base OD by the learned
+    day factor and optional period share.
+
+    Returns the link-volume DataFrame (same format as baseline assignment).
+    """
+    from sim.temporal import load_profile, get_combined_factor, classify_day
+
+    cfg = load_config(config_path)
+    project_dir = Path(cfg["project_path"])
+    demand_cfg = cfg.get("demand") or {}
+    calib_cfg = cfg.get("calibration") or {}
+    matrix_path = Path(demand_cfg.get("matrix_path", "data/demand/od_matrix.aem"))
+
+    algorithm = str(calib_cfg.get("algorithm", "bfw"))
+    max_iter = int(calib_cfg.get("max_iter", 100))
+    rgap = float(calib_cfg.get("rgap_target", 0.001))
+    core_name = str(calib_cfg.get("core_name", "wd_daily"))
+
+    profile = load_profile(cfg)
+    factor = get_combined_factor(date_str, period, profile)
+    day_type = classify_day(date_str)
+
+    print(f"=== TEMPORAL ASSIGNMENT: {date_str} ({day_type}), period={period}, factor={factor:.3f} ===")
+
+    mat = AequilibraeMatrix()
+    mat.load(str(matrix_path))
+    mat.computational_view([core_name])
+
+    # Scale matrix data in memory (do NOT save — keep original on disk)
+    mat.matrix_view[:, :] = mat.matrix_view[:, :] * factor
+    total_demand = float(mat.matrix_view.sum())
+    print(f"  Scaled demand: {total_demand:,.0f}")
+
+    fix_node_ids(project_dir)
+
+    project = Project()
+    project.open(str(project_dir))
+    try:
+        df, _skims, _sl = execute_assignment(
+            project, mat,
+            algorithm=algorithm, max_iter=max_iter, rgap_target=rgap,
+        )
+    finally:
+        project.close()
+        mat.close()
+
+    tot_col = _detect_volume_col(df)
+    total_vol = float(df[tot_col].sum()) if tot_col else 0.0
+    print(f"  Result: {len(df)} links, total_vol={total_vol:,.0f}")
+
+    return df

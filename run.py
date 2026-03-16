@@ -10,10 +10,13 @@ Workflow:
   4) build-zones        – create TAZ zones + centroid connectors
   5) fetch-data         – download & preprocess external datasets
   6) build-demand       – build OD matrix from SLDB commuting data
-  7) assign             – traffic assignment (shortest path / equilibrium)
-  8) calibrate          – iterative: assign → compare → scale → repeat
-  9) validate           – independent validation on CSD2020
- 10) serve              – start REST API server (read-only results)
+  7) distribute         – gravity calibration + IPF on seed OD
+  8) assign             – traffic assignment (shortest path / equilibrium)
+  9) calibrate          – iterative: assign → compare → scale → repeat
+ 10) tune-supply        – outer-loop supply parameter optimization
+ 11) validate           – independent validation on CSD2020
+ 12) learn-profile      – learn day-type factors from CSD2020
+ 13) serve              – start REST API server (read-only results)
 """
 from __future__ import annotations
 
@@ -25,7 +28,6 @@ import argparse
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from sim.io_project import load_config
-from sim.viz_checks import viz_step1_project_bootstrap
 from sim.network_pipeline import build_network_from_osm
 from sim.network_normalization import normalize_and_export_network
 from sim.zoning import build_zones_and_connectors
@@ -33,6 +35,7 @@ from sim.fetch_datasets import run_fetch_datasets
 from sim.demand import load_or_build_od_matrix
 from sim.assignment import run_assignment
 from sim.calibration import run_calibration, run_validation_only
+from sim.temporal import run_learn_profile
 
 STEPS = [
     "clean",
@@ -42,9 +45,12 @@ STEPS = [
     "build-zones",
     "fetch-data",
     "build-demand",
+    "distribute",
     "assign",
     "calibrate",
+    "tune-supply",
     "validate",
+    "learn-profile",
     "serve",
 ]
 
@@ -89,8 +95,6 @@ def main() -> None:
 
     if step == "clean":
         run_clean(cfg)
-    elif step == "check":
-        viz_step1_project_bootstrap(cfg)
     elif step == "build-network":
         build_network_from_osm(cfg)
     elif step == "normalize-network":
@@ -101,12 +105,20 @@ def main() -> None:
         run_fetch_datasets(config_path=cfg)
     elif step == "build-demand":
         load_or_build_od_matrix(cfg)
+    elif step == "distribute":
+        from sim.distribution import run_distribution
+        run_distribution(cfg)
     elif step == "assign":
         run_assignment(cfg)
     elif step == "calibrate":
         run_calibration(cfg)
+    elif step == "tune-supply":
+        from sim.calibration import run_supply_tuning
+        run_supply_tuning(cfg)
     elif step == "validate":
         run_validation_only(cfg)
+    elif step == "learn-profile":
+        run_learn_profile(cfg)
     elif step == "serve":
         from sim.api import start_server
         start_server(cfg)

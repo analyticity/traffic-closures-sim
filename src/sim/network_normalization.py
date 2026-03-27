@@ -608,10 +608,25 @@ def export_stable_network(
 
     link_cols = ["link_id", "a_node", "b_node", "direction", "modes", "distance", "geometry"]
     optional_cols = [
-        "link_type", "name", "osm_id",
-        "speed_ab", "speed_ba", "lanes_ab", "lanes_ba",
-        "capacity_ab", "capacity_ba", "travel_time_ab", "travel_time_ba",
-        "speed", "lanes", "capacity", "free_flow_time",
+        "link_type",
+        "name",
+        "osm_id",
+        "osm_ref",
+        "osm_ref_norm",
+        "osm_name_raw",
+        "osm_highway",
+        "speed_ab",
+        "speed_ba",
+        "lanes_ab",
+        "lanes_ba",
+        "capacity_ab",
+        "capacity_ba",
+        "travel_time_ab",
+        "travel_time_ba",
+        "speed",
+        "lanes",
+        "capacity",
+        "free_flow_time",
     ]
     available_cols = [col for col in link_cols + optional_cols if col in links.columns]
 
@@ -628,7 +643,7 @@ def export_stable_network(
     links_parquet.to_parquet(parquet_path, index=False)
 
     nodes = project.network.nodes.data.copy()
-    node_cols = ["node_id", "is_centroid"]
+    node_cols = ["node_id", "osm_id", "is_centroid"]
     if "geometry" in nodes.columns:
         node_cols.append("geometry")
     available_node_cols = [col for col in node_cols if col in nodes.columns]

@@ -56,6 +56,14 @@ def _find_col(df: pd.DataFrame, name: str) -> Optional[str]:
     return None
 
 
+def _coerce_object_columns_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        if out[c].dtype == object:
+            out[c] = out[c].astype(str)
+    return out
+
+
 def download_file(
     url: str,
     out_path: Path,
@@ -217,6 +225,9 @@ def _load_aoi_bbox_wgs84(cfg: Dict[str, Any]) -> Optional[Tuple[float, float, fl
     if mb and len(mb) == 4 and None not in mb:
         return tuple(float(x) for x in mb)
 
+    if gpd is None:
+        return None
+
     zones_dir = Path(cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones"))
     aoi_path = zones_dir / "model_area.geojson"
     if aoi_path.exists():
@@ -302,52 +313,102 @@ def fetch_arcgis_feature_service(
     cache_parquet = cache_dir / f"{_slug(out_path.stem)}.parquet"
     gdf.to_parquet(cache_parquet, index=False)
 
-    return {"features": int(len(gdf)), "geojson": str(out_path), "parquet": str(cache_parquet), "epsg": out_epsg}
+    return {
+        "features": int(len(gdf)),
+        "geojson": str(out_path),
+        "parquet": str(cache_parquet),
+        "epsg": out_epsg,
+    }
 
 
-def preprocess_csd2020_xlsx(xlsx_path: Path, out_parquet: Path) -> Dict[str, Any]:
+def preprocess_xlsx_table(
+    xlsx_path: Path,
+    out_parquet: Path,
+    *,
+    key_cols: Optional[set[str]] = None,
+    max_header_row_scan: int = 4,
+    summary_tag: str = "xlsx_table",
+) -> Dict[str, Any]:
+    """
+    Generic XLSX -> Parquet preprocessor.
+
+    It scans sheets and a few possible header rows, scores them by presence
+    of key normalized column names, chooses the best match, normalizes columns,
+    and saves the selected table to Parquet.
+    """
     xls = pd.ExcelFile(xlsx_path)
     sheets = xls.sheet_names
+
+    if key_cols is None:
+        key_cols = set()
 
     best_sheet = None
     best_score = -1
     best_df = None
     best_header_row = 0
+    best_cols: List[str] = []
 
-    key_cols = {"sv", "o", "tv", "sil", "rpdi"}
     for sh in sheets:
-        for hrow in (0, 1, 2):
+        for hrow in range(max_header_row_scan + 1):
             try:
-                df = xls.parse(sh, header=hrow, nrows=50)
+                preview = xls.parse(sh, header=hrow, nrows=50)
             except Exception:
                 continue
-            cols = [_norm_col(str(c)) for c in df.columns]
-            score = sum(1 for c in cols if c in key_cols)
+
+            cols_norm = [_norm_col(str(c)) for c in preview.columns]
+
+            if key_cols:
+                score = sum(1 for c in cols_norm if c in key_cols)
+            else:
+                score = len([c for c in cols_norm if c])
+
             if score > best_score:
                 best_score = score
                 best_sheet = sh
                 best_header_row = hrow
                 best_df = xls.parse(sh, header=hrow)
+                best_cols = cols_norm
 
-    if best_df is None:
+    if best_df is None or best_sheet is None:
         raise RuntimeError(f"Could not parse any sheet from {xlsx_path}")
 
     df = best_df.copy()
     df.columns = [_norm_col(str(c)) for c in df.columns]
     df.insert(0, "sheet", str(best_sheet))
-
-    # Sloupce object (smíšené typy z Excelu) převést na string kvůli Parquet
-    for c in df.columns:
-        if df[c].dtype == object:
-            df[c] = df[c].astype(str)
+    df = _coerce_object_columns_for_parquet(df)
 
     _ensure_dir(out_parquet.parent)
     df.to_parquet(out_parquet, index=False)
 
-    summary = {"sheets": sheets, "chosen_sheet": best_sheet, "rows": int(len(df)), "cols": int(len(df.columns))}
+    summary = {
+        "kind": summary_tag,
+        "source_xlsx": str(xlsx_path),
+        "sheets": sheets,
+        "chosen_sheet": best_sheet,
+        "chosen_header_row": int(best_header_row),
+        "rows": int(len(df)),
+        "cols": int(len(df.columns)),
+        "columns": list(df.columns),
+        "best_score": int(best_score),
+        "best_preview_columns_norm": best_cols,
+    }
     summary_path = out_parquet.with_suffix(".summary.json")
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     return {"parquet": str(out_parquet), "summary": str(summary_path), **summary}
+
+
+def preprocess_csd_xlsx(xlsx_path: Path, out_parquet: Path) -> Dict[str, Any]:
+    """
+    Specialized wrapper for CSD Excel tables.
+    Uses traffic-count-oriented key columns to choose the correct sheet/header.
+    """
+    return preprocess_xlsx_table(
+        xlsx_path,
+        out_parquet,
+        key_cols={"sv", "o", "tv", "sil", "rpdi"},
+        max_header_row_scan=4,
+        summary_tag="csd_xlsx",
+    )
 
 
 _MC_TO_KU: Dict[str, List[str]] = {
@@ -392,7 +453,7 @@ def preprocess_population_sldb2021(
 
     Maps Brno městské části to katastrální území (our zones) using
     the _MC_TO_KU table and distributes MC population proportionally
-    by zone polygon area.  Outer-Brno zones are matched by name.
+    by zone polygon area. Outer-Brno zones are matched by name.
     """
     import difflib
     import unicodedata
@@ -407,7 +468,7 @@ def preprocess_population_sldb2021(
     total["hodnota"] = pd.to_numeric(total["hodnota"], errors="coerce").fillna(0).astype(int)
     total["nazev"] = total["uzemi_txt"].astype(str).str.strip()
 
-    # Build MC population lookup  {normalized_mc_name: population}
+    # Build MC population lookup {normalized_mc_name: population}
     brno_mc = total[
         (total["uzemi_cis"] == 44) & total["nazev"].str.startswith("Brno")
     ]
@@ -586,11 +647,16 @@ def run_fetch_datasets(
             info: Dict[str, Any] = {"download": dl}
 
             fmt = (scfg.get("format") or {}).get("type")
+            usage = scfg.get("usage") or {}
+
             if fmt == "xlsx":
                 out_parquet = cache_dir / f"{_slug(out_path.stem)}.parquet"
-                info["preprocess"] = preprocess_csd2020_xlsx(out_path, out_parquet)
 
-            usage = scfg.get("usage") or {}
+                if usage.get("validation_target") == "aadt_screenlines" or usage.get("calibration_target") == "aadt_screenlines":
+                    info["preprocess"] = preprocess_csd_xlsx(out_path, out_parquet)
+                else:
+                    info["preprocess"] = preprocess_xlsx_table(out_path, out_parquet)
+
             if usage.get("socioeconomic") == "population_per_zone":
                 zoning_dir = Path(cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones"))
                 zones_geojson = zoning_dir / "zones.geojson"
@@ -621,7 +687,14 @@ def run_fetch_datasets(
             continue
 
         if provider == "arcgis_feature_service":
-            info = fetch_arcgis_feature_service(cfg, scfg, timeout_s=timeout_s, retries=retries, headers=headers, force=force)
+            info = fetch_arcgis_feature_service(
+                cfg,
+                scfg,
+                timeout_s=timeout_s,
+                retries=retries,
+                headers=headers,
+                force=force,
+            )
             manifest["sources"][key] = info
             continue
 
@@ -643,4 +716,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    

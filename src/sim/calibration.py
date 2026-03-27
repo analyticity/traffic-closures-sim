@@ -192,7 +192,7 @@ def validate_geometries_or_fail(
 
 def load_csd2020(cfg: Dict[str, Any], region_code: str = "CZ064") -> pd.DataFrame:
     cache_dir = Path(_get(cfg, ["datasets", "cache_dir"], "data/cache"))
-    parquet_path = cache_dir / "v2_csd2020.parquet"
+    parquet_path = cache_dir / "v2_csd2025.parquet"
     if not parquet_path.exists():
         raise FileNotFoundError(f"CSD2020 parquet not found: {parquet_path}")
 

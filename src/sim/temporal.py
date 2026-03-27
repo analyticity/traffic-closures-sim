@@ -65,7 +65,7 @@ def learn_day_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
     Returns a profile dict and saves it to ``temporal_profile.json``.
     """
     cache_dir = Path(cfg.get("datasets", {}).get("cache_dir", "data/cache"))
-    parquet = cache_dir / "v2_csd2020.parquet"
+    parquet = cache_dir / "v2_csd2025.parquet"
     if not parquet.exists():
         raise FileNotFoundError(f"CSD2020 parquet not found: {parquet}. Run fetch-data first.")
 

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import shutil
 import sqlite3
+import unicodedata
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -16,6 +20,180 @@ from sim.io_project import load_config
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _project_db_path(project_dir: Path) -> Path:
+    candidates = (
+        list(project_dir.glob("*.sqlite"))
+        + list(project_dir.glob("*.db"))
+        + list(project_dir.glob("*.sqlite3"))
+    )
+    if candidates:
+        return candidates[0]
+    return project_dir / "project_database.sqlite"
+
+_MAJOR_REF_PROPAGATION_TYPES = {
+    "motorway",
+    "motorway_link",
+    "trunk",
+    "trunk_link",
+    "primary",
+    "primary_link",
+    "secondary",
+    "secondary_link",
+}
+
+
+def _normalize_name(value: Any) -> str:
+    text = _clean_text(value)
+    if not text:
+        return ""
+
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.upper().strip()
+    text = re.sub(r"\s+", "", text)
+    text = text.replace("-", "")
+    text = text.replace("/", "")
+    text = text.replace("\\", "")
+    return text
+
+
+def _fill_missing_refs_from_named_corridors(
+    project: Project,
+    project_dir: Path,
+) -> Dict[str, int]:
+    """
+    Second pass:
+    If a major-road corridor has the same name and most of its connected links
+    already have the same ref, propagate that ref to short missing gaps.
+    This helps with cases like Bratislavská where OSM ref is not present on every segment.
+    """
+    df = project.network.links.data.copy()
+    if df.empty:
+        return {"filled": 0, "components_used": 0}
+
+    required = {"link_id", "a_node", "b_node", "modes", "link_type"}
+    if not required.issubset(df.columns):
+        return {"filled": 0, "components_used": 0}
+
+    if "osm_ref_norm" not in df.columns:
+        return {"filled": 0, "components_used": 0}
+
+    work = df[
+        df["modes"].astype(str).str.contains("c", na=False)
+        & df["link_type"].astype(str).isin(_MAJOR_REF_PROPAGATION_TYPES)
+    ].copy()
+
+    if work.empty:
+        return {"filled": 0, "components_used": 0}
+
+    if "osm_name_raw" in work.columns:
+        work["_name_src"] = work["osm_name_raw"]
+    else:
+        work["_name_src"] = None
+
+    if "name" in work.columns:
+        work["_name_src"] = work["_name_src"].where(work["_name_src"].notna(), work["name"])
+
+    work["_name_norm"] = work["_name_src"].apply(_normalize_name)
+    work["_ref_norm"] = work["osm_ref_norm"].fillna("").astype(str).str.strip()
+    work["_ref_raw"] = work["osm_ref"].fillna("").astype(str).str.strip() if "osm_ref" in work.columns else ""
+
+    work = work[work["_name_norm"] != ""].copy()
+    if work.empty:
+        return {"filled": 0, "components_used": 0}
+
+    updates: List[Tuple[str, str, int]] = []
+    components_used = 0
+
+    for _, group in work.groupby("_name_norm"):
+        if group.empty:
+            continue
+
+        by_link = {int(r["link_id"]): r for _, r in group.iterrows()}
+        node_to_links: Dict[int, List[int]] = defaultdict(list)
+
+        for _, r in group.iterrows():
+            lid = int(r["link_id"])
+            node_to_links[int(r["a_node"])].append(lid)
+            node_to_links[int(r["b_node"])].append(lid)
+
+        seen: set[int] = set()
+
+        for lid0 in by_link.keys():
+            if lid0 in seen:
+                continue
+
+            stack = [lid0]
+            component_link_ids: List[int] = []
+            seen.add(lid0)
+
+            while stack:
+                lid = stack.pop()
+                component_link_ids.append(lid)
+                row = by_link[lid]
+                neigh = node_to_links[int(row["a_node"])] + node_to_links[int(row["b_node"])]
+
+                for other in neigh:
+                    if other not in seen:
+                        seen.add(other)
+                        stack.append(other)
+
+            comp = group[group["link_id"].astype(int).isin(component_link_ids)].copy()
+            if comp.empty:
+                continue
+
+            known = comp[comp["_ref_norm"] != ""].copy()
+            missing = comp[comp["_ref_norm"] == ""].copy()
+
+            if known.empty or missing.empty:
+                continue
+
+            ref_counts = Counter(known["_ref_norm"].tolist())
+            raw_counts = Counter([x for x in known["_ref_raw"].tolist() if x])
+
+            dominant_ref_norm, dominant_ref_count = ref_counts.most_common(1)[0]
+            dominant_ref_raw = raw_counts.most_common(1)[0][0] if raw_counts else dominant_ref_norm
+
+            # Be conservative: fill only when the component is clearly dominated by one ref
+            if len(ref_counts) > 1 and (dominant_ref_count / len(known)) < 0.8:
+                continue
+
+            # Also avoid filling huge ambiguous components from just 1 known segment
+            if len(known) < 2 and len(missing) > 2:
+                continue
+
+            components_used += 1
+            for lid in missing["link_id"].astype(int).tolist():
+                updates.append((dominant_ref_raw, dominant_ref_norm, lid))
+
+    if not updates:
+        return {"filled": 0, "components_used": 0}
+
+    db_path = _project_db_path(project_dir)
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
+    try:
+        conn.executemany(
+            """
+            UPDATE links
+               SET osm_ref = ?,
+                   osm_ref_norm = ?
+             WHERE link_id = ?
+               AND (osm_ref IS NULL OR TRIM(osm_ref) = '')
+            """,
+            updates,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        project.network.links.refresh()
+    except Exception:
+        pass
+
+    return {"filled": int(len(updates)), "components_used": int(components_used)}
 
 
 def create_or_open_project(project_dir: Path) -> Project:
@@ -34,7 +212,7 @@ def create_or_open_project(project_dir: Path) -> Project:
 
 
 # ----------------------------
-# CRS helpers (ONLY for plotting/export)
+# CRS helpers
 # ----------------------------
 
 def _guess_crs_from_coords(geoms: gpd.GeoSeries, fallback_epsg: int = 5514) -> str:
@@ -77,14 +255,75 @@ def _as_gdf(df, crs_hint_epsg: int) -> gpd.GeoDataFrame:
     return g
 
 
+def _network_links_gdf_with_crs(project: Project, crs_epsg_hint: int) -> gpd.GeoDataFrame:
+    links = project.network.links.data
+    if "geometry" not in links.columns or len(links) == 0:
+        raise RuntimeError("Network links missing geometry/empty")
+    return _as_gdf(links, crs_epsg_hint)
+
+
+def _network_bbox_wgs84_from_project(
+    project: Project,
+    crs_epsg_hint: int,
+    *,
+    pad_ratio: float = 0.005,
+    min_pad_deg: float = 0.0015,
+) -> Tuple[float, float, float, float]:
+    """
+    Computes current network extent from ACTUAL project links and converts it to WGS84.
+    Smaller padding than before, so enrichment area stays closer to the real network.
+    """
+    gdf = _network_links_gdf_with_crs(project, crs_epsg_hint)
+
+    if gdf.crs is None:
+        raise RuntimeError("Could not determine CRS of project links")
+
+    if gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+
+    minx, miny, maxx, maxy = map(float, gdf.total_bounds)
+
+    dx = max(maxx - minx, 0.0)
+    dy = max(maxy - miny, 0.0)
+
+    padx = max(dx * pad_ratio, min_pad_deg)
+    pady = max(dy * pad_ratio, min_pad_deg)
+
+    return (minx - padx, miny - pady, maxx + padx, maxy + pady)
+
+
+def _native_bbox_from_wgs84_bbox(
+    project: Project,
+    bbox_wgs84: Iterable[float],
+    crs_epsg_hint: int,
+) -> Tuple[float, float, float, float]:
+    """
+    Converts config bbox in WGS84 into native link CRS used by the current project.
+    This makes trimming safe even when DB coordinates are not EPSG:4326.
+    """
+    west, south, east, north = [float(x) for x in bbox_wgs84]
+    bbox_geom = box(west, south, east, north)
+
+    links_gdf = _network_links_gdf_with_crs(project, crs_epsg_hint)
+    bbox_gdf = gpd.GeoDataFrame({"geometry": [bbox_geom]}, crs="EPSG:4326")
+
+    if links_gdf.crs is not None and links_gdf.crs.to_epsg() != 4326:
+        bbox_gdf = bbox_gdf.to_crs(links_gdf.crs)
+
+    minx, miny, maxx, maxy = map(float, bbox_gdf.total_bounds)
+    if not (minx < maxx and miny < maxy):
+        raise RuntimeError(f"Invalid converted native bbox: {(minx, miny, maxx, maxy)}")
+
+    return minx, miny, maxx, maxy
+
+
 # ----------------------------
-# Deterministic trimming (NO CRS transforms)
+# Deterministic trimming
 # ----------------------------
 
 def compute_bbox_from_links_raw(project: Project) -> Tuple[float, float, float, float]:
     """
-    Returns bbox from link geometries exactly as stored in the DB (raw coordinates).
-    NO CRS guessing, NO to_crs. This is what you want for 'make bbox match the network'.
+    Returns bbox from link geometries exactly as stored in the DB (raw/native coordinates).
     """
     links = project.network.links.data
     if "geometry" not in links.columns or len(links) == 0:
@@ -102,10 +341,9 @@ def trim_network_to_bbox_raw(
     project_dir: Path,
 ) -> Dict[str, int]:
     """
-    HARD trim in RAW coordinate space (whatever the DB uses):
-    - keep nodes within bbox (by node geometry point)
+    HARD trim in native/raw coordinate space:
+    - keep nodes within bbox
     - keep links where both endpoints are kept AND link geometry intersects bbox
-    Uses links.delete(link_id) API and direct SQLite for nodes (.data has no setter).
     """
     west, south, east, north = bbox
     rect = box(west, south, east, north)
@@ -127,12 +365,10 @@ def trim_network_to_bbox_raw(
     nodes_gdf = gpd.GeoDataFrame(nodes, geometry="geometry", crs=getattr(nodes, "crs", None))
     links_gdf = gpd.GeoDataFrame(links, geometry="geometry", crs=getattr(links, "crs", None))
 
-    # RAW: no transforms
     inside_nodes = nodes_gdf.geometry.within(rect)
     kept_nodes = nodes_gdf.loc[inside_nodes].copy()
     kept_node_ids = set(kept_nodes["node_id"].astype(int).tolist())
 
-    # Keep only links fully connected inside the kept node set
     a_inside = links_gdf["a_node"].astype(int).isin(kept_node_ids)
     b_inside = links_gdf["b_node"].astype(int).isin(kept_node_ids)
     geom_inside = links_gdf.geometry.intersects(rect)
@@ -151,10 +387,8 @@ def trim_network_to_bbox_raw(
         except Exception:
             pass
 
-    # Nodes: API has no delete; use SQLite (project holds DB open, use short timeout)
     if node_ids_to_remove:
-        db_files = list(project_dir.glob("*.sqlite")) + list(project_dir.glob("*.db")) + list(project_dir.glob("*.sqlite3"))
-        db_path = db_files[0] if db_files else project_dir / "project_database.sqlite"
+        db_path = _project_db_path(project_dir)
         conn = sqlite3.connect(str(db_path), timeout=30.0)
         placeholders = ",".join("?" * len(node_ids_to_remove))
         conn.execute(f"DELETE FROM nodes WHERE node_id IN ({placeholders})", node_ids_to_remove)
@@ -174,6 +408,374 @@ def trim_network_to_bbox_raw(
 
 
 # ----------------------------
+# OSM enrichment helpers
+# ----------------------------
+
+def _normalize_ref(value: Any) -> str:
+    text = str(value or "").upper().strip()
+    text = text.replace(" ", "")
+    text = text.replace("-", "")
+    text = text.replace("\\", "/")
+    text = text.replace("/", "")
+    return text
+
+
+def _listify(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    try:
+        if isinstance(value, float) and math.isnan(value):
+            return []
+    except Exception:
+        pass
+    if isinstance(value, (list, tuple, set)):
+        out: List[Any] = []
+        for item in value:
+            out.extend(_listify(item))
+        return out
+    return [value]
+
+
+def _extract_osm_ids(value: Any) -> List[int]:
+    """
+    Robust parser for osm_id values stored in the links table.
+    Handles:
+    - int / float
+    - stringified ints
+    - list-like strings: "[123, 456]"
+    - tuples / lists / sets
+    """
+    out: List[int] = []
+
+    if value is None:
+        return out
+
+    try:
+        if isinstance(value, float) and math.isnan(value):
+            return out
+    except Exception:
+        pass
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            out.extend(_extract_osm_ids(item))
+        return list(dict.fromkeys(out))
+
+    if isinstance(value, int):
+        return [int(value)]
+
+    if isinstance(value, float):
+        try:
+            return [int(value)]
+        except Exception:
+            return out
+
+    text = str(value).strip()
+    if not text:
+        return out
+
+    nums = re.findall(r"-?\d+", text)
+    for n in nums:
+        try:
+            out.append(int(n))
+        except Exception:
+            continue
+
+    return list(dict.fromkeys(out))
+
+
+def _clean_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, float) and math.isnan(value):
+            return None
+    except Exception:
+        pass
+    text = str(value).strip()
+    return text or None
+
+
+def _choose_best(counter: Counter) -> Optional[str]:
+    if not counter:
+        return None
+    return counter.most_common(1)[0][0]
+
+
+def _download_osm_drive_edges(
+    *,
+    place_name: Optional[str] = None,
+    bbox_cfg: Optional[Iterable[float]] = None,
+) -> gpd.GeoDataFrame:
+    try:
+        import osmnx as ox
+    except ImportError as e:
+        raise RuntimeError("Chybí osmnx. Doinstaluj: pip install osmnx") from e
+
+    if bbox_cfg:
+        west, south, east, north = [float(x) for x in bbox_cfg]
+        polygon = box(west, south, east, north)
+        G = ox.graph_from_polygon(
+            polygon,
+            network_type="drive",
+            simplify=False,
+            retain_all=True,
+            truncate_by_edge=True,
+        )
+    elif place_name:
+        G = ox.graph_from_place(
+            place_name,
+            network_type="drive",
+            simplify=False,
+            retain_all=True,
+            truncate_by_edge=True,
+        )
+    else:
+        raise ValueError("Need either bbox_cfg or place_name to download OSM edges")
+
+    _, edges = ox.graph_to_gdfs(G, nodes=True, edges=True, fill_edge_geometry=True)
+    edges = edges.reset_index()
+    return edges
+
+
+def _aggregate_osm_edge_attributes(edges: gpd.GeoDataFrame) -> Dict[int, Dict[str, Optional[str]]]:
+    """
+    Group OSMnx edges by osmid and aggregate attributes like ref/name/highway.
+    AequilibraE links often preserve the OSM way id as `osm_id`, so this is the cleanest join key.
+    """
+    grouped: Dict[int, Dict[str, Counter]] = defaultdict(lambda: {
+        "ref": Counter(),
+        "name": Counter(),
+        "highway": Counter(),
+    })
+
+    for _, row in edges.iterrows():
+        osmids = []
+        for raw_id in _listify(row.get("osmid")):
+            try:
+                osmids.append(int(raw_id))
+            except Exception:
+                continue
+
+        if not osmids:
+            continue
+
+        refs = [_clean_text(v) for v in _listify(row.get("ref"))]
+        refs = [v for v in refs if v]
+        names = [_clean_text(v) for v in _listify(row.get("name"))]
+        names = [v for v in names if v]
+        highways = [_clean_text(v) for v in _listify(row.get("highway"))]
+        highways = [v for v in highways if v]
+
+        for oid in osmids:
+            if refs:
+                grouped[oid]["ref"].update(refs)
+            if names:
+                grouped[oid]["name"].update(names)
+            if highways:
+                grouped[oid]["highway"].update(highways)
+
+    out: Dict[int, Dict[str, Optional[str]]] = {}
+    for oid, counters in grouped.items():
+        ref = _choose_best(counters["ref"])
+        name = _choose_best(counters["name"])
+        highway = _choose_best(counters["highway"])
+        out[oid] = {
+            "osm_ref": ref,
+            "osm_ref_norm": _normalize_ref(ref) if ref else None,
+            "osm_name_raw": name,
+            "osm_highway": highway,
+        }
+    return out
+
+
+def _ensure_link_enrichment_fields(project: Project) -> None:
+    fields_to_add = [
+        ("osm_ref", "OSM ref tag", "TEXT"),
+        ("osm_ref_norm", "Normalized OSM ref tag", "TEXT"),
+        ("osm_name_raw", "Original OSM name tag", "TEXT"),
+        ("osm_highway", "Original OSM highway tag", "TEXT"),
+    ]
+
+    for field_name, description, data_type in fields_to_add:
+        try:
+            project.network.links.fields.add(field_name, description, data_type)
+        except Exception:
+            pass
+
+    try:
+        project.network.links.refresh_fields()
+    except Exception:
+        pass
+
+    try:
+        project.network.links.refresh()
+    except Exception:
+        pass
+
+
+def enrich_links_from_osm(
+    project: Project,
+    project_dir: Path,
+    *,
+    crs_epsg_hint: int,
+    place_name: Optional[str] = None,
+    bbox_cfg: Optional[Iterable[float]] = None,
+) -> Dict[str, Any]:
+    """
+    Enrich AequilibraE links with OSM tags using existing `osm_id` in the links table.
+
+    Important:
+    - Prefer ACTUAL current project extent for OSM download.
+    - Use a smaller padding than before.
+    - Use unsimplified OSM graph to preserve original way refs better.
+    - Do a second pass to fill short missing ref gaps inside the same named corridor.
+    """
+    _ensure_link_enrichment_fields(project)
+
+    links_df = project.network.links.data.copy()
+    if links_df.empty:
+        return {
+            "total_links": 0,
+            "matched_osm_id": 0,
+            "updated": 0,
+            "filled_osm_ref": 0,
+            "filled_osm_name_raw": 0,
+            "filled_from_named_corridors": 0,
+            "download_bbox_wgs84": None,
+            "download_source": None,
+        }
+
+    if "osm_id" not in links_df.columns:
+        print("⚠ links table has no osm_id column -> OSM enrichment skipped")
+        return {
+            "total_links": int(len(links_df)),
+            "matched_osm_id": 0,
+            "updated": 0,
+            "filled_osm_ref": 0,
+            "filled_osm_name_raw": 0,
+            "filled_from_named_corridors": 0,
+            "download_bbox_wgs84": None,
+            "download_source": "missing_osm_id_column",
+        }
+
+    effective_bbox = None
+    download_source = None
+
+    try:
+        effective_bbox = _network_bbox_wgs84_from_project(project, crs_epsg_hint)
+        download_source = "project_extent"
+    except Exception as e:
+        print(f"⚠ could not derive enrichment bbox from current project extent: {e}")
+        if bbox_cfg:
+            effective_bbox = tuple(float(x) for x in bbox_cfg)
+            download_source = "config_bbox"
+        elif place_name:
+            effective_bbox = None
+            download_source = "place_name"
+        else:
+            raise RuntimeError("Could not determine any OSM download area for enrichment")
+
+    if effective_bbox is not None:
+        print("OSM enrichment bbox (WGS84):", effective_bbox)
+    else:
+        print("OSM enrichment area: place_name =", place_name)
+
+    edges = _download_osm_drive_edges(
+        place_name=place_name if effective_bbox is None else None,
+        bbox_cfg=effective_bbox,
+    )
+    osm_map = _aggregate_osm_edge_attributes(edges)
+
+    updates = []
+    matched_links = 0
+
+    for _, row in links_df.iterrows():
+        candidate_ids = _extract_osm_ids(row.get("osm_id"))
+        if not candidate_ids:
+            continue
+
+        attrs = None
+        for oid in candidate_ids:
+            attrs = osm_map.get(oid)
+            if attrs:
+                break
+
+        if not attrs:
+            continue
+
+        matched_links += 1
+        updates.append((
+            attrs.get("osm_ref"),
+            attrs.get("osm_ref_norm"),
+            attrs.get("osm_name_raw"),
+            attrs.get("osm_highway"),
+            int(row["link_id"]),
+        ))
+
+    db_path = _project_db_path(project_dir)
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
+    try:
+        # Clear old enrichment first, so reruns don't keep stale values
+        conn.execute(
+            """
+            UPDATE links
+               SET osm_ref = NULL,
+                   osm_ref_norm = NULL,
+                   osm_name_raw = NULL,
+                   osm_highway = NULL
+            """
+        )
+
+        if updates:
+            conn.executemany(
+                """
+                UPDATE links
+                   SET osm_ref = ?,
+                       osm_ref_norm = ?,
+                       osm_name_raw = ?,
+                       osm_highway = ?
+                 WHERE link_id = ?
+                """,
+                updates,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        project.network.links.refresh()
+    except Exception:
+        pass
+
+    if not updates:
+        print("⚠ no link matched OSM attributes by osm_id")
+
+    corridor_fill_stats = _fill_missing_refs_from_named_corridors(project, project_dir)
+
+    refreshed = project.network.links.data.copy()
+
+    filled_ref = 0
+    filled_name = 0
+    if not refreshed.empty:
+        if "osm_ref" in refreshed.columns:
+            filled_ref = int(refreshed["osm_ref"].notna().sum())
+        if "osm_name_raw" in refreshed.columns:
+            filled_name = int(refreshed["osm_name_raw"].notna().sum())
+
+    return {
+        "total_links": int(len(links_df)),
+        "matched_osm_id": int(matched_links),
+        "updated": int(len(updates)),
+        "filled_osm_ref": int(filled_ref),
+        "filled_osm_name_raw": int(filled_name),
+        "filled_from_named_corridors": int(corridor_fill_stats["filled"]),
+        "download_bbox_wgs84": list(effective_bbox) if effective_bbox is not None else None,
+        "download_source": download_source,
+    }
+
+
+# ----------------------------
 # Main
 # ----------------------------
 
@@ -186,7 +788,6 @@ def build_network_from_osm(
         outputs_dir = cfg.get("network", {}).get("maps_dir", "outputs/baseline/maps")
 
     project_dir = Path(cfg["project_path"])
-
     crs_epsg_hint = int(cfg.get("crs_epsg", 5514))
 
     osm_cfg = cfg.get("osm", {}) or {}
@@ -203,25 +804,38 @@ def build_network_from_osm(
 
     # --- Build network (only if empty) ---
     if links_before == 0 or nodes_before == 0:
-        # Priority: explicit bbox (OSM import area), else place_name.
         if bbox_cfg:
-            west, south, east, north = bbox_cfg
+            west, south, east, north = [float(x) for x in bbox_cfg]
             model_area = box(west, south, east, north)
             project.network.create_from_osm(model_area=model_area)
-            print(f"Network created from model_bbox: {bbox_cfg}")
+            print(f"Network created from model_bbox (WGS84): {bbox_cfg}")
         else:
             project.network.create_from_osm(place_name=place_name)
             print(f"Network created from place_name: {place_name}")
 
-    # --- Trim to config bbox (the area we actually want) ---
+    # --- Trim to desired area ---
     if bbox_cfg:
-        bbox_raw = tuple(float(x) for x in bbox_cfg)
+        bbox_native = _native_bbox_from_wgs84_bbox(project, bbox_cfg, crs_epsg_hint)
+        bbox_wgs84_used = tuple(float(x) for x in bbox_cfg)
+        print("Trim bbox from config (WGS84):", bbox_wgs84_used)
+        print("Trim bbox converted to native coords:", bbox_native)
     else:
-        bbox_raw = compute_bbox_from_links_raw(project)
-    print("Trim bbox:", bbox_raw)
+        bbox_native = compute_bbox_from_links_raw(project)
+        bbox_wgs84_used = None
+        print("Trim bbox (native, derived from links):", bbox_native)
 
-    trim_stats = trim_network_to_bbox_raw(project, bbox_raw, project_dir)
+    trim_stats = trim_network_to_bbox_raw(project, bbox_native, project_dir)
     print("Trimmed network:", trim_stats)
+
+    # --- OSM enrichment of links ---
+    enrich_stats = enrich_links_from_osm(
+        project,
+        project_dir,
+        crs_epsg_hint=crs_epsg_hint,
+        place_name=place_name,
+        bbox_cfg=bbox_cfg,
+    )
+    print("OSM enrichment:", enrich_stats)
 
     # --- Visual verification artifacts ---
     out_dir = Path(outputs_dir)
@@ -238,13 +852,15 @@ def build_network_from_osm(
                 "nodes": int(nodes_n),
                 "place_name": place_name or "",
                 "osm_bbox_used_for_import_wgs84": bbox_cfg or None,
-                "raw_bbox_from_links_db_coords": {
-                    "minx": bbox_raw[0],
-                    "miny": bbox_raw[1],
-                    "maxx": bbox_raw[2],
-                    "maxy": bbox_raw[3],
+                "trim_bbox_wgs84_requested": list(bbox_wgs84_used) if bbox_wgs84_used is not None else None,
+                "trim_bbox_native_used": {
+                    "minx": bbox_native[0],
+                    "miny": bbox_native[1],
+                    "maxx": bbox_native[2],
+                    "maxy": bbox_native[3],
                 },
                 "trim_stats": trim_stats,
+                "enrich_stats": enrich_stats,
             },
             indent=2,
         )
@@ -255,26 +871,26 @@ def build_network_from_osm(
     # Prepare GDFs for plotting/export
     links_df = project.network.links.data
     links_gdf_native = gpd.GeoDataFrame(links_df, geometry="geometry", crs=getattr(links_df, "crs", None))
-    bbox_poly_native = box(*bbox_raw)
+    bbox_poly_native = box(*bbox_native)
     bbox_gdf_native = gpd.GeoDataFrame({"geometry": [bbox_poly_native]}, crs=links_gdf_native.crs)
 
-    # Plot in "native" coords (always consistent with bbox)
+    # Plot in native coords
     fig, ax = plt.subplots(figsize=(10, 10))
     links_gdf_native.plot(ax=ax, linewidth=0.2, zorder=1)
     bbox_gdf_native.boundary.plot(ax=ax, linewidth=3.0, zorder=3)
-    ax.set_title("AequilibraE links + RAW bbox (native DB coords)")
+    ax.set_title("AequilibraE links + native trim bbox")
     ax.set_axis_off()
     png_path_native = out_dir / "links_native.png"
     fig.savefig(png_path_native, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
-    # Also export GeoJSON (native coords)
+    # Export GeoJSON (native coords)
     geojson_path_native = out_dir / "links_native.geojson"
     bbox_geojson_path_native = out_dir / "model_bbox_native.geojson"
 
     base_cols = ["link_id", "a_node", "b_node", "direction", "modes", "distance", "geometry"]
     osm_attr_cols = ["speed_ab", "speed_ba", "lanes_ab", "lanes_ba", "travel_time_ab", "travel_time_ba"]
-    metadata_cols = ["link_type", "name", "osm_id"]
+    metadata_cols = ["link_type", "name", "osm_id", "osm_ref", "osm_ref_norm", "osm_name_raw", "osm_highway"]
     active_transport_cols = ["cycleway", "cycleway_left", "cycleway_right", "busway", "busway_left", "busway_right"]
     capacity_cols = ["capacity_ab", "capacity_ba"]
 
@@ -284,7 +900,7 @@ def build_network_from_osm(
     links_gdf_native[available_cols].to_file(geojson_path_native, driver="GeoJSON")
     bbox_gdf_native.to_file(bbox_geojson_path_native, driver="GeoJSON")
 
-    # Optional: WGS84 export if CRS can be guessed (for easy QGIS)
+    # Optional: WGS84 export
     links_gdf_plot = links_gdf_native.copy()
     if links_gdf_plot.crs is None:
         links_gdf_plot = _as_gdf(links_gdf_plot, crs_epsg_hint)
@@ -319,8 +935,11 @@ def build_network_from_osm(
     print("=== NETWORK BUILD DONE ===")
     print("Project:", project_dir.resolve())
     print("Nodes:", nodes_n, "Links:", links_n)
-    print("RAW bbox (native coords):", bbox_raw)
+    print("Native trim bbox:", bbox_native)
+    if bbox_wgs84_used is not None:
+        print("Requested trim bbox (WGS84):", bbox_wgs84_used)
     print("Trim stats:", trim_stats)
+    print("Enrich stats:", enrich_stats)
     print("Wrote:", counts_path)
     print("Wrote:", png_path_native)
     print("Wrote:", geojson_path_native)

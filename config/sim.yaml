@@ -20,6 +20,13 @@ zoning:
     - place: "Okres Brno-venkov, Czechia"
       admin_level: "9"
 
+  aoi:
+    quantile: 0.003
+    pad_ratio: 0.008
+    extra_margin_m: 200
+    shift_x_m: 0
+    shift_y_m: 0
+
   zone_area_filter:
     enabled: true
     rel_factor: 10
@@ -38,21 +45,35 @@ zoning:
 
   external_gateways:
     enabled: true
-    zone_offset_m: 4000
-    zone_size_m: 800
+    whitelist: ["D1", "D2", "I/43", "I/50", "I/52", "I/23"]
+    boundary_buffer_m: 600
+    min_gateway_separation_m: 1800
+    zone_size_m: 40
+    zone_offset_m: 10
     connectors_per_gateway: 2
-    candidate_outer_quantile: 0.90
+    candidate_outer_quantile: 0.95
+    allowed_link_types:
+      - motorway
+      - motorway_link
+      - trunk
+      - trunk_link
+      - primary
+      - primary_link
 
 # OD matice
 demand:
+  output_dir: "outputs/baseline/demand"
   matrix_path: "data/demand/od_matrix.aem"
   matrix_name: "demand"
-  output_dir: "outputs/baseline/demand"
 
+  # důležité: povolit fallback externích commuting toků na gateway zóny
   use_gateway_fallback_in_commuting: true
 
   sldb:
-    include_lokalizace: ["0_na_adrese_OP", "1_meziobecni"]
+    include_lokalizace:
+      - "0_na_adrese_OP"
+      - "1_meziobecni"
+    # důležité: nepoužívat jen interní páry, jinak se externí commuting ztrácí
     only_internal_pairs: false
 
   conversion:
@@ -65,53 +86,72 @@ demand:
       occupancy: 1.30
       trips_per_person: 2.0
 
-  gateways:
-    - name: "D1_north"
-      direction_deg: 340
-      angle_range: [300, 20]
-    - name: "D2_east"
-      direction_deg: 80
-      angle_range: [50, 110]
-    - name: "D52_south"
-      direction_deg: 200
-      angle_range: [170, 230]
-    - name: "I43_northwest"
-      direction_deg: 330
-      angle_range: [295, 340]
-    - name: "I50_east"
-      direction_deg: 90
-      angle_range: [60, 120]
-    - name: "I41_south"
-      direction_deg: 190
-      angle_range: [160, 210]
-    - name: "I23_west"
-      direction_deg: 260
-      angle_range: [230, 295]
-
   segments:
     other:
       source: "gravity"
       trip_rate: 1.5
       car_share: 0.45
       occupancy: 1.40
+      beta: 0.0001
 
-    external:
-      source: "gateway_gravity"
-      total_daily_trips: 150000
-      through_share: 0.35
+    external_local:
+      source: "gateway_local"
+      total_daily_trips: 50000
+      corridor_weights: {}
 
-  distribution:
-    enabled: false
+    external_through:
+      source: "gateway_pairs"
+      total_daily_trips: 100000
+      default_pair_weight: 1.0
+      pairs: []
 
   time_slices:
     periods: ["am", "ip", "pm", "ev"]
+
     weekday:
       work:
-        outbound: {"am": 0.80, "ip": 0.20}
-        return: {"pm": 0.80, "ev": 0.20}
+        outbound:
+          am: 0.80
+          ip: 0.20
+        return:
+          pm: 0.80
+          ev: 0.20
       school:
-        outbound: {"am": 0.90, "ip": 0.10}
-        return: {"pm": 0.70, "ev": 0.30}
+        outbound:
+          am: 0.90
+          ip: 0.10
+        return:
+          pm: 0.70
+          ev: 0.30
+
+    segments:
+      other:
+        am: 0.25
+        ip: 0.30
+        pm: 0.30
+        ev: 0.15
+      external_local:
+        am: 0.28
+        ip: 0.22
+        pm: 0.30
+        ev: 0.20
+      external_through:
+        am: 0.24
+        ip: 0.28
+        pm: 0.30
+        ev: 0.18
+
+  distribution:
+    enabled: false
+    deterrence_function: "EXPO"
+    pa_trip_rate: 2.5
+    pa_car_share: 0.50
+    pa_occupancy: 1.30
+    ipf_max_iter: 200
+    ipf_tolerance: 0.001
+
+    # dočasně menší váha IPF/blendu, dokud distribuce ještě neběží nad síťovými skimy
+    blend_alpha: 0.35
 
 # Kalibrace a validace
 calibration:
@@ -120,47 +160,45 @@ calibration:
   rgap_target: 0.001
   core_name: "wd_daily"
 
-  match_buffer_m: 50.0
-  match_direction_aware: false
+  gateway_calibration:
+    enabled: true
+    observed_path: "data/cache/gateway_counts_2025.parquet"
+    damping: 0.15
+    min_factor: 0.85
+    max_factor: 1.15
+
+  match_buffer_m: 25.0
+
+  # důležité: zapnout direction-aware match
+  match_direction_aware: true
   match_conflict_resolution: "nearest"
   count_target: "car_only"
+
+  # důležité: pro dělené komunikace agregovat koridor
   aggregate_corridor: false
   save_skims: true
 
-  max_iterations: 10
+  max_iterations: 15
   convergence:
     geh_lt5_target_pct: 85.0
-    min_improvement_pct: 0.1
+
+    # malé dočasné zhoršení GEH nesmí zastavit kalibraci hned po 2. iteraci
+    # funguje jako "povolená tolerance" pro přechodné výkyvy
+    min_improvement_pct: -2.0
 
   scaling:
     method: "global"
-    damping: 0.3
-    min_factor: 0.7
-    max_factor: 1.3
-    sectors:
-      n_sectors: 5
+    damping: 0.15
+    min_factor: 0.85
+    max_factor: 1.15
 
   screenlines_path: "config/screenlines.yaml"
-
-  journey_time_validation:
-    enabled: false
-
-  supply_tuning:
-    enabled: false
-
-  period_calibration:
-    enabled: false
 
 # Datové sady
 datasets:
   enabled: true
   root_dir: "data/sources"
   cache_dir: "data/cache"
-
-  aoi:
-    use_model_bbox: true
-    bbox_epsg: 4326
-    target_epsg: 5514
 
   http:
     timeout_s: 60
@@ -210,11 +248,14 @@ datasets:
       usage:
         calibration_target: "link_counts"
 
+    # legacy název ponechaný kvůli loaderu;
+    # POZOR: tady máš aktuálně URL na CSD 2025, ne 2020
     validation_csd2020_v2:
       enabled: true
+      year: 2025
       provider: "http_file"
-      url: "https://rsd.cz/documents/38144/55309/V2_CSD2020_oprava15122022.xlsx/075ae1be-1a2f-dca0-2789-e76ff80d2694?t=1671525226422"
-      out_path: "data/sources/rsd/csd2020/V2_CSD2020.xlsx"
+      url: "https://www.rsd.cz/documents/38144/3734982/V2_CSD_2025.xlsx/50663492-395b-0fd4-f365-d18440997ca5?t=1773922634346"
+      out_path: "data/sources/rsd/csd2025/V2_CSD2025.xlsx"
       format:
         type: "xlsx"
       usage:

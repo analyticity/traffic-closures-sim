@@ -1,15 +1,22 @@
 """
 Generic TAZ zoning (priority + AOI-from-network + optional prefilter + connectors + map).
 
-CO JE OPRAVENO:
-- AOI už není axis-aligned bbox z min/max X,Y (který v EPSG:5514 často působí „nahnutě“ vůči síti),
-  ale počítá se jako ORIENTOVANÝ (rotovaný) čtverec podle hlavní osy sítě (PCA / principal axis).
-- Minima/maxima se tedy berou v otočeném souřadném systému (u,v), a výsledný čtverec se vrátí zpět
-  do EPSG:5514 jako Polygon (rotovaný rámeček).
+UPRAVENO:
+- AOI už není axis-aligned bbox z min/max X,Y, ale ORIENTOVANÝ čtverec podle hlavní osy sítě.
+- External gateway zóny už neleží radiálně kolem středu AOI.
+- External centroid se ukládá za HRANICI modelu (AOI) podle boundary pointu gatewaye.
+- External connectory se napojují přímo na vybrané cílové road nodes.
+- Pokud by centroid ležel moc blízko existujícímu node, posune se jen dál po stejné outward ose.
+- Exportované external zóny dostanou population=0.
+- Mapa používá vlastní legendu, takže už nehází warning s PatchCollection.
 
-POZNÁMKA:
-- Funkce filter_zones_centroid_in_bbox() i nadále funguje, protože testuje within() nad geometrií AOI.
-  Jen AOI už není "box", ale Polygon (rotovaný).
+NOVĚ:
+- Gatewaye se hledají AUTOMATICKY podél hranice AOI.
+- Používá se JEN jednoduchý whitelist koridorů v configu.
+- Kód vezme boundary-near linky, odfiltruje je podle whitelistu, rozclusteruje je po okraji
+  a z každého clusteru vytvoří jeden gateway.
+- External zóna se kotví na boundary point AOI, ne na anchor road node.
+- Žádná hardcoded gateway knihovna pro konkrétní město.
 """
 
 from __future__ import annotations
@@ -17,16 +24,19 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
+import sqlite3
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
-import geopandas as gpd
 from aequilibrae import Project
 from shapely.affinity import translate
-from shapely.geometry import LineString, Polygon, box, MultiPoint
-from shapely.ops import unary_union
+from shapely.geometry import LineString, MultiPoint, Point, Polygon, box
+from shapely.ops import nearest_points, unary_union
 
 from sim.io_project import load_config
 
@@ -37,6 +47,12 @@ from sim.io_project import load_config
 
 def _safe_path(p: str | Path) -> Path:
     return p if isinstance(p, Path) else Path(p)
+
+
+def _load_cfg(config_or_path: str | Path | Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(config_or_path, dict):
+        return config_or_path
+    return load_config(config_or_path)
 
 
 def _fix_polygons(g: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -66,17 +82,14 @@ def _to_wgs84_point(point, crs_from) -> Any:
 
 
 def _guess_crs_from_coords(geoms: gpd.GeoSeries, target_epsg: int) -> str:
-    """
-    Heuristic:
-    - If coordinates look like degrees (|x| <= 180 and |y| <= 90-ish) -> EPSG:4326
-    - Otherwise assume target_epsg (e.g., 5514)
-    """
     s = geoms.dropna()
     if s.empty:
         return f"EPSG:{target_epsg}"
+
     s = s.iloc[:200]
     xs: List[float] = []
     ys: List[float] = []
+
     for g in s:
         try:
             c = g.centroid
@@ -84,6 +97,7 @@ def _guess_crs_from_coords(geoms: gpd.GeoSeries, target_epsg: int) -> str:
             ys.append(float(c.y))
         except Exception:
             continue
+
     if not xs or not ys:
         return f"EPSG:{target_epsg}"
 
@@ -94,12 +108,171 @@ def _guess_crs_from_coords(geoms: gpd.GeoSeries, target_epsg: int) -> str:
         return "EPSG:4326"
     return f"EPSG:{target_epsg}"
 
+def _circular_mean_ring_pos(values: List[float], ring_length: float) -> float:
+    if not values:
+        return 0.0
+    if ring_length <= 0:
+        return float(np.mean(values))
+
+    ang = np.array(values, dtype=float) / float(ring_length) * (2.0 * np.pi)
+    s = np.sin(ang).mean()
+    c = np.cos(ang).mean()
+    mean_ang = math.atan2(s, c)
+    if mean_ang < 0:
+        mean_ang += 2.0 * np.pi
+    return float(mean_ang / (2.0 * np.pi) * float(ring_length))
+
+
+def _pick_nodes_near_boundary(
+    node_ids: List[int],
+    node_geom: Dict[int, Point],
+    boundary: Any,
+    node_weight: Dict[int, float],
+    *,
+    max_nodes: int,
+    min_node_sep_m: float = 25.0,
+) -> List[int]:
+    rows = []
+    for nid in node_ids:
+        geom = node_geom.get(int(nid))
+        if geom is None:
+            continue
+        rows.append({
+            "node_id": int(nid),
+            "dist_boundary": float(geom.distance(boundary)),
+            "road_weight": float(node_weight.get(int(nid), 0.0)),
+            "geometry": geom,
+        })
+
+    if not rows:
+        return []
+
+    df = pd.DataFrame(rows).sort_values(
+        ["dist_boundary", "road_weight"],
+        ascending=[True, False],
+    )
+
+    chosen: List[int] = []
+    for _, row in df.iterrows():
+        nid = int(row["node_id"])
+        g = node_geom[nid]
+        too_close = False
+        for kept in chosen:
+            if float(g.distance(node_geom[int(kept)])) < float(min_node_sep_m):
+                too_close = True
+                break
+        if not too_close:
+            chosen.append(nid)
+        if len(chosen) >= int(max_nodes):
+            break
+
+    if not chosen and not df.empty:
+        chosen = [int(df.iloc[0]["node_id"])]
+
+    return chosen
+
+
+def _merge_gateway_candidates_on_boundary(
+    gateway_targets: Dict[str, List[int]],
+    gateway_meta: Dict[str, Dict[str, Any]],
+    node_geom: Dict[int, Point],
+    node_weight: Dict[int, float],
+    model_area: Any,
+    *,
+    merge_distance_m: float,
+    nodes_per_gateway: int,
+) -> Tuple[Dict[str, List[int]], Dict[str, Dict[str, Any]]]:
+    if len(gateway_meta) <= 1:
+        return gateway_targets, gateway_meta
+
+    boundary = model_area.boundary
+    ring_length = float(boundary.length)
+
+    df = pd.DataFrame(
+        [
+            {
+                "gateway_name": gw_name,
+                "boundary_pos": float(meta.get("boundary_pos", 0.0)),
+            }
+            for gw_name, meta in gateway_meta.items()
+        ]
+    )
+
+    clusters = _cluster_positions_on_ring(
+        df=df,
+        pos_col="boundary_pos",
+        threshold_m=float(merge_distance_m),
+        ring_length=ring_length,
+    )
+
+    merged_targets: Dict[str, List[int]] = {}
+    merged_meta: Dict[str, Dict[str, Any]] = {}
+
+    for cl in clusters:
+        names = cl["gateway_name"].tolist()
+        metas = [gateway_meta[n] for n in names]
+
+        rep = sorted(
+            metas,
+            key=lambda m: (
+                int(m.get("whitelist_priority", 9999)),
+                float(m.get("dist_boundary_m", 1e9)),
+                -float(_ROAD_CLASS_WEIGHT.get(str(m.get("link_type", "")), 0.0)),
+            ),
+        )[0]
+
+        cluster_boundary_pos = _circular_mean_ring_pos(
+            [float(m.get("boundary_pos", 0.0)) for m in metas],
+            ring_length,
+        )
+        cluster_boundary_pt = boundary.interpolate(cluster_boundary_pos)
+
+        union_nodes: List[int] = []
+        for m in metas:
+            for nid in m.get("target_node_ids", []):
+                nid = int(nid)
+                if nid in node_geom and nid not in union_nodes:
+                    union_nodes.append(nid)
+
+        chosen = _pick_nodes_near_boundary(
+            union_nodes,
+            node_geom,
+            boundary,
+            node_weight,
+            max_nodes=int(nodes_per_gateway),
+            min_node_sep_m=25.0,
+        )
+
+        if not chosen:
+            anchor_id = int(rep["anchor_node_id"])
+            chosen = [anchor_id] if anchor_id in node_geom else []
+
+        if not chosen:
+            continue
+
+        anchor_id = int(chosen[0])
+        anchor_geom = node_geom[anchor_id]
+
+        new_meta = dict(rep)
+        new_meta["target_node_ids"] = chosen
+        new_meta["anchor_node_id"] = int(anchor_id)
+        new_meta["anchor_x"] = float(anchor_geom.x)
+        new_meta["anchor_y"] = float(anchor_geom.y)
+        new_meta["boundary_x"] = float(cluster_boundary_pt.x)
+        new_meta["boundary_y"] = float(cluster_boundary_pt.y)
+        new_meta["boundary_pos"] = float(cluster_boundary_pos)
+        new_meta["merged_from"] = "|".join(names)
+
+        merged_targets[new_meta["gateway_name"]] = chosen
+        merged_meta[new_meta["gateway_name"]] = new_meta
+
+        if len(names) > 1:
+            print(f"  merged boundary-near gateways {names} -> {new_meta['gateway_name']}")
+
+    return merged_targets, merged_meta
+
 
 def _looks_like_degrees(geoms: gpd.GeoSeries) -> bool:
-    """
-    Stronger "looks like WGS84 degrees" check. We only need to detect the common failure mode:
-    lon/lat coordinates incorrectly labeled as EPSG:5514.
-    """
     s = geoms.dropna()
     if s.empty:
         return False
@@ -107,6 +280,7 @@ def _looks_like_degrees(geoms: gpd.GeoSeries) -> bool:
 
     xs: List[float] = []
     ys: List[float] = []
+
     for g in s:
         try:
             c = g.centroid
@@ -114,6 +288,7 @@ def _looks_like_degrees(geoms: gpd.GeoSeries) -> bool:
             ys.append(float(c.y))
         except Exception:
             continue
+
     if not xs or not ys:
         return False
 
@@ -123,12 +298,12 @@ def _looks_like_degrees(geoms: gpd.GeoSeries) -> bool:
     return (max_abs_x <= 180.0) and (max_abs_y <= 90.0)
 
 
-def _force_to_target_crs(gdf: gpd.GeoDataFrame, target_epsg: int, *, name: str = "gdf") -> gpd.GeoDataFrame:
-    """
-    CRS-safe conversion into target_epsg with a guard against:
-    - CRS missing -> guess
-    - CRS says target_epsg but coords look like degrees -> override to EPSG:4326 then convert
-    """
+def _force_to_target_crs(
+    gdf: gpd.GeoDataFrame,
+    target_epsg: int,
+    *,
+    name: str = "gdf",
+) -> gpd.GeoDataFrame:
     if gdf.empty:
         if gdf.crs is None:
             return gdf.set_crs(epsg=target_epsg, allow_override=True)
@@ -206,23 +381,12 @@ def _oriented_square_from_points(
     pad_ratio: float = 0.005,
     make_square: bool = True,
 ) -> Polygon:
-    """
-    Oriented AOI based on MINIMUM ROTATED RECTANGLE (MRR) of convex hull
-    (more stable than PCA for "city-shaped" networks).
-
-    Steps:
-    1) pre-trim XY by quantile to drop long spikes
-    2) convex hull -> minimum_rotated_rectangle -> get dominant edge angle
-    3) rotate points into that frame, trim by quantile in (u,v)
-    4) pad + optional square, rotate back -> Polygon
-    """
     if xs.size < 3:
         return box(float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
 
     q = float(quantile)
     q = max(0.0, min(q, 0.49))
 
-    # --- pre-trim in XY (reduces effect of long branches) ---
     x_lo, x_hi = np.quantile(xs, [q, 1.0 - q])
     y_lo, y_hi = np.quantile(ys, [q, 1.0 - q])
     mask = (xs >= x_lo) & (xs <= x_hi) & (ys >= y_lo) & (ys <= y_hi)
@@ -230,12 +394,10 @@ def _oriented_square_from_points(
     pts = np.column_stack([xs, ys])
     pts_core = pts[mask] if mask.sum() >= 50 else pts
 
-    # --- MRR angle from convex hull ---
     hull = MultiPoint(pts_core).convex_hull
     mrr = hull.minimum_rotated_rectangle
 
     coords = list(mrr.exterior.coords)
-    # coords: 5 points (closed ring). Find longest edge.
     best_dx, best_dy, best_len2 = 1.0, 0.0, -1.0
     for i in range(4):
         x1, y1 = coords[i]
@@ -246,21 +408,17 @@ def _oriented_square_from_points(
             best_len2 = l2
             best_dx, best_dy = dx, dy
 
-    angle = float(np.arctan2(best_dy, best_dx))  # radians
+    angle = float(np.arctan2(best_dy, best_dx))
 
-    # --- rotate all points into (u,v) frame around center ---
     cx, cy = pts_core.mean(axis=0)
     c = float(np.cos(-angle))
     s = float(np.sin(-angle))
 
-    # rotate: [u] = [ c -s ] [x-cx]
-    #         [v]   [ s  c ] [y-cy]
     dx = pts[:, 0] - cx
     dy = pts[:, 1] - cy
     u = c * dx - s * dy
     v = s * dx + c * dy
 
-    # quantile trim in rotated frame
     u_lo, u_hi = np.quantile(u, [q, 1.0 - q])
     v_lo, v_hi = np.quantile(v, [q, 1.0 - q])
 
@@ -289,7 +447,6 @@ def _oriented_square_from_points(
         [u_lo, v_hi],
     ])
 
-    # rotate back by +angle
     c2 = float(np.cos(angle))
     s2 = float(np.sin(angle))
     corners_xy = []
@@ -299,6 +456,128 @@ def _oriented_square_from_points(
         corners_xy.append((x, y))
 
     return Polygon(corners_xy)
+
+
+def _safe_line_midpoint(geom: Any) -> Point:
+    try:
+        if geom is None or geom.is_empty:
+            return Point(0, 0)
+        if geom.geom_type == "LineString":
+            return geom.interpolate(0.5, normalized=True)
+        if geom.geom_type == "MultiLineString":
+            longest = max(list(geom.geoms), key=lambda g: g.length)
+            return longest.interpolate(0.5, normalized=True)
+        return geom.representative_point()
+    except Exception:
+        try:
+            return geom.representative_point()
+        except Exception:
+            return Point(0, 0)
+
+
+def _first_number(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        try:
+            return float(value)
+        except Exception:
+            return default
+    if isinstance(value, (list, tuple)) and value:
+        return _first_number(value[0], default=default)
+    text = str(value).strip()
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    if not m:
+        return default
+    try:
+        return float(m.group(0))
+    except Exception:
+        return default
+
+
+def _bearing_deg(cx: float, cy: float, x: float, y: float) -> float:
+    # 0 = north, 90 = east
+    return math.degrees(math.atan2(x - cx, y - cy)) % 360.0
+
+
+def _normalize_vector(dx: float, dy: float) -> Tuple[float, float]:
+    norm = math.hypot(dx, dy)
+    if norm <= 1e-12:
+        return 1.0, 0.0
+    return dx / norm, dy / norm
+
+
+def _candidate_external_steps() -> List[float]:
+    return [0.0, 2.0, 5.0, 10.0, 15.0, 25.0]
+
+
+def _point_is_too_close(pt: Point, occupied_points: List[Any], min_sep_m: float = 1.0) -> bool:
+    for op in occupied_points:
+        try:
+            if pt.distance(op) < min_sep_m:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _row_is_external(row: pd.Series) -> bool:
+    val = row.get("is_external", 0)
+    if pd.isna(val):
+        return False
+    return int(val) == 1
+
+
+def _compass8(angle: float) -> str:
+    labels = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    idx = int(((angle % 360.0) + 22.5) // 45.0) % 8
+    return labels[idx]
+
+
+def _norm_text(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.replace(" ", "")
+    text = text.replace("/", "")
+    text = text.replace("\\", "")
+    text = text.replace("-", "")
+    text = text.replace(".", "")
+    return text
+
+
+def _slug_token(value: Any) -> str:
+    text = _norm_text(value)
+    return text or "GW"
+
+
+def _resolve_whitelist(ext_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = ext_cfg.get("whitelist") or []
+    return [
+        {
+            "raw": str(item),
+            "norm": _norm_text(item),
+            "slug": _slug_token(item),
+        }
+        for item in raw
+        if str(item).strip()
+    ]
+
+
+def _match_ref_token(row: pd.Series, token_norm: str) -> int:
+    for col in ("osm_ref_norm", "osm_ref", "ref"):
+        if col in row and pd.notna(row.get(col)):
+            if _norm_text(row.get(col)) == token_norm:
+                return 1
+    return 0
+
+
+def _match_name_token(row: pd.Series, token_norm: str) -> int:
+    for col in ("osm_name_raw", "name"):
+        if col in row and pd.notna(row.get(col)):
+            if token_norm and token_norm in _norm_text(row.get(col)):
+                return 1
+    return 0
 
 
 # ----------------------------
@@ -389,224 +668,6 @@ def remove_overlaps_by_priority(
 
     return _fix_polygons(out)
 
-def _angle_in_range(angle: float, lo: float, hi: float) -> bool:
-    angle = angle % 360.0
-    lo = lo % 360.0
-    hi = hi % 360.0
-    if lo <= hi:
-        return lo <= angle <= hi
-    return angle >= lo or angle <= hi
-
-
-def _angular_distance_deg(a: float, b: float) -> float:
-    d = abs((a - b) % 360.0)
-    return min(d, 360.0 - d)
-
-
-def _bearing_deg(cx: float, cy: float, x: float, y: float) -> float:
-    # 0 = north, 90 = east  (stejná konvence jako v build-demand.py)
-    return math.degrees(math.atan2(x - cx, y - cy)) % 360.0
-
-
-def _build_external_gateway_zones(
-    model_area: Any,
-    crs_epsg: int,
-    gateways_cfg: List[Dict[str, Any]],
-    *,
-    zone_offset_m: float = 4000.0,
-    zone_size_m: float = 800.0,
-    start_id: int = 8_000_000_000,
-) -> gpd.GeoDataFrame:
-    if not gateways_cfg:
-        return gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{crs_epsg}")
-
-    center = model_area.representative_point()
-    cx, cy = float(center.x), float(center.y)
-
-    boundary_coords = list(model_area.exterior.coords)
-    max_r = max(math.hypot(x - cx, y - cy) for x, y in boundary_coords)
-
-    half = zone_size_m / 2.0
-    rows = []
-
-    for i, gw in enumerate(gateways_cfg):
-        gw_name = str(gw.get("name", f"gw_{i}")).strip()
-        ang = math.radians(float(gw.get("direction_deg", 0.0)) % 360.0)
-
-        # 0=north, 90=east
-        x = cx + math.sin(ang) * (max_r + zone_offset_m)
-        y = cy + math.cos(ang) * (max_r + zone_offset_m)
-
-        geom = translate(
-            box(-half, -half, half, half),
-            xoff=x,
-            yoff=y,
-        )
-
-        rows.append({
-            "zone_id": start_id + i,
-            "name": f"EXT_{gw_name}",
-            "source_rank": 999,
-            "is_external": 1,
-            "gateway_name": gw_name,
-            "geometry": geom,
-        })
-
-    return gpd.GeoDataFrame(rows, crs=f"EPSG:{crs_epsg}")
-
-
-def _select_gateway_target_nodes(
-    project: Project,
-    target_epsg: int,
-    model_area: Any,
-    gateways_cfg: List[Dict[str, Any]],
-    *,
-    nodes_per_gateway: int = 2,
-    outer_quantile: float = 0.90,
-) -> Dict[str, List[int]]:
-    road_nids, node_weight = _eligible_road_nodes(project)
-    if not road_nids:
-        return {}
-
-    nodes_gdf = _network_ref(project, "nodes", target_epsg)
-    eligible = nodes_gdf[nodes_gdf["node_id"].astype(int).isin(road_nids)].copy()
-    if eligible.empty:
-        return {}
-
-    eligible["road_weight"] = eligible["node_id"].map(node_weight).fillna(0.5)
-
-    center = model_area.representative_point()
-    cx, cy = float(center.x), float(center.y)
-
-    eligible["_dist_center"] = np.sqrt(
-        (eligible.geometry.x - cx) ** 2 + (eligible.geometry.y - cy) ** 2
-    )
-    eligible["_angle"] = eligible.geometry.apply(
-        lambda g: _bearing_deg(cx, cy, float(g.x), float(g.y))
-    )
-
-    outer_thr = float(eligible["_dist_center"].quantile(outer_quantile))
-    outer = eligible[eligible["_dist_center"] >= outer_thr].copy()
-    if outer.empty:
-        outer = eligible.copy()
-
-    out: Dict[str, List[int]] = {}
-
-    for gw in gateways_cfg:
-        gw_name = str(gw.get("name", "")).strip()
-        lo, hi = gw.get("angle_range", [0, 360])
-        dir_deg = float(gw.get("direction_deg", 0.0)) % 360.0
-
-        cand = outer[
-            outer["_angle"].apply(lambda a: _angle_in_range(float(a), float(lo), float(hi)))
-        ].copy()
-
-        if cand.empty:
-            cand = outer.copy()
-
-        cand["_ang_err"] = cand["_angle"].apply(
-            lambda a: _angular_distance_deg(float(a), dir_deg)
-        )
-
-        cand = cand.sort_values(
-            ["_ang_err", "road_weight", "_dist_center"],
-            ascending=[True, False, False],
-        )
-
-        chosen = cand["node_id"].astype(int).head(nodes_per_gateway).tolist()
-        out[gw_name] = chosen
-        print(f"  gateway targets {gw_name}: {chosen}")
-
-    return out
-
-# ----------------------------
-# Download zones (OSM, generic)
-# ----------------------------
-
-def download_zones_from_sources(
-    sources: List[Dict[str, Any]],
-    crs_epsg: int,
-    cache_file: Optional[Path],
-    area_filter_cfg: Dict[str, Any],
-) -> gpd.GeoDataFrame:
-    try:
-        import osmnx as ox
-    except ImportError as e:
-        raise RuntimeError("Chybí osmnx. Doinstaluj: pip install osmnx") from e
-
-    if cache_file is not None:
-        cache_file = _safe_path(cache_file)
-        cached = _read_cache(cache_file, crs_epsg)
-        if cached is not None:
-            return cached
-
-    enabled = bool(area_filter_cfg.get("enabled", True))
-    rel_factor = float(area_filter_cfg.get("rel_factor", 10.0))
-    abs_max_km2 = area_filter_cfg.get("abs_max_km2", None)
-    abs_max_km2 = None if abs_max_km2 in ("", "null", "None") else abs_max_km2
-    abs_max_km2 = float(abs_max_km2) if abs_max_km2 is not None else None
-
-    parts: List[gpd.GeoDataFrame] = []
-
-    for rank, src in enumerate(sources):
-        place = src["place"]
-        admin_level = str(src.get("admin_level", "")).strip()
-        tags = src.get("tags") or {"boundary": "administrative", "admin_level": admin_level}
-
-        print(f"=== DOWNLOAD zones[{rank}] place={place} tags={tags} ===")
-        g = ox.features.features_from_place(place, tags)
-
-        if g is None or len(g) == 0:
-            print("⚠ 0 features")
-            continue
-
-        g = g.reset_index()
-        g = _fix_polygons(g)
-        if g.empty:
-            print("⚠ no polygonal features after fix")
-            continue
-
-        osmid_col = next((c for c in ("osmid", "osm_id", "id") if c in g.columns), None)
-        zone_id = g[osmid_col].map(_normalize_osmid) if osmid_col else range(1, len(g) + 1)
-        name = g["name"].fillna("zone") if "name" in g.columns else "zone"
-
-        out = gpd.GeoDataFrame(
-            {"zone_id": zone_id, "name": name, "source_rank": rank, "geometry": g.geometry},
-            crs="EPSG:4326",
-        )
-
-        if crs_epsg != 4326:
-            out = out.to_crs(epsg=crs_epsg)
-
-        out = out.drop_duplicates(subset=["zone_id"]).copy()
-
-        out = _drop_huge_zones_per_source(
-            out,
-            crs_epsg=crs_epsg,
-            enabled=enabled,
-            rel_factor=rel_factor,
-            abs_max_km2=abs_max_km2,
-        )
-
-        parts.append(out)
-        print(f"✓ zones[{rank}] kept: {len(out)}")
-
-    if not parts:
-        raise RuntimeError("Nepodařilo se stáhnout žádné zóny z žádného zdroje (sources).")
-
-    zones = gpd.GeoDataFrame(gpd.pd.concat(parts, ignore_index=True), crs=f"EPSG:{crs_epsg}")
-
-    print("=== REMOVE overlaps by priority ===")
-    before = len(zones)
-    zones = remove_overlaps_by_priority(zones, rank_col="source_rank", min_area_m2=25.0)
-    after = len(zones)
-    print(f"zones after de-overlap: {before} -> {after}")
-
-    if cache_file is not None:
-        _write_cache(zones, cache_file, crs_epsg)
-
-    return zones
-
 
 # ----------------------------
 # Network reference (CRS-safe)
@@ -627,7 +688,7 @@ def _network_ref(project: Project, kind: str, target_epsg: int) -> gpd.GeoDataFr
         df = project.network.links.data
         if "geometry" not in df.columns or len(df) == 0:
             raise RuntimeError("Network links missing geometry/empty")
-        g = gpd.GeoDataFrame(df[["geometry"]].copy(), geometry="geometry", crs=getattr(df, "crs", None))
+        g = gpd.GeoDataFrame(df.copy(), geometry="geometry", crs=getattr(df, "crs", None))
         if "link_type" in df.columns:
             g = g[df["link_type"].astype(str) != "centroid_connector"].copy()
         g = _force_to_target_crs(g, target_epsg, name="network.links")
@@ -638,22 +699,18 @@ def _network_ref(project: Project, kind: str, target_epsg: int) -> gpd.GeoDataFr
 
 # ----------------------------
 # AOI (model area) from network – largest component + quantile trim + padding
-# NOW: oriented square (PCA) instead of axis-aligned bbox
 # ----------------------------
 
 def build_model_area(
     project: Project,
     target_epsg: int,
     *,
-    quantile: float = 0.01,
-    pad_ratio: float = 0.005,
+    quantile: float = 0.0,
+    pad_ratio: float = 0.02,
+    extra_margin_m: float = 0.0,
+    shift_x_m: float = 0.0,
+    shift_y_m: float = 0.0,
 ) -> Any:
-    """
-    AOI from the *largest connected component* of the network:
-    - robust trimming (quantile) to reduce effect of long branches
-    - PCA to find dominant orientation
-    - oriented square (rotated Polygon) in target CRS
-    """
     print("Zoning: building model area (ORIENTED square of largest component)...")
 
     links = project.network.links.data
@@ -719,15 +776,24 @@ def build_model_area(
         ys,
         quantile=float(quantile),
         pad_ratio=float(pad_ratio),
-        make_square=True,  # změň na False pokud chceš orientovaný obdélník místo čtverce
+        make_square=True,
     )
+
+    if float(extra_margin_m) > 0.0:
+        aoi = aoi.buffer(float(extra_margin_m), join_style=2)
+
+    if float(shift_x_m) != 0.0 or float(shift_y_m) != 0.0:
+        aoi = translate(aoi, xoff=float(shift_x_m), yoff=float(shift_y_m))
 
     bminx, bminy, bmaxx, bmaxy = map(float, aoi.bounds)
     print(
         f"✓ AOI ORIENTED (EPSG:{target_epsg}) core_nodes={len(core_nodes)} "
-        f"q={float(quantile)} pad={float(pad_ratio)}: "
+        f"q={float(quantile)} pad={float(pad_ratio)} "
+        f"extra_margin_m={float(extra_margin_m)} "
+        f"shift=({float(shift_x_m)}, {float(shift_y_m)}): "
         f"bounds(minx={bminx:.2f}, miny={bminy:.2f}, maxx={bmaxx:.2f}, maxy={bmaxy:.2f})"
     )
+
     return aoi
 
 
@@ -738,16 +804,6 @@ def filter_zones_centroid_in_bbox(
     *,
     min_intersection_share: float = 0.05,
 ) -> gpd.GeoDataFrame:
-    """Keep zones that significantly overlap the AOI.
-
-    A zone is kept if:
-    - its intersection area with AOI >= ``min_intersection_share`` of the
-      zone's own area, OR
-    - its representative_point lies within AOI (backward compatibility).
-
-    This prevents dropping zones whose polygon straddles the AOI boundary
-    but whose representative_point falls just outside.
-    """
     if zones.empty:
         return zones
 
@@ -768,8 +824,10 @@ def filter_zones_centroid_in_bbox(
 
     n_kept = int(keep.sum())
     n_share_only = int((keep & ~rep_inside).sum())
-    print(f"Zoning: AOI filter kept={n_kept} dropped={len(z) - n_kept} "
-          f"(by intersection share: {n_share_only}, min_share={min_intersection_share})")
+    print(
+        f"Zoning: AOI filter kept={n_kept} dropped={len(z) - n_kept} "
+        f"(by intersection share: {n_share_only}, min_share={min_intersection_share})"
+    )
     return z.loc[keep].reset_index(drop=True)
 
 
@@ -779,11 +837,44 @@ def filter_zones_centroid_in_bbox(
 
 def calculate_centroids(zones: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     keep_cols = [
-        c for c in ["zone_id", "name", "source_rank", "is_external", "gateway_name"]
+        c
+        for c in [
+            "zone_id",
+            "name",
+            "source_rank",
+            "is_external",
+            "gateway_name",
+            "anchor_node_id",
+            "anchor_x",
+            "anchor_y",
+            "boundary_x",
+            "boundary_y",
+            "centroid_x",
+            "centroid_y",
+            "outward_dx",
+            "outward_dy",
+            "matched_ref",
+            "matched_name",
+        ]
         if c in zones.columns
     ]
+
     pts = zones[keep_cols].copy()
-    pts["geometry"] = zones.geometry.representative_point()
+    rep_points = zones.geometry.representative_point()
+
+    geoms = []
+    for idx, row in pts.iterrows():
+        is_external_val = row.get("is_external", 0)
+        is_external = int(0 if pd.isna(is_external_val) else is_external_val) == 1
+        if is_external and "centroid_x" in pts.columns and "centroid_y" in pts.columns:
+            cx = row.get("centroid_x")
+            cy = row.get("centroid_y")
+            if pd.notna(cx) and pd.notna(cy):
+                geoms.append(Point(float(cx), float(cy)))
+                continue
+        geoms.append(rep_points.loc[idx])
+
+    pts["geometry"] = geoms
     return gpd.GeoDataFrame(pts, crs=zones.crs)
 
 
@@ -825,7 +916,7 @@ def fast_prefilter_zones_by_centroid_near_network(
     elif ref_mode == "links":
         dist = dist_to("links")
     else:
-        dist = gpd.pd.concat([dist_to("nodes"), dist_to("links")], axis=1).min(axis=1)
+        dist = pd.concat([dist_to("nodes"), dist_to("links")], axis=1).min(axis=1)
 
     centroids = centroids.copy()
     centroids["dist_m"] = dist
@@ -904,7 +995,7 @@ def add_fallback_zones_for_gaps(
         crs=zones.crs,
     )
 
-    out = gpd.GeoDataFrame(gpd.pd.concat([zones, fallback], ignore_index=True), crs=zones.crs)
+    out = gpd.GeoDataFrame(pd.concat([zones, fallback], ignore_index=True), crs=zones.crs)
     out = _fix_polygons(out)
 
     print(f"✓ added fallback zones for gaps: {len(fallback)}")
@@ -912,144 +1003,8 @@ def add_fallback_zones_for_gaps(
 
 
 # ----------------------------
-# Map export (zones over network + AOI highlighted)
+# Eligible road nodes
 # ----------------------------
-
-def export_map_png(
-    project: Project,
-    zones: gpd.GeoDataFrame,
-    centroids: gpd.GeoDataFrame,
-    model_area_bbox: Any,
-    output_dir: Path,
-    filename: str = "zones_map.png",
-    title_suffix: str = "",
-    dpi: int = 250,
-) -> None:
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("⚠ matplotlib není nainstalovaný -> mapa přeskočena")
-        return
-
-    if zones.empty:
-        print("⚠ no zones -> mapa přeskočena")
-        return
-
-    target_epsg = int(zones.crs.to_epsg()) if zones.crs is not None else 5514
-
-    links = project.network.links.data
-    if "geometry" not in links.columns or len(links) == 0:
-        print("⚠ links bez geometry -> mapa přeskočena")
-        return
-
-    links_gdf = gpd.GeoDataFrame(links, geometry="geometry", crs=getattr(links, "crs", None))
-    if "link_type" in links_gdf.columns:
-        links_gdf = links_gdf[links_gdf["link_type"].astype(str) != "centroid_connector"].copy()
-
-    links_gdf = _force_to_target_crs(links_gdf, target_epsg, name="network.links(for map)")
-
-    # Map extent = network extent (align view to network)
-    sx, sy, sx2, sy2 = links_gdf.total_bounds
-    zx, zy, zx2, zy2 = zones.total_bounds
-
-    minx0 = min(float(sx), float(zx))
-    miny0 = min(float(sy), float(zy))
-    maxx0 = max(float(sx2), float(zx2))
-    maxy0 = max(float(sy2), float(zy2))
-
-    margin_ratio = 0.02
-    w = maxx0 - minx0
-    h = maxy0 - miny0
-    margin_x = max(w * margin_ratio, 50.0)
-    margin_y = max(h * margin_ratio, 50.0)
-
-    minx = minx0 - margin_x
-    maxx = maxx0 + margin_x
-    miny = miny0 - margin_y
-    maxy = maxy0 + margin_y
-
-    aoi_gdf = gpd.GeoDataFrame({"geometry": [model_area_bbox]}, crs=f"EPSG:{target_epsg}")
-
-    fig, ax = plt.subplots(1, 1, figsize=(16, 16))
-
-    links_gdf.plot(ax=ax, linewidth=0.8, alpha=1.0, zorder=1)
-
-    # AOI (Polygon/box) - visible
-    aoi_gdf.plot(ax=ax, alpha=0.08, zorder=2)
-    aoi_gdf.boundary.plot(ax=ax, linewidth=6.0, zorder=10)
-
-    zones.plot(
-        ax=ax,
-        facecolor="lightblue",
-        edgecolor="navy",
-        alpha=0.35,
-        linewidth=2.0,
-        label=f"Zones ({len(zones)})",
-        zorder=3,
-    )
-    centroids.plot(
-        ax=ax,
-        markersize=30,
-        marker="o",
-        linewidth=1.0,
-        label=f"Centroids ({len(centroids)})",
-        zorder=4,
-    )
-
-    ax.set_xlim(minx, maxx)
-    ax.set_ylim(miny, maxy)
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_title(
-        f"Network + TAZ zones ({len(zones)}) + AOI (oriented){title_suffix}",
-        fontsize=16,
-        fontweight="bold",
-        pad=20,
-    )
-    ax.legend(loc="upper right", framealpha=0.95)
-    ax.set_axis_off()
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    png_path = output_dir / filename
-    fig.savefig(png_path, dpi=dpi, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    print(f"✓ map: {png_path}")
-
-
-# ----------------------------
-# Centroid node + connectors
-# ----------------------------
-
-
-def _delete_all_connectors_and_reset_centroids(project: Project) -> int:
-    """Delete ALL centroid_connector links, clear is_centroid flags,
-    and remove orphan centroid nodes that only had connector links."""
-    import sqlite3
-    db = str(project.project_base_path) + "/project_database.sqlite"
-    conn = sqlite3.connect(db)
-    try:
-        before = conn.execute(
-            "SELECT COUNT(*) FROM links WHERE link_type='centroid_connector'"
-        ).fetchone()[0]
-        conn.execute("DELETE FROM links WHERE link_type='centroid_connector'")
-        conn.execute("UPDATE nodes SET is_centroid=0 WHERE is_centroid=1")
-
-        # Delete orphan nodes (nodes with zero links after connector removal)
-        # so AequilibraE cannot snap new connector endpoints to them.
-        orphans = conn.execute("""
-            SELECT n.node_id FROM nodes n
-            WHERE NOT EXISTS (SELECT 1 FROM links l WHERE l.a_node=n.node_id OR l.b_node=n.node_id)
-        """).fetchall()
-        if orphans:
-            ids = [r[0] for r in orphans]
-            conn.executemany("DELETE FROM nodes WHERE node_id=?", [(i,) for i in ids])
-            print(f"  Removed {len(ids)} orphan nodes")
-
-        conn.commit()
-        print(f"  Cleaned: {before} old connectors deleted, is_centroid flags cleared")
-        return before
-    finally:
-        conn.close()
-
 
 _EXCLUDED_LINK_TYPES = frozenset({
     "footway", "path", "track", "steps", "cycleway", "pedestrian",
@@ -1058,11 +1013,16 @@ _EXCLUDED_LINK_TYPES = frozenset({
 })
 
 _ROAD_CLASS_WEIGHT = {
-    "motorway": 5.0, "motorway_link": 4.0,
-    "trunk": 4.0, "trunk_link": 3.0,
-    "primary": 3.0, "primary_link": 2.5,
-    "secondary": 2.0, "secondary_link": 1.5,
-    "tertiary": 1.5, "tertiary_link": 1.2,
+    "motorway": 5.0,
+    "motorway_link": 4.0,
+    "trunk": 4.0,
+    "trunk_link": 3.0,
+    "primary": 3.0,
+    "primary_link": 2.5,
+    "secondary": 2.0,
+    "secondary_link": 1.5,
+    "tertiary": 1.5,
+    "tertiary_link": 1.2,
     "unclassified": 0.8,
     "residential": 0.5,
     "living_street": 0.3,
@@ -1071,26 +1031,13 @@ _ROAD_CLASS_WEIGHT = {
 
 
 def _eligible_road_nodes(project: Project) -> Tuple[set[int], Dict[int, float]]:
-    """Return (node_ids, node_weight) for nodes on the main connected car network.
-
-    Rules:
-    - exclude clearly non-driveable / irrelevant connector targets
-    - require car mode in link.modes
-    - keep only nodes from the largest connected car component
-    - assign node weight from the highest-class road touching the node
-    """
     import networkx as nx
 
     links = project.network.links.data.copy()
     if links.empty:
         return set(), {}
 
-    excluded = {
-        "footway", "path", "track", "steps", "cycleway", "pedestrian",
-        "corridor", "bridleway", "proposed", "construction", "elevator",
-        "rest_area", "services", "traffic_mirror", "virtual",
-        "centroid_connector",
-    }
+    excluded = set(_EXCLUDED_LINK_TYPES) | {"centroid_connector"}
 
     car = links[
         links["modes"].astype(str).str.contains("c", na=False)
@@ -1100,7 +1047,6 @@ def _eligible_road_nodes(project: Project) -> Tuple[set[int], Dict[int, float]]:
     if car.empty:
         return set(), {}
 
-    # Largest connected component of the drivable graph
     G = nx.Graph()
     for _, r in car.iterrows():
         a = int(r["a_node"])
@@ -1148,32 +1094,814 @@ def _eligible_road_nodes(project: Project) -> Tuple[set[int], Dict[int, float]]:
     return set(node_weight.keys()), node_weight
 
 
+# ----------------------------
+# Boundary-whitelist gateway discovery
+# ----------------------------
+
+def _prepare_boundary_candidate_links(
+    project: Project,
+    target_epsg: int,
+    model_area: Any,
+    *,
+    allowed_link_types: Optional[List[str]] = None,
+    boundary_buffer_m: float = 500.0,
+    outer_quantile: float = 0.95,
+) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, Dict[int, Any], set[int], Dict[int, float], float]:
+    road_nids, node_weight = _eligible_road_nodes(project)
+    if not road_nids:
+        empty = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
+        return empty, empty, {}, set(), {}, 0.0
+
+    nodes_gdf = _network_ref(project, "nodes", target_epsg)[["node_id", "geometry"]].copy()
+    nodes_gdf = nodes_gdf[nodes_gdf["node_id"].astype(int).isin(road_nids)].copy()
+
+    node_geom = {
+        int(r["node_id"]): r.geometry
+        for _, r in nodes_gdf.iterrows()
+    }
+
+    center = model_area.representative_point()
+    cx, cy = float(center.x), float(center.y)
+
+    nodes_gdf["_dist_center"] = np.sqrt(
+        (nodes_gdf.geometry.x - cx) ** 2 + (nodes_gdf.geometry.y - cy) ** 2
+    )
+    outer_thr = float(nodes_gdf["_dist_center"].quantile(float(outer_quantile))) if len(nodes_gdf) else 0.0
+    outer_node_ids = set(
+        nodes_gdf.loc[nodes_gdf["_dist_center"] >= outer_thr, "node_id"].astype(int).tolist()
+    )
+
+    links_gdf = _network_ref(project, "links", target_epsg).copy()
+    if links_gdf.empty:
+        empty = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
+        return empty, nodes_gdf, node_geom, outer_node_ids, node_weight, 0.0
+
+    links_gdf = links_gdf[
+        links_gdf["modes"].astype(str).str.contains("c", na=False)
+        & (links_gdf["link_type"].astype(str) != "centroid_connector")
+        & links_gdf["a_node"].astype(int).isin(road_nids)
+        & links_gdf["b_node"].astype(int).isin(road_nids)
+    ].copy()
+
+    if allowed_link_types:
+        allowed = {str(x).strip() for x in allowed_link_types}
+        if allowed:
+            links_gdf = links_gdf[links_gdf["link_type"].astype(str).isin(allowed)].copy()
+
+    boundary = model_area.boundary
+
+    def _nearest_boundary_point(geom: Any) -> Point:
+        try:
+            _, bp = nearest_points(geom, boundary)
+            return bp
+        except Exception:
+            mid = _safe_line_midpoint(geom)
+            try:
+                _, bp = nearest_points(mid, boundary)
+                return bp
+            except Exception:
+                return mid
+
+    links_gdf["_dist_boundary"] = links_gdf.geometry.distance(boundary)
+    links_gdf["_boundary_pt"] = links_gdf.geometry.apply(_nearest_boundary_point)
+    links_gdf["_boundary_pos"] = links_gdf["_boundary_pt"].apply(lambda p: float(boundary.project(p)))
+    links_gdf["_boundary_angle"] = links_gdf["_boundary_pt"].apply(
+        lambda p: _bearing_deg(cx, cy, float(p.x), float(p.y))
+    )
+    links_gdf["_road_class_weight"] = links_gdf["link_type"].astype(str).map(_ROAD_CLASS_WEIGHT).fillna(0.5)
+    links_gdf["_speed_num"] = links_gdf["speed_ab"].apply(lambda v: _first_number(v, default=0.0)) if "speed_ab" in links_gdf.columns else 0.0
+    links_gdf["_lanes_num"] = links_gdf["lanes_ab"].apply(lambda v: _first_number(v, default=1.0)) if "lanes_ab" in links_gdf.columns else 1.0
+
+    near_boundary = links_gdf[links_gdf["_dist_boundary"] <= float(boundary_buffer_m)].copy()
+    if near_boundary.empty and not links_gdf.empty:
+        near_boundary = links_gdf.nsmallest(min(200, len(links_gdf)), "_dist_boundary").copy()
+        print(
+            f"  [warn] no links within boundary_buffer_m={boundary_buffer_m:.0f}; "
+            f"using nearest {len(near_boundary)} links"
+        )
+
+    return near_boundary, nodes_gdf, node_geom, outer_node_ids, node_weight, float(boundary.length)
+
+
+def _cluster_positions_on_ring(df: pd.DataFrame, pos_col: str, threshold_m: float, ring_length: float) -> List[pd.DataFrame]:
+    if df.empty:
+        return []
+
+    s = df.sort_values(pos_col).copy()
+    idxs = s.index.tolist()
+    poss = s[pos_col].astype(float).tolist()
+
+    clusters: List[List[Any]] = [[idxs[0]]]
+    prev = poss[0]
+
+    for idx, pos in zip(idxs[1:], poss[1:]):
+        if (pos - prev) <= float(threshold_m):
+            clusters[-1].append(idx)
+        else:
+            clusters.append([idx])
+        prev = pos
+
+    if len(clusters) > 1 and ring_length > 0:
+        first_pos = float(s.loc[clusters[0][0], pos_col])
+        last_pos = float(s.loc[clusters[-1][-1], pos_col])
+        wrap_gap = ring_length - last_pos + first_pos
+        if wrap_gap <= float(threshold_m):
+            merged = clusters[-1] + clusters[0]
+            clusters = [merged] + clusters[1:-1]
+
+    return [df.loc[c].copy() for c in clusters]
+
+
+def _select_gateway_target_nodes_boundary_whitelist(
+    project: Project,
+    target_epsg: int,
+    model_area: Any,
+    whitelist_specs: List[Dict[str, Any]],
+    *,
+    nodes_per_gateway: int = 2,
+    outer_quantile: float = 0.95,
+    boundary_buffer_m: float = 600.0,
+    min_gateway_separation_m: float = 1800.0,
+    allowed_link_types: Optional[List[str]] = None,
+) -> Tuple[
+    Dict[str, List[int]],
+    Dict[str, Dict[str, Any]],
+    gpd.GeoDataFrame,
+    gpd.GeoDataFrame,
+]:
+    def _token_variants(raw_token: str, norm_token: str) -> set[str]:
+        vals = set()
+        for v in (raw_token, norm_token):
+            t = _norm_text(v)
+            if t:
+                vals.add(t)
+                if t.startswith("I") and t[1:].isdigit():
+                    vals.add(t[1:])
+        return vals
+
+    def _match_ref_variants(row: pd.Series, variants: set[str]) -> int:
+        for col in ("osm_ref_norm", "osm_ref", "ref"):
+            if col in row and pd.notna(row.get(col)):
+                rv = _norm_text(row.get(col))
+                if rv in variants:
+                    return 1
+                if rv.startswith("I") and rv[1:].isdigit() and rv[1:] in variants:
+                    return 1
+        return 0
+
+    road_nids, node_weight = _eligible_road_nodes(project)
+    if not road_nids:
+        empty_lines = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
+        empty_points = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
+        return {}, {}, empty_lines, empty_points
+
+    nodes_gdf = _network_ref(project, "nodes", target_epsg)[["node_id", "geometry"]].copy()
+    nodes_gdf = nodes_gdf[nodes_gdf["node_id"].astype(int).isin(road_nids)].copy()
+    if nodes_gdf.empty:
+        empty_lines = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
+        empty_points = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
+        return {}, {}, empty_lines, empty_points
+
+    node_geom: Dict[int, Point] = {
+        int(r["node_id"]): r.geometry
+        for _, r in nodes_gdf.iterrows()
+    }
+
+    center = model_area.representative_point()
+    boundary = model_area.boundary
+    ring_length = float(boundary.length)
+    cx, cy = float(center.x), float(center.y)
+
+    links_gdf = _network_ref(project, "links", target_epsg).copy()
+    if links_gdf.empty:
+        empty_lines = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
+        empty_points = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
+        return {}, {}, empty_lines, empty_points
+
+    links_gdf = links_gdf[
+        links_gdf["modes"].astype(str).str.contains("c", na=False)
+        & (links_gdf["link_type"].astype(str) != "centroid_connector")
+        & links_gdf["a_node"].astype(int).isin(road_nids)
+        & links_gdf["b_node"].astype(int).isin(road_nids)
+    ].copy()
+
+    if allowed_link_types:
+        allowed = {str(x).strip() for x in allowed_link_types}
+        if allowed:
+            links_gdf = links_gdf[links_gdf["link_type"].astype(str).isin(allowed)].copy()
+
+    if links_gdf.empty:
+        empty_lines = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
+        empty_points = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
+        return {}, {}, empty_lines, empty_points
+
+    def _nearest_boundary_point(geom: Any) -> Point:
+        try:
+            _, bp = nearest_points(geom, boundary)
+            return bp
+        except Exception:
+            mid = _safe_line_midpoint(geom)
+            try:
+                _, bp = nearest_points(mid, boundary)
+                return bp
+            except Exception:
+                return mid
+
+    links_gdf["_dist_boundary"] = links_gdf.geometry.distance(boundary)
+    links_gdf["_boundary_pt"] = links_gdf.geometry.apply(_nearest_boundary_point)
+    links_gdf["_boundary_pos"] = links_gdf["_boundary_pt"].apply(lambda p: float(boundary.project(p)))
+    links_gdf["_boundary_angle"] = links_gdf["_boundary_pt"].apply(
+        lambda p: _bearing_deg(cx, cy, float(p.x), float(p.y))
+    )
+    links_gdf["_road_class_weight"] = links_gdf["link_type"].astype(str).map(_ROAD_CLASS_WEIGHT).fillna(0.5)
+
+    gateway_targets: Dict[str, List[int]] = {}
+    gateway_meta: Dict[str, Dict[str, Any]] = {}
+    used_names: Dict[str, int] = {}
+
+    debug_corridor_parts: List[gpd.GeoDataFrame] = []
+    debug_point_rows: List[Dict[str, Any]] = []
+
+    for spec_priority, spec in enumerate(whitelist_specs):
+        token_raw = spec["raw"]
+        token_norm = spec["norm"]
+        token_slug = spec["slug"]
+
+        ref_variants = _token_variants(token_raw, token_norm)
+
+        print(f"=== DISCOVER whitelist token {token_raw} ===")
+        print(f"  ref variants: {sorted(ref_variants)}")
+
+        cand = links_gdf.copy()
+        cand["_ref_match"] = cand.apply(lambda r: _match_ref_variants(r, ref_variants), axis=1).astype(int)
+        matched = cand[cand["_ref_match"] == 1].copy()
+
+        if matched.empty:
+            print(f"  [warn] token {token_raw}: no ref match in whole network")
+            continue
+
+        print(f"  matched in whole network: {len(matched)}")
+
+        matched["debug_token"] = token_raw
+        matched["debug_token_slug"] = token_slug
+        debug_corridor_parts.append(matched.copy())
+
+        boundary_near = matched[matched["_dist_boundary"] <= float(boundary_buffer_m)].copy()
+        if boundary_near.empty:
+            boundary_near = matched.nsmallest(min(20, len(matched)), "_dist_boundary").copy()
+            print(
+                f"  [warn] token {token_raw}: no boundary-near matched links within "
+                f"{boundary_buffer_m:.0f} m, using nearest {len(boundary_near)}"
+            )
+
+        clusters = _cluster_positions_on_ring(
+            boundary_near,
+            pos_col="_boundary_pos",
+            threshold_m=float(min_gateway_separation_m),
+            ring_length=ring_length,
+        )
+        print(f"  boundary clusters: {len(clusters)}")
+
+        for cl_i, cl in enumerate(clusters, start=1):
+            local_nodes = sorted(
+                {
+                    int(x)
+                    for x in pd.concat([cl["a_node"], cl["b_node"]], ignore_index=True).astype(int).tolist()
+                    if int(x) in node_geom
+                }
+            )
+            if not local_nodes:
+                continue
+
+            boundary_local_nodes = [
+                nid for nid in local_nodes
+                if float(node_geom[nid].distance(boundary)) <= float(boundary_buffer_m) * 1.25
+            ]
+            target_pool = boundary_local_nodes if boundary_local_nodes else local_nodes
+
+            chosen = _pick_nodes_near_boundary(
+                target_pool,
+                node_geom,
+                boundary,
+                node_weight,
+                max_nodes=int(nodes_per_gateway),
+                min_node_sep_m=25.0,
+            )
+
+            if not chosen:
+                print(f"  [warn] token {token_raw} cluster {cl_i}: no chosen boundary nodes")
+                continue
+
+            anchor_id = int(chosen[0])
+            anchor_geom = node_geom[anchor_id]
+
+            cluster_boundary_pos = _circular_mean_ring_pos(
+                cl["_boundary_pos"].astype(float).tolist(),
+                ring_length,
+            )
+            cluster_boundary_pt = boundary.interpolate(cluster_boundary_pos)
+
+            ux, uy = _normalize_vector(
+                float(cluster_boundary_pt.x) - cx,
+                float(cluster_boundary_pt.y) - cy,
+            )
+            cluster_angle = _bearing_deg(cx, cy, float(cluster_boundary_pt.x), float(cluster_boundary_pt.y))
+            compass = _compass8(cluster_angle)
+
+            gw_name = f"{token_slug}_{compass}"
+            if gw_name in used_names:
+                used_names[gw_name] += 1
+                gw_name = f"{gw_name}_{used_names[gw_name]}"
+            else:
+                used_names[gw_name] = 1
+
+            best_link = cl.sort_values(
+                ["_road_class_weight", "_dist_boundary"],
+                ascending=[False, True],
+            ).iloc[0]
+
+            matched_ref = str(
+                best_link.get("osm_ref_norm", "")
+                or best_link.get("osm_ref", "")
+                or best_link.get("ref", "")
+                or ""
+            )
+            matched_name = str(
+                best_link.get("osm_name_raw", "")
+                or best_link.get("name", "")
+                or ""
+            )
+
+            gateway_targets[gw_name] = chosen
+            gateway_meta[gw_name] = {
+                "gateway_name": gw_name,
+                "whitelist_token": token_raw,
+                "whitelist_priority": int(spec_priority),
+                "cluster_index": cl_i,
+                "anchor_node_id": int(anchor_id),
+                "anchor_x": float(anchor_geom.x),
+                "anchor_y": float(anchor_geom.y),
+                "boundary_x": float(cluster_boundary_pt.x),
+                "boundary_y": float(cluster_boundary_pt.y),
+                "boundary_pos": float(cluster_boundary_pos),
+                "outward_dx": float(ux),
+                "outward_dy": float(uy),
+                "target_node_ids": chosen,
+                "matched_ref": matched_ref,
+                "matched_name": matched_name,
+                "link_type": str(best_link.get("link_type", "") or ""),
+                "boundary_angle": float(cluster_angle),
+                "dist_boundary_m": float(anchor_geom.distance(boundary)),
+            }
+
+            print(
+                f"  gateway {gw_name}: "
+                f"boundary=({float(cluster_boundary_pt.x):.1f}, {float(cluster_boundary_pt.y):.1f}) "
+                f"anchor=({float(anchor_geom.x):.1f}, {float(anchor_geom.y):.1f}) "
+                f"targets={chosen} "
+                f"matched_ref='{matched_ref}' "
+                f"matched_name='{matched_name}' "
+                f"type={gateway_meta[gw_name]['link_type']}"
+            )
+
+            debug_point_rows.append({
+                "kind": "anchor",
+                "token": token_raw,
+                "cluster": cl_i,
+                "node_id": int(anchor_id),
+                "geometry": anchor_geom,
+            })
+            for nid in chosen:
+                debug_point_rows.append({
+                    "kind": "target",
+                    "token": token_raw,
+                    "cluster": cl_i,
+                    "node_id": int(nid),
+                    "geometry": node_geom[int(nid)],
+                })
+
+    # Global boundary-based merge across all tokens and carriageways
+    gateway_targets, gateway_meta = _merge_gateway_candidates_on_boundary(
+        gateway_targets=gateway_targets,
+        gateway_meta=gateway_meta,
+        node_geom=node_geom,
+        node_weight=node_weight,
+        model_area=model_area,
+        merge_distance_m=float(min_gateway_separation_m),
+        nodes_per_gateway=int(nodes_per_gateway),
+    )
+
+    debug_corridors_gdf = (
+        gpd.GeoDataFrame(pd.concat(debug_corridor_parts, ignore_index=True), crs=links_gdf.crs)
+        if debug_corridor_parts
+        else gpd.GeoDataFrame({"geometry": []}, crs=links_gdf.crs)
+    )
+
+    debug_points_gdf = (
+        gpd.GeoDataFrame(debug_point_rows, geometry="geometry", crs=nodes_gdf.crs)
+        if debug_point_rows
+        else gpd.GeoDataFrame({"geometry": []}, crs=nodes_gdf.crs)
+    )
+
+    return gateway_targets, gateway_meta, debug_corridors_gdf, debug_points_gdf
+
+
+def _build_external_gateway_zones_from_boundary_meta(
+    gateway_meta: Dict[str, Dict[str, Any]],
+    target_epsg: int,
+    *,
+    zone_offset_m: float = 10.0,
+    zone_size_m: float = 40.0,
+    start_id: int = 8_000_000_000,
+) -> gpd.GeoDataFrame:
+    """
+    Build external gateway zones from REAL AOI boundary points.
+    Zone centroid is placed just outside the AOI:
+        centroid = boundary_point + outward * (half_size + zone_offset_m)
+    """
+    if not gateway_meta:
+        return gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
+
+    rows: List[Dict[str, Any]] = []
+    half = float(zone_size_m) / 2.0
+
+    for i, gw_name in enumerate(sorted(gateway_meta.keys())):
+        meta = gateway_meta[gw_name]
+
+        bx = float(meta["boundary_x"])
+        by = float(meta["boundary_y"])
+        ux = float(meta["outward_dx"])
+        uy = float(meta["outward_dy"])
+
+        centroid_dist = half + float(zone_offset_m)
+        cx = bx + ux * centroid_dist
+        cy = by + uy * centroid_dist
+
+        geom = translate(
+            box(-half, -half, half, half),
+            xoff=cx,
+            yoff=cy,
+        )
+
+        rows.append({
+            "zone_id": start_id + i,
+            "name": f"EXT_{gw_name}",
+            "source_rank": 999,
+            "is_external": 1,
+            "gateway_name": gw_name,
+            "anchor_node_id": int(meta["anchor_node_id"]),
+            "anchor_x": float(meta["anchor_x"]),
+            "anchor_y": float(meta["anchor_y"]),
+            "boundary_x": bx,
+            "boundary_y": by,
+            "centroid_x": cx,
+            "centroid_y": cy,
+            "outward_dx": ux,
+            "outward_dy": uy,
+            "matched_ref": str(meta.get("matched_ref", "")),
+            "matched_name": str(meta.get("matched_name", "")),
+            "geometry": geom,
+        })
+
+        print(
+            f"  gateway zone {gw_name}: "
+            f"boundary=({bx:.1f}, {by:.1f}) "
+            f"centroid=({cx:.1f}, {cy:.1f}) "
+            f"anchor_node={int(meta['anchor_node_id'])}"
+        )
+
+    return gpd.GeoDataFrame(rows, crs=f"EPSG:{target_epsg}")
+
+# ----------------------------
+# Download zones (OSM, generic)
+# ----------------------------
+
+def download_zones_from_sources(
+    sources: List[Dict[str, Any]],
+    crs_epsg: int,
+    cache_file: Optional[Path],
+    area_filter_cfg: Dict[str, Any],
+) -> gpd.GeoDataFrame:
+    try:
+        import osmnx as ox
+    except ImportError as e:
+        raise RuntimeError("Chybí osmnx. Doinstaluj: pip install osmnx") from e
+
+    if cache_file is not None:
+        cache_file = _safe_path(cache_file)
+        cached = _read_cache(cache_file, crs_epsg)
+        if cached is not None:
+            return cached
+
+    enabled = bool(area_filter_cfg.get("enabled", True))
+    rel_factor = float(area_filter_cfg.get("rel_factor", 10.0))
+    abs_max_km2 = area_filter_cfg.get("abs_max_km2", None)
+    abs_max_km2 = None if abs_max_km2 in ("", "null", "None") else abs_max_km2
+    abs_max_km2 = float(abs_max_km2) if abs_max_km2 is not None else None
+
+    parts: List[gpd.GeoDataFrame] = []
+
+    for rank, src in enumerate(sources):
+        place = src["place"]
+        admin_level = str(src.get("admin_level", "")).strip()
+        tags = src.get("tags") or {"boundary": "administrative", "admin_level": admin_level}
+
+        print(f"=== DOWNLOAD zones[{rank}] place={place} tags={tags} ===")
+        g = ox.features.features_from_place(place, tags)
+
+        if g is None or len(g) == 0:
+            print("⚠ 0 features")
+            continue
+
+        g = g.reset_index()
+        g = _fix_polygons(g)
+        if g.empty:
+            print("⚠ no polygonal features after fix")
+            continue
+
+        osmid_col = next((c for c in ("osmid", "osm_id", "id") if c in g.columns), None)
+        zone_id = g[osmid_col].map(_normalize_osmid) if osmid_col else range(1, len(g) + 1)
+        name = g["name"].fillna("zone") if "name" in g.columns else "zone"
+
+        out = gpd.GeoDataFrame(
+            {"zone_id": zone_id, "name": name, "source_rank": rank, "geometry": g.geometry},
+            crs="EPSG:4326",
+        )
+
+        if crs_epsg != 4326:
+            out = out.to_crs(epsg=crs_epsg)
+
+        out = out.drop_duplicates(subset=["zone_id"]).copy()
+
+        out = _drop_huge_zones_per_source(
+            out,
+            crs_epsg=crs_epsg,
+            enabled=enabled,
+            rel_factor=rel_factor,
+            abs_max_km2=abs_max_km2,
+        )
+
+        parts.append(out)
+        print(f"✓ zones[{rank}] kept: {len(out)}")
+
+    if not parts:
+        raise RuntimeError("Nepodařilo se stáhnout žádné zóny z žádného zdroje (sources).")
+
+    zones = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=f"EPSG:{crs_epsg}")
+
+    print("=== REMOVE overlaps by priority ===")
+    before = len(zones)
+    zones = remove_overlaps_by_priority(zones, rank_col="source_rank", min_area_m2=25.0)
+    after = len(zones)
+    print(f"zones after de-overlap: {before} -> {after}")
+
+    if cache_file is not None:
+        _write_cache(zones, cache_file, crs_epsg)
+
+    return zones
+
+
+# ----------------------------
+# Map export (zones over network + AOI highlighted)
+# ----------------------------
+
+def export_map_png(
+    project: Project,
+    zones: gpd.GeoDataFrame,
+    centroids: gpd.GeoDataFrame,
+    model_area_bbox: Any,
+    output_dir: Path,
+    filename: str = "zones_map.png",
+    title_suffix: str = "",
+    dpi: int = 250,
+    debug_corridors: Optional[gpd.GeoDataFrame] = None,
+    debug_points: Optional[gpd.GeoDataFrame] = None,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Patch
+    except ImportError:
+        print("⚠ matplotlib není nainstalovaný -> mapa přeskočena")
+        return
+
+    if zones.empty:
+        print("⚠ no zones -> mapa přeskočena")
+        return
+
+    target_epsg = int(zones.crs.to_epsg()) if zones.crs is not None else 5514
+
+    links = project.network.links.data
+    if "geometry" not in links.columns or len(links) == 0:
+        print("⚠ links bez geometry -> mapa přeskočena")
+        return
+
+    links_gdf = gpd.GeoDataFrame(links, geometry="geometry", crs=getattr(links, "crs", None))
+    if "link_type" in links_gdf.columns:
+        links_gdf = links_gdf[links_gdf["link_type"].astype(str) != "centroid_connector"].copy()
+
+    links_gdf = _force_to_target_crs(links_gdf, target_epsg, name="network.links(for map)")
+
+    z = zones.copy()
+    c = centroids.copy()
+
+    if "is_external" not in z.columns:
+        z["is_external"] = 0
+    z["is_external"] = pd.to_numeric(z["is_external"], errors="coerce").fillna(0).astype(int)
+
+    if "is_external" not in c.columns:
+        c["is_external"] = 0
+    c["is_external"] = pd.to_numeric(c["is_external"], errors="coerce").fillna(0).astype(int)
+
+    internal_zones = z[z["is_external"] == 0].copy()
+    external_zones = z[z["is_external"] == 1].copy()
+
+    internal_centroids = c[c["is_external"] == 0].copy()
+    external_centroids = c[c["is_external"] == 1].copy()
+
+    sx, sy, sx2, sy2 = links_gdf.total_bounds
+    zx, zy, zx2, zy2 = z.total_bounds
+
+    minx0 = min(float(sx), float(zx))
+    miny0 = min(float(sy), float(zy))
+    maxx0 = max(float(sx2), float(zx2))
+    maxy0 = max(float(sy2), float(zy2))
+
+    margin_ratio = 0.02
+    w = maxx0 - minx0
+    h = maxy0 - miny0
+    margin_x = max(w * margin_ratio, 50.0)
+    margin_y = max(h * margin_ratio, 50.0)
+
+    minx = minx0 - margin_x
+    maxx = maxx0 + margin_x
+    miny = miny0 - margin_y
+    maxy = maxy0 + margin_y
+
+    aoi_gdf = gpd.GeoDataFrame({"geometry": [model_area_bbox]}, crs=f"EPSG:{target_epsg}")
+
+    fig, ax = plt.subplots(1, 1, figsize=(16, 16))
+
+    links_gdf.plot(ax=ax, color="dimgray", linewidth=0.8, alpha=0.9, zorder=1)
+
+    aoi_gdf.plot(ax=ax, color="gold", alpha=0.08, zorder=2)
+    aoi_gdf.boundary.plot(ax=ax, color="goldenrod", linewidth=3.0, zorder=10)
+
+    if not internal_zones.empty:
+        internal_zones.plot(
+            ax=ax,
+            facecolor="lightblue",
+            edgecolor="navy",
+            alpha=0.35,
+            linewidth=1.0,
+            zorder=3,
+        )
+
+    if not external_zones.empty:
+        external_zones.plot(
+            ax=ax,
+            facecolor="mistyrose",
+            edgecolor="darkred",
+            alpha=0.55,
+            linewidth=1.2,
+            zorder=4,
+        )
+
+    if not internal_centroids.empty:
+        internal_centroids.plot(
+            ax=ax,
+            color="navy",
+            markersize=20,
+            marker="o",
+            zorder=5,
+        )
+
+    if not external_centroids.empty:
+        external_centroids.plot(
+            ax=ax,
+            color="red",
+            markersize=45,
+            marker="X",
+            zorder=6,
+        )
+
+    if debug_corridors is not None and not debug_corridors.empty:
+        dbg = debug_corridors.copy()
+        if dbg.crs is None:
+            dbg = dbg.set_crs(epsg=target_epsg, allow_override=True)
+        if dbg.crs.to_epsg() != target_epsg:
+            dbg = dbg.to_crs(epsg=target_epsg)
+
+        dbg.plot(
+            ax=ax,
+            color="red",
+            linewidth=2.5,
+            alpha=0.85,
+            zorder=7,
+        )
+
+    if debug_points is not None and not debug_points.empty:
+        dbg_pts = debug_points.copy()
+        if dbg_pts.crs is None:
+            dbg_pts = dbg_pts.set_crs(epsg=target_epsg, allow_override=True)
+        if dbg_pts.crs.to_epsg() != target_epsg:
+            dbg_pts = dbg_pts.to_crs(epsg=target_epsg)
+
+        terminals = dbg_pts[dbg_pts["kind"] == "terminal"].copy() if "kind" in dbg_pts.columns else dbg_pts.iloc[0:0]
+        anchors = dbg_pts[dbg_pts["kind"] == "anchor"].copy() if "kind" in dbg_pts.columns else dbg_pts.iloc[0:0]
+
+        if not terminals.empty:
+            terminals.plot(
+                ax=ax,
+                color="yellow",
+                markersize=35,
+                marker="o",
+                zorder=8,
+            )
+
+        if not anchors.empty:
+            anchors.plot(
+                ax=ax,
+                color="red",
+                markersize=90,
+                marker="X",
+                zorder=9,
+            )
+
+    ax.set_xlim(minx, maxx)
+    ax.set_ylim(miny, maxy)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title(
+        f"Network + TAZ zones ({len(zones)}) + AOI (oriented){title_suffix}",
+        fontsize=16,
+        fontweight="bold",
+        pad=20,
+    )
+
+    legend_handles = [
+        Line2D([0], [0], color="dimgray", linewidth=2.0, label="Network"),
+        Patch(facecolor="lightblue", edgecolor="navy", alpha=0.35, label=f"Internal zones ({len(internal_zones)})"),
+        Patch(facecolor="mistyrose", edgecolor="darkred", alpha=0.55, label=f"Exit zones ({len(external_zones)})"),
+        Line2D([0], [0], marker="o", color="navy", linestyle="None", markersize=8, label=f"Internal centroids ({len(internal_centroids)})"),
+        Line2D([0], [0], marker="X", color="red", linestyle="None", markersize=9, label=f"Exit centroids ({len(external_centroids)})"),
+        Patch(facecolor="gold", edgecolor="goldenrod", alpha=0.08, label="AOI"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper right", framealpha=0.95)
+
+    ax.set_axis_off()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    png_path = output_dir / filename
+    fig.savefig(png_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"✓ map: {png_path}")
+
+
+# ----------------------------
+# Centroid node + connectors
+# ----------------------------
+
+def _delete_all_connectors_and_reset_centroids(project: Project) -> int:
+    db = str(project.project_base_path) + "/project_database.sqlite"
+    conn = sqlite3.connect(db)
+    try:
+        before = conn.execute(
+            "SELECT COUNT(*) FROM links WHERE link_type='centroid_connector'"
+        ).fetchone()[0]
+        conn.execute("DELETE FROM links WHERE link_type='centroid_connector'")
+        conn.execute("UPDATE nodes SET is_centroid=0 WHERE is_centroid=1")
+
+        orphans = conn.execute("""
+            SELECT n.node_id FROM nodes n
+            WHERE NOT EXISTS (SELECT 1 FROM links l WHERE l.a_node=n.node_id OR l.b_node=n.node_id)
+        """).fetchall()
+        if orphans:
+            ids = [r[0] for r in orphans]
+            conn.executemany("DELETE FROM nodes WHERE node_id=?", [(i,) for i in ids])
+            print(f"  Removed {len(ids)} orphan nodes")
+
+        conn.commit()
+        print(f"  Cleaned: {before} old connectors deleted, is_centroid flags cleared")
+        return before
+    finally:
+        conn.close()
+
+
 def _select_diverse_connectors(
     eligible: gpd.GeoDataFrame,
-    centroid_pt,
+    centroid_pt: Point,
     max_connectors: int,
     max_distance_m: float,
     pool_size: int = 40,
 ) -> gpd.GeoDataFrame:
-    """Pick connector targets that are nearby and directionally diverse.
-
-    Strategy:
-    1. Compute distance to all eligible nodes.
-    2. Keep only nodes within max_distance_m.
-    3. Score by road importance and proximity.
-    4. Prefer angular diversity across sectors.
-    5. If nothing is within max_distance_m, fall back to nearest nodes.
-    """
     if eligible.empty or max_connectors <= 0:
         return eligible.head(0).copy()
 
     cand = eligible.copy()
     cand["_dist"] = cand.geometry.distance(centroid_pt)
 
-    # Hard distance filter
     nearby = cand[cand["_dist"] <= float(max_distance_m)].copy()
 
-    # Fallback if nothing is within the threshold
     if nearby.empty:
         nearby = cand.nsmallest(min(pool_size, len(cand)), "_dist").copy()
     else:
@@ -1189,7 +1917,6 @@ def _select_diverse_connectors(
         np.arctan2(nearby.geometry.y - cy, nearby.geometry.x - cx)
     ) % 360.0
 
-    # Prefer important roads, but still strongly prefer closer nodes
     nearby["_score"] = nearby["road_weight"] / np.power(nearby["_dist"], 0.75)
 
     n_sectors = min(max_connectors, 8)
@@ -1198,7 +1925,6 @@ def _select_diverse_connectors(
 
     chosen_idx: List[int] = []
 
-    # First pass: best candidate per sector
     for sec in range(n_sectors):
         sec_df = nearby[nearby["_sector"] == sec]
         if sec_df.empty:
@@ -1208,7 +1934,6 @@ def _select_diverse_connectors(
         if len(chosen_idx) >= max_connectors:
             break
 
-    # Second pass: fill remaining slots globally by score
     if len(chosen_idx) < max_connectors:
         remaining = nearby.drop(index=chosen_idx, errors="ignore").nlargest(
             max_connectors - len(chosen_idx), "_score"
@@ -1235,16 +1960,14 @@ def create_centroid_connectors(
     lanes: int = 4,
     access_penalty_s: float = 120.0,
     gateway_targets: Optional[Dict[str, List[int]]] = None,
+    external_speed_kmh: Optional[float] = None,
+    external_access_penalty_s: Optional[float] = None,
 ) -> Dict[int, int]:
     """
-    For each zone, create a small-ID centroid node and connect it to the
-    nearest road-network nodes.
-
-    AequilibraE's compressed-graph builder uses node IDs as array indices,
-    so centroid IDs must be small (< graph node count).  We allocate
-    sequential IDs 1, 2, 3, … that are guaranteed to fit.
-
-    Returns ``{zone_id: centroid_node_id}`` mapping.
+    For external zones:
+    - centroid is placed outside model according to stored centroid_x / centroid_y
+    - if that still collides, it is moved only further OUT along the same outward axis
+    - connectors go directly to the configured gateway target nodes
     """
     print("\n=== CREATE centroid connectors ===")
 
@@ -1257,19 +1980,25 @@ def create_centroid_connectors(
     existing_nids = set(int(x) for x in nodes["node_id"].values)
 
     nodes_gdf = gpd.GeoDataFrame(nodes, geometry="geometry", crs=getattr(nodes, "crs", None))
-    nodes_gdf = _force_to_target_crs(nodes_gdf, int(centroids.crs.to_epsg()),
-                                     name="network.nodes(for connector candidates)")
+    nodes_gdf = _force_to_target_crs(
+        nodes_gdf,
+        int(centroids.crs.to_epsg()),
+        name="network.nodes(for connector candidates)",
+    )
 
     eligible = nodes_gdf[nodes_gdf["node_id"].isin(road_nids)].copy()
     eligible["road_weight"] = eligible["node_id"].map(node_weight).fillna(0.5)
-    print(f"  Eligible road-network nodes: {len(eligible)} (from {len(nodes_gdf)} total, "
-          f"excluded {len(nodes_gdf) - len(eligible)} non-car types)")
+    print(
+        f"  Eligible road-network nodes: {len(eligible)} (from {len(nodes_gdf)} total, "
+        f"excluded {len(nodes_gdf) - len(eligible)} non-car types)"
+    )
+
+    occupied_points = list(nodes_gdf.geometry.dropna())
 
     if eligible.empty:
         print("  WARNING: no eligible road-network nodes found")
         return {}
 
-    # Allocate small sequential centroid IDs (1, 2, 3, …) avoiding collisions
     next_id = 1
     zone_to_centroid: Dict[int, int] = {}
     for zid in sorted(centroids["zone_id"].astype(int)):
@@ -1279,42 +2008,80 @@ def create_centroid_connectors(
         existing_nids.add(next_id)
         next_id += 1
 
-    print(f"  Centroid IDs: {min(zone_to_centroid.values())}-{max(zone_to_centroid.values())} "
-          f"for {len(zone_to_centroid)} zones")
+    print(
+        f"  Centroid IDs: {min(zone_to_centroid.values())}-{max(zone_to_centroid.values())} "
+        f"for {len(zone_to_centroid)} zones"
+    )
 
-    # Load original WGS84 node geometries (to avoid CRS precision issues)
     nodes_wgs84 = project.network.nodes.data[["node_id", "geometry"]].copy()
     wgs84_lookup = {int(r["node_id"]): r["geometry"] for _, r in nodes_wgs84.iterrows()}
 
     created = 0
     for _, c in centroids.iterrows():
         zone_id = int(c["zone_id"])
-        centroid_pt = c.geometry
         centroid_node_id = zone_to_centroid[zone_id]
 
-        centroid_wgs84 = _to_wgs84_point(centroid_pt, centroids.crs)
-
-        new_node = (project.network.nodes.new_centroid(centroid_node_id)
-                    if hasattr(project.network.nodes, "new_centroid")
-                    else project.network.nodes.new())
-        if not hasattr(project.network.nodes, "new_centroid"):
-            new_node.__dict__["node_id"] = centroid_node_id
-        new_node.is_centroid = 1
-        new_node.geometry = centroid_wgs84
-        new_node.save()
-
-        is_external = (
-            bool(int(c.get("is_external", 0))) if pd.notna(c.get("is_external", 0)) else False
-        )
+        is_external = bool(int(c.get("is_external", 0))) if pd.notna(c.get("is_external", 0)) else False
         gateway_name = str(c.get("gateway_name", "") or "").strip()
 
+        if is_external and pd.notna(c.get("centroid_x")) and pd.notna(c.get("centroid_y")):
+            base_pt = Point(float(c["centroid_x"]), float(c["centroid_y"]))
+            ux, uy = _normalize_vector(float(c.get("outward_dx", 1.0)), float(c.get("outward_dy", 0.0)))
+        else:
+            base_pt = c.geometry
+            ux, uy = 1.0, 0.0
+
+        saved_centroid_pt: Optional[Point] = None
+        saved_centroid_wgs84 = None
+
+        if is_external:
+            candidate_steps = _candidate_external_steps()
+        else:
+            candidate_steps = [0.0]
+
+        for step in candidate_steps:
+            candidate_pt = translate(base_pt, xoff=ux * step, yoff=uy * step)
+
+            if _point_is_too_close(candidate_pt, occupied_points, min_sep_m=1.0):
+                continue
+
+            candidate_wgs84 = _to_wgs84_point(candidate_pt, centroids.crs)
+
+            try:
+                new_node = (
+                    project.network.nodes.new_centroid(centroid_node_id)
+                    if hasattr(project.network.nodes, "new_centroid")
+                    else project.network.nodes.new()
+                )
+                if not hasattr(project.network.nodes, "new_centroid"):
+                    new_node.__dict__["node_id"] = centroid_node_id
+
+                new_node.is_centroid = 1
+                new_node.geometry = candidate_wgs84
+                new_node.save()
+
+                saved_centroid_pt = candidate_pt
+                saved_centroid_wgs84 = candidate_wgs84
+                occupied_points.append(candidate_pt)
+                break
+
+            except sqlite3.IntegrityError:
+                continue
+
+        if saved_centroid_pt is None or saved_centroid_wgs84 is None:
+            raise RuntimeError(
+                f"Could not place centroid node for zone_id={zone_id} "
+                f"without overlapping an existing node"
+            )
+
+        centroid_pt = saved_centroid_pt
+        centroid_wgs84 = saved_centroid_wgs84
+
         if is_external and gateway_name in gateway_targets:
-            target_ids = set(int(x) for x in gateway_targets[gateway_name])
+            target_ids = [int(x) for x in gateway_targets[gateway_name]]
             cand = eligible[eligible["node_id"].astype(int).isin(target_ids)].copy()
             cand["dist"] = cand.geometry.distance(centroid_pt)
-            cand = cand.sort_values(["dist", "road_weight"], ascending=[True, False]).head(
-                len(target_ids)
-            )
+            cand = cand.sort_values(["dist", "road_weight"], ascending=[True, False]).head(len(target_ids))
         else:
             cand = _select_diverse_connectors(
                 eligible,
@@ -1327,9 +2094,6 @@ def create_centroid_connectors(
             target_node_id = int(n["node_id"])
             dist_m = float(n["dist"])
 
-            # Use the target node's EXACT WGS84 geometry from the DB
-            # (no CRS conversion — avoids precision loss that causes
-            # AequilibraE to create a new node instead of matching the target)
             target_geom = wgs84_lookup.get(target_node_id)
             if target_geom is None:
                 continue
@@ -1341,15 +2105,26 @@ def create_centroid_connectors(
             link.modes = "c"
             link.link_type = "centroid_connector"
 
+            link_speed = (
+                float(external_speed_kmh)
+                if (is_external and external_speed_kmh is not None)
+                else float(speed_kmh)
+            )
+            link_penalty = (
+                float(external_access_penalty_s)
+                if (is_external and external_access_penalty_s is not None)
+                else float(access_penalty_s)
+            )
+
             link.distance = dist_m
-            link.speed_ab = speed_kmh
-            link.speed_ba = speed_kmh
+            link.speed_ab = link_speed
+            link.speed_ba = link_speed
             link.capacity_ab = capacity_vph
             link.capacity_ba = capacity_vph
             link.lanes_ab = lanes
             link.lanes_ba = lanes
 
-            time_s = (dist_m / 1000.0) / speed_kmh * 3600.0 + access_penalty_s
+            time_s = (dist_m / 1000.0) / max(link_speed, 1e-6) * 3600.0 + link_penalty
             if hasattr(link, "travel_time_ab"):
                 link.travel_time_ab = time_s
                 link.travel_time_ba = time_s
@@ -1371,8 +2146,6 @@ def export_connector_diagnostics(
     zone_to_centroid: Dict[int, int],
     output_dir: Path,
 ) -> None:
-    """Export CSV with per-connector info: zone, node, distance, link_type, penalty."""
-    import sqlite3
     db = str(project.project_base_path) + "/project_database.sqlite"
     conn = sqlite3.connect(db)
     rows = conn.execute(
@@ -1407,13 +2180,45 @@ def export_connector_diagnostics(
         print(f"  Connector diagnostics: {out} ({len(df)} connectors)")
 
 
+def export_gateway_diagnostics(
+    gateway_meta: Dict[str, Dict[str, Any]],
+    output_dir: Path,
+) -> None:
+    if not gateway_meta:
+        return
+
+    rows = []
+    for gw_name, meta in gateway_meta.items():
+        rows.append({
+            "gateway_name": gw_name,
+            "whitelist_token": meta.get("whitelist_token"),
+            "anchor_node_id": meta.get("anchor_node_id"),
+            "boundary_x": meta.get("boundary_x"),
+            "boundary_y": meta.get("boundary_y"),
+            "anchor_x": meta.get("anchor_x"),
+            "anchor_y": meta.get("anchor_y"),
+            "matched_ref": meta.get("matched_ref"),
+            "matched_name": meta.get("matched_name"),
+            "link_type": meta.get("link_type"),
+            "boundary_angle": meta.get("boundary_angle"),
+            "dist_boundary_m": meta.get("dist_boundary_m"),
+            "target_node_ids": ",".join(str(x) for x in meta.get("target_node_ids", [])),
+        })
+
+    if rows:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out = output_dir / "gateway_diagnostics.csv"
+        pd.DataFrame(rows).to_csv(out, index=False)
+        print(f"  Gateway diagnostics: {out} ({len(rows)} gateways)")
+
+
 # ----------------------------
 # Main
 # ----------------------------
 
-def build_zones_and_connectors(config_path: str | Path = "config/sim.yaml") -> None:
+def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "config/sim.yaml") -> None:
     print("Zoning: loading config...")
-    cfg = load_config(config_path)
+    cfg = _load_cfg(config_path)
 
     project_dir = Path(cfg["project_path"])
 
@@ -1427,6 +2232,7 @@ def build_zones_and_connectors(config_path: str | Path = "config/sim.yaml") -> N
     area_filter_cfg = zoning_cfg.get("zone_area_filter", {}) or {}
     cache_file = zoning_cfg.get("cache_file")
     output_dir = Path(zoning_cfg.get("output_dir", "outputs/baseline/zones"))
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     max_connectors = int(zoning_cfg.get("max_connectors", 4))
     max_distance_m = float(zoning_cfg.get("max_distance_m", 5000.0))
@@ -1435,15 +2241,24 @@ def build_zones_and_connectors(config_path: str | Path = "config/sim.yaml") -> N
     connector_lanes = int(zoning_cfg.get("connector_lanes", 4))
     connector_penalty = float(zoning_cfg.get("connector_access_penalty_s", 120.0))
 
+    ext_cfg = zoning_cfg.get("external_gateways", {}) or {}
+
     print("Zoning: opening project...")
     project = Project()
     project.open(str(project_dir))
 
     try:
-        # 0) AOI from network (ORIENTED, CRS-safe)
-        model_area = build_model_area(project, crs_epsg)
+        aoi_cfg = zoning_cfg.get("aoi", {}) or {}
+        model_area = build_model_area(
+            project,
+            crs_epsg,
+            quantile=float(aoi_cfg.get("quantile", 0.0)),
+            pad_ratio=float(aoi_cfg.get("pad_ratio", 0.02)),
+            extra_margin_m=float(aoi_cfg.get("extra_margin_m", 0.0)),
+            shift_x_m=float(aoi_cfg.get("shift_x_m", 0.0)),
+            shift_y_m=float(aoi_cfg.get("shift_y_m", 0.0)),
+        )
 
-        # 1) zones from OSM (cached)
         print("Zoning: loading zones (cache or download)...")
         zones = download_zones_from_sources(
             sources=sources,
@@ -1452,26 +2267,54 @@ def build_zones_and_connectors(config_path: str | Path = "config/sim.yaml") -> N
             area_filter_cfg=area_filter_cfg,
         )
 
-        # 2) filter by AOI
         zones = filter_zones_centroid_in_bbox(zones, model_area, crs_epsg)
         print(f"✓ zones with representative_point in AOI: {len(zones)}")
 
-        # 3) de-overlap again
         zones = remove_overlaps_by_priority(zones, rank_col="source_rank", min_area_m2=25.0)
         print(f"✓ zones after priority de-overlap: {len(zones)}")
 
         gateway_targets: Dict[str, List[int]] = {}
+        gateway_meta: Dict[str, Dict[str, Any]] = {}
 
-        ext_cfg = zoning_cfg.get("external_gateways", {}) or {}
         if bool(ext_cfg.get("enabled", False)):
-            gw_list = cfg.get("demand", {}).get("gateways", []) or []
+            whitelist_specs = _resolve_whitelist(ext_cfg)
 
-            ext_zones = _build_external_gateway_zones(
-                model_area,
-                crs_epsg,
-                gw_list,
-                zone_offset_m=float(ext_cfg.get("zone_offset_m", 4000.0)),
-                zone_size_m=float(ext_cfg.get("zone_size_m", 800.0)),
+            gateway_targets, gateway_meta, debug_corridors, debug_points = _select_gateway_target_nodes_boundary_whitelist(
+                project=project,
+                target_epsg=crs_epsg,
+                model_area=model_area,
+                whitelist_specs=whitelist_specs,
+                nodes_per_gateway=int(ext_cfg.get("connectors_per_gateway", 2)),
+                outer_quantile=float(ext_cfg.get("candidate_outer_quantile", 0.95)),
+                boundary_buffer_m=float(ext_cfg.get("boundary_buffer_m", 600.0)),
+                min_gateway_separation_m=float(ext_cfg.get("min_gateway_separation_m", 1800.0)),
+                allowed_link_types=ext_cfg.get(
+                    "allowed_link_types",
+                    ["motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link"],
+                ),
+            )
+
+            if debug_corridors is not None and not debug_corridors.empty:
+                dbg = debug_corridors.copy()
+
+                extra_geom_cols = [
+                    c for c in dbg.columns if c != dbg.geometry.name and dbg[c].dtype == "geometry"
+                ]
+                if extra_geom_cols:
+                    dbg = dbg.drop(columns=extra_geom_cols)
+
+                dbg.to_file(output_dir / "gateway_corridors_debug.geojson", driver="GeoJSON")
+                print(f"  gateway corridor debug: {output_dir / 'gateway_corridors_debug.geojson'}")
+
+            if debug_points is not None and not debug_points.empty:
+                debug_points.to_file(output_dir / "gateway_points_debug.geojson", driver="GeoJSON")
+                print(f"  gateway points debug: {output_dir / 'gateway_points_debug.geojson'}")
+
+            ext_zones = _build_external_gateway_zones_from_boundary_meta(
+                gateway_meta=gateway_meta,
+                target_epsg=crs_epsg,
+                zone_offset_m=float(ext_cfg.get("zone_offset_m", 20.0)),
+                zone_size_m=float(ext_cfg.get("zone_size_m", 80.0)),
             )
 
             if not ext_zones.empty:
@@ -1481,16 +2324,8 @@ def build_zones_and_connectors(config_path: str | Path = "config/sim.yaml") -> N
                 )
                 print(f"✓ synthetic external gateway zones added: {len(ext_zones)}")
 
-                gateway_targets = _select_gateway_target_nodes(
-                    project,
-                    crs_epsg,
-                    model_area,
-                    gw_list,
-                    nodes_per_gateway=int(ext_cfg.get("connectors_per_gateway", 2)),
-                    outer_quantile=float(ext_cfg.get("candidate_outer_quantile", 0.90)),
-                )
+            export_gateway_diagnostics(gateway_meta, output_dir)
 
-        # 4) centroids inside
         if zones.crs is None:
             zones = zones.set_crs(epsg=crs_epsg, allow_override=True)
         if zones.crs.to_epsg() != crs_epsg:
@@ -1498,7 +2333,6 @@ def build_zones_and_connectors(config_path: str | Path = "config/sim.yaml") -> N
 
         centroids = calculate_centroids(zones)
 
-        # 6.5) EARLY DEBUG MAP (before connectors)
         export_map_png(
             project=project,
             zones=zones,
@@ -1508,14 +2342,13 @@ def build_zones_and_connectors(config_path: str | Path = "config/sim.yaml") -> N
             filename="zones_map_pre_connectors.png",
             title_suffix=" (pre-connectors)",
             dpi=int(zoning_cfg.get("map_dpi", 250)),
+            debug_corridors=debug_corridors,
+            debug_points=debug_points,
         )
 
-        # 7) connectors
-        #    If running on a fresh project (after `clean`), there are no old
-        #    connectors.  If re-running, we close+reopen to flush AequilibraE's
-        #    in-memory cache so link.save() doesn't snap to stale nodes.
         _delete_all_connectors_and_reset_centroids(project)
         project.close()
+
         project = Project()
         project.open(str(project_dir))
 
@@ -1529,51 +2362,53 @@ def build_zones_and_connectors(config_path: str | Path = "config/sim.yaml") -> N
             lanes=connector_lanes,
             access_penalty_s=connector_penalty,
             gateway_targets=gateway_targets,
+            external_speed_kmh=float(ext_cfg.get("external_connector_speed_kmh", 90.0)),
+            external_access_penalty_s=float(ext_cfg.get("external_connector_access_penalty_s", 5.0)),
         )
 
-        # Connector diagnostics
         export_connector_diagnostics(project, zone_to_centroid, output_dir)
 
-        # Add centroid_node_id to centroids GeoDataFrame
         centroids["centroid_node_id"] = centroids["zone_id"].map(
             lambda z: zone_to_centroid.get(int(z), int(z))
         ).astype(int)
 
-        # Add population data if available
         pop_path = Path(cfg.get("datasets", {}).get("cache_dir", "data/cache")) / "zone_population.parquet"
         if pop_path.exists():
             pop_df = pd.read_parquet(pop_path)
             pop_map = dict(zip(pop_df["zone_id"], pop_df["population"]))
-            centroids["population"] = centroids["zone_id"].map(
-                lambda z: pop_map.get(int(z), 0)
+
+            centroids["population"] = centroids.apply(
+                lambda r: 0 if _row_is_external(r) else int(pop_map.get(int(r["zone_id"]), 0)),
+                axis=1,
             ).astype(int)
-            zones["population"] = zones["zone_id"].map(
-                lambda z: pop_map.get(int(z), 0)
+
+            zones["population"] = zones.apply(
+                lambda r: 0 if _row_is_external(r) else int(pop_map.get(int(r["zone_id"]), 0)),
+                axis=1,
             ).astype(int)
+
             print(f"  population data loaded: {len(pop_map)} zones, total={sum(pop_map.values()):,}")
+            print("  external zones exported with population=0")
         else:
             print(f"  [warn] {pop_path} not found — population not added to centroids")
 
-        # 8) export final
         output_dir.mkdir(parents=True, exist_ok=True)
         zones.to_file(output_dir / "zones.geojson", driver="GeoJSON")
         centroids.to_file(output_dir / "centroids.geojson", driver="GeoJSON")
 
-        import json as _json
         mapping_path = output_dir / "zone_centroid_mapping.json"
-        mapping_path.write_text(_json.dumps(
-            {str(k): v for k, v in zone_to_centroid.items()}, indent=2
-        ), encoding="utf-8")
+        mapping_path.write_text(
+            json.dumps({str(k): v for k, v in zone_to_centroid.items()}, indent=2),
+            encoding="utf-8",
+        )
         print(f"  zone->centroid mapping: {mapping_path}")
 
-        # AOI and gaps
         gpd.GeoDataFrame({"geometry": [model_area]}, crs=f"EPSG:{crs_epsg}").to_file(
             output_dir / "model_area.geojson", driver="GeoJSON"
         )
 
         print(f"✓ exported: {output_dir} (zones={len(zones)})")
 
-        # final map
         export_map_png(
             project=project,
             zones=zones,

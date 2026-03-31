@@ -211,4 +211,8 @@ cache/
 frontend/node_modules/
 frontend/dist/
 frontend/.env
-src/sim/__pycache__
+src/sim/__pycache__/
+
+# Experiment temp configs (must stay under repo root for path resolution)
+.tmp_metric_principle_configs/
+.tmp_tuning_configs/

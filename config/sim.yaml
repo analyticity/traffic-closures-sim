@@ -46,12 +46,14 @@ zoning:
   external_gateways:
     enabled: true
     whitelist: ["D1", "D2", "I/43", "I/50", "I/52", "I/23"]
+
     boundary_buffer_m: 600
     min_gateway_separation_m: 1800
     zone_size_m: 40
     zone_offset_m: 10
     connectors_per_gateway: 2
     candidate_outer_quantile: 0.95
+
     allowed_link_types:
       - motorway
       - motorway_link
@@ -60,21 +62,64 @@ zoning:
       - primary
       - primary_link
 
+    export_lookup: true
+    export_lookup_path: "data/cache/gateway_lookup_seed.parquet"
+    merge_boundary_near_candidates: false
+
+# Coarse national supernetwork
+supernetwork:
+  output_dir: "outputs/baseline/supernetwork"
+  cache_dir: "data/cache/supernetwork"
+  pbf_path: "data/sources/osm/czech-republic-latest.osm.pbf"
+  place_centroids_path: "data/cache/cz_place_centroids.parquet"
+  place_centroids_crs_epsg: 4326
+
+  contract_graph: true
+  contract_exclude_degree_leq: 2
+
+  national_network:
+    highway_types:
+      - motorway
+      - motorway_link
+      - trunk
+      - trunk_link
+      - primary
+      - primary_link
+      - secondary
+      - secondary_link
+
+  relation_filter:
+    detour_ratio_max: 1.25
+    max_extra_minutes: 20.0
+    allow_same_gateway_pair: false
+
 # OD matice
 demand:
   output_dir: "outputs/baseline/demand"
   matrix_path: "data/demand/od_matrix.aem"
   matrix_name: "demand"
 
-  # důležité: povolit fallback externích commuting toků na gateway zóny
-  use_gateway_fallback_in_commuting: true
+  # kvůli kompatibilitě může zatím zůstat true
+  use_gateway_fallback_in_commuting: false
 
   sldb:
     include_lokalizace:
       - "0_na_adrese_OP"
       - "1_meziobecni"
-    # důležité: nepoužívat jen interní páry, jinak se externí commuting ztrácí
     only_internal_pairs: false
+
+    filtered_parquet: "data/cache/dojizdka_obce.parquet"
+    full_cr_parquet: "data/cache/dojizdka_obce_full_cr.parquet"
+
+    external_processing:
+      enabled: true
+      use_full_cr_dataset: true
+      external_gateway_lookup_path: "data/cache/external_gateway_lookup.parquet"
+      through_gateway_pairs_path: "data/cache/through_gateway_pairs.parquet"
+      use_external_internal: true
+      use_internal_external: true
+      use_external_external_via_brno: true
+      drop_external_external_outside_model: true
 
   conversion:
     work:
@@ -89,21 +134,26 @@ demand:
   segments:
     other:
       source: "gravity"
-      trip_rate: 1.5
-      car_share: 0.45
-      occupancy: 1.40
-      beta: 0.0001
+      trip_rate: 0.6
+      car_share: 0.35
+      occupancy: 1.50
+      beta: 0.00015
 
     external_local:
+      enabled: false
       source: "gateway_local"
-      total_daily_trips: 50000
+      total_daily_trips: 30000
       corridor_weights: {}
+      mode: "residual_synthetic"
 
     external_through:
+      enabled: false
       source: "gateway_pairs"
-      total_daily_trips: 100000
+      total_daily_trips: 30000
       default_pair_weight: 1.0
       pairs: []
+      mode: "residual_synthetic"
+      data_driven_pairs_path: "data/cache/through_gateway_pairs.parquet"
 
   time_slices:
     periods: ["am", "ip", "pm", "ev"]
@@ -149,51 +199,46 @@ demand:
     pa_occupancy: 1.30
     ipf_max_iter: 200
     ipf_tolerance: 0.001
-
-    # dočasně menší váha IPF/blendu, dokud distribuce ještě neběží nad síťovými skimy
     blend_alpha: 0.35
 
 # Kalibrace a validace
 calibration:
   algorithm: "bfw"
-  max_iter: 100
-  rgap_target: 0.001
+  max_iter: 150
+  rgap_target: 0.002
   core_name: "wd_daily"
 
   gateway_calibration:
     enabled: true
     observed_path: "data/cache/gateway_counts_2025.parquet"
-    damping: 0.15
-    min_factor: 0.85
-    max_factor: 1.15
+    damping: 0.08
+    min_factor: 0.90
+    max_factor: 1.10
 
-  match_buffer_m: 25.0
-
-  # důležité: zapnout direction-aware match
+  match_buffer_m: 15.0
   match_direction_aware: true
   match_conflict_resolution: "nearest"
   count_target: "car_only"
-
-  # důležité: pro dělené komunikace agregovat koridor
   aggregate_corridor: false
   save_skims: true
 
   max_iterations: 15
+  # Restore data/demand/od_matrix.aem from .aem.orig at each calibrate (needed for fair tuning runs).
+  reset_matrix_before_run: true
   convergence:
     geh_lt5_target_pct: 85.0
-
-    # malé dočasné zhoršení GEH nesmí zastavit kalibraci hned po 2. iteraci
-    # funguje jako "povolená tolerance" pro přechodné výkyvy
     min_improvement_pct: -2.0
 
   scaling:
+    enabled: true
     method: "global"
-    damping: 0.15
-    min_factor: 0.85
-    max_factor: 1.15
+    damping: 0.08
+    min_factor: 0.90
+    max_factor: 1.10
 
   screenlines_path: "config/screenlines.yaml"
 
+# Datové sady
 # Datové sady
 datasets:
   enabled: true
@@ -211,6 +256,8 @@ datasets:
       provider: "csu_open_data_csv"
       url: "https://csu.gov.cz/docs/107508/4dbdab3b-905c-deff-4cfa-e4828a6fa2de/dojizdka_obce.csv?version=1.0"
       out_path: "data/sources/csu/sldb2021/dojizdka_obce.csv"
+      filtered_out_parquet: "data/cache/dojizdka_obce.parquet"
+      full_cr_out_parquet: "data/cache/dojizdka_obce_full_cr.parquet"
       format:
         type: "csv"
         delimiter: ","
@@ -226,6 +273,9 @@ datasets:
               values: ["Brno"]
         destination:
           keep_all: true
+      preprocess:
+        write_filtered: true
+        write_full_cr: true
 
     calibration_brno_pentlogram_2024:
       enabled: true
@@ -248,9 +298,7 @@ datasets:
       usage:
         calibration_target: "link_counts"
 
-    # legacy název ponechaný kvůli loaderu;
-    # POZOR: tady máš aktuálně URL na CSD 2025, ne 2020
-    validation_csd2020_v2:
+    validation_csd2025_v2:
       enabled: true
       year: 2025
       provider: "http_file"
@@ -275,6 +323,39 @@ datasets:
         encoding: "utf-8"
       usage:
         socioeconomic: "population_per_zone"
+
+    # Oficiální countrywide RÚIAN address points (ZIP/CSV přes ATOM).
+    # Z toho fetch_datasets vytvoří reprezentativní body obcí do cz_place_centroids.parquet.
+    cz_place_centroids:
+      enabled: true
+      provider: "atom_file"
+      url: "https://atom.cuzk.gov.cz/get.ashx?theme=RUIAN-CSV-ADR-ST"
+      feed_cache_path: "data/sources/cz/places/ruian_csv_adr_st.atom.xml"
+      out_path: "data/sources/cz/places/ruian_csv_adr_st.zip"
+      out_parquet: "data/cache/cz_place_centroids.parquet"
+      format:
+        type: "zip_csv"
+        asset_pattern: "(?i)(^|/)[0-9]{8}_OB_ADR_csv\\.zip$"
+        member_pattern: "(?i)\\.csv$"
+        delimiter: ";"
+        encoding: "cp1250"
+        source_crs_epsg: 2065
+        output_crs_epsg: 4326
+      columns:
+        place_code: "Kód obce"
+        place_name: "Název obce"
+        x: "Souřadnice X"
+        y: "Souřadnice Y"
+      usage:
+        supernetwork_places: "grouped_point_centroids"
+
+    cz_roads_major_pbf:
+      enabled: true
+      provider: "http_file"
+      url: "https://download.geofabrik.de/europe/czech-republic-latest.osm.pbf"
+      out_path: "data/sources/osm/czech-republic-latest.osm.pbf"
+      format:
+        type: "pbf"
 
 # REST API
 api:

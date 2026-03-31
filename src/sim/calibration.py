@@ -526,6 +526,85 @@ def compute_stats(modeled: np.ndarray, observed: np.ndarray) -> Dict[str, Any]:
     }
 
 
+def _coarse_road_class(link_type: object) -> str:
+    """Map OSM link_type to a small set of buckets for bias / MAE reporting."""
+    s = str(link_type).lower()
+    for rc in ("motorway", "trunk", "primary", "secondary", "tertiary"):
+        if rc in s:
+            return rc
+    return "other"
+
+
+def compute_extended_link_metrics(
+    matched: pd.DataFrame,
+    model_col: str,
+    obs_col: str,
+) -> Dict[str, Any]:
+    """Extra fit diagnostics for metric validity experiments (wMAPE, class MAE, Spearman).
+
+    *matched* should be rows with positive observed counts and finite modeled volumes.
+    """
+    if model_col not in matched.columns or obs_col not in matched.columns:
+        return {}
+
+    sub = matched[[model_col, obs_col]].dropna()
+    sub = sub[(sub[obs_col] > 0) & np.isfinite(sub[model_col])].copy()
+    if sub.empty:
+        return {}
+
+    m = sub[model_col].astype(float).values
+    o = sub[obs_col].astype(float).values
+
+    wmape = float(np.sum(np.abs(m - o)) / max(np.sum(o), 1e-9) * 100.0)
+    denom_smape = np.abs(m) + np.abs(o)
+    mask = denom_smape > 0
+    smape = float(
+        np.mean(2.0 * np.abs(m[mask] - o[mask]) / denom_smape[mask]) * 100.0
+    ) if mask.any() else float("nan")
+
+    srs = pd.Series(m)
+    srs_o = pd.Series(o)
+    rho = srs.corr(srs_o, method="spearman")
+    spearman_rho = round(float(rho), 4) if rho is not None and np.isfinite(rho) else None
+
+    sum_m, sum_o = float(m.sum()), float(o.sum())
+    sum_ratio = round(sum_m / max(sum_o, 1e-9), 4) if sum_o > 0 else None
+
+    mae_by_class: Dict[str, float] = {}
+    bias_pct_by_class: Dict[str, float] = {}
+    n_by_class: Dict[str, int] = {}
+
+    if "link_type" in matched.columns:
+        lt_sub = matched.loc[sub.index]
+        coarse = lt_sub["link_type"].map(_coarse_road_class)
+        for rc in coarse.unique():
+            idx = coarse == rc
+            if not idx.any():
+                continue
+            take = idx.to_numpy()
+            mc = m[take]
+            oc = o[take]
+            mae_by_class[str(rc)] = round(float(np.mean(np.abs(mc - oc))), 1)
+            bias_pct_by_class[str(rc)] = round(
+                float(np.mean((mc - oc) / np.maximum(oc, 1e-9)) * 100.0), 2
+            )
+            n_by_class[str(rc)] = int(idx.sum())
+
+    biases = list(bias_pct_by_class.values()) if bias_pct_by_class else []
+    class_bias_max_abs = round(float(max(abs(b) for b in biases)), 2) if biases else None
+
+    return {
+        "wmape_pct": round(wmape, 2),
+        "smape_pct": round(smape, 2) if np.isfinite(smape) else None,
+        "spearman_rho": spearman_rho,
+        "sum_ratio": sum_ratio,
+        "mae_by_class": mae_by_class,
+        "bias_pct_by_class": bias_pct_by_class,
+        "n_by_class": n_by_class,
+        "class_bias_max_abs_pct": class_bias_max_abs,
+    }
+
+
 # ---------------------------------------------------------------------------
 # OD matrix scaling (FSM calibration step)
 # ---------------------------------------------------------------------------
@@ -1304,6 +1383,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     min_improvement = float(conv_cfg.get("min_improvement_pct", 1.0))
     scale_cfg = calib_cfg.get("scaling") or {}
     scale_method = str(scale_cfg.get("method", "sector"))
+    scale_enabled = bool(scale_cfg.get("enabled", True))
     damping = float(scale_cfg.get("damping", 0.5))
     min_factor = float(scale_cfg.get("min_factor", 0.5))
     max_factor = float(scale_cfg.get("max_factor", 2.0))
@@ -1313,7 +1393,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
 
     print("=== FSM ITERATIVE CALIBRATION ===")
     print(f"  max_iterations={max_iterations}, target GEH<5 >= {geh_target}%")
-    print(f"  scaling: {scale_method}, damping={damping}")
+    print(f"  scaling: enabled={scale_enabled}, method={scale_method}, damping={damping}")
     print(f"  count_target: {count_target} (comparing against '{obs_col}')")
 
     # Pre-flight
@@ -1322,10 +1402,16 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     if not matrix_path.exists():
         raise FileNotFoundError(f"OD matrix not found: {matrix_path}")
 
-    # Keep a backup of the original matrix
+    # Keep a backup of the original (pre-calibration) matrix and optionally
+    # restore it at the start of each run so batch / tuning experiments are not
+    # chained through a repeatedly scaled matrix file.
     backup = matrix_path.with_suffix(".aem.orig")
     if not backup.exists():
         shutil.copy2(matrix_path, backup)
+    reset_matrix = bool(calib_cfg.get("reset_matrix_before_run", True))
+    if reset_matrix and backup.exists():
+        shutil.copy2(backup, matrix_path)
+        print("  Restored OD matrix from .aem.orig (reset_matrix_before_run=true)")
 
     # Load calibration counts once
     pent = load_pentlogram(cfg)
@@ -1358,6 +1444,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     history: List[Dict[str, Any]] = []
     prev_geh5 = 0.0
     mq: Dict[str, Any] = {}
+    last_extended: Dict[str, Any] = {}
 
     try:
         for it in range(1, max_iterations + 1):
@@ -1420,6 +1507,15 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             r2 = stats.get("r2")
             print(f"  GEH<5: {geh5:.1f}%  GEH<10: {geh10:.1f}%  R²: {r2}")
 
+            if not valid.empty and compare_col and compare_col in valid.columns:
+                try:
+                    last_extended = compute_extended_link_metrics(
+                        valid, compare_col, obs_col,
+                    )
+                except Exception as ex:
+                    print(f"  WARNING: extended link metrics failed: {ex}")
+                    last_extended = {}
+
             mq = match_quality_report(matched)
             if it == 1:
                 print(f"  Match quality: {mq['n_matched']}/{mq['n_total']} matched, "
@@ -1462,7 +1558,12 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             prev_geh5 = geh5
 
             # 5) Scale OD matrix (use compare_col -- corridor volume when available)
-            if not valid.empty and compare_col and total_vol > 0:
+            if (
+                scale_enabled
+                and not valid.empty
+                and compare_col
+                and total_vol > 0
+            ):
                 if scale_method == "global":
                     factor = _compute_global_factor(
                         valid, compare_col, damping=damping,
@@ -1512,6 +1613,8 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                         scale_matrix(mat, core_name, factors, weights=obs_weights)
                     else:
                         print("  No sector factors computed — skipping scaling")
+            elif not scale_enabled:
+                print("  Scaling disabled (principle: frozen / diagnostic run)")
             else:
                 print("  Cannot scale — no valid matched volumes")
 
@@ -1600,10 +1703,12 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             "max_iterations": max_iterations,
             "geh_target": geh_target,
             "scale_method": scale_method,
+            "scale_enabled": scale_enabled,
             "damping": damping,
             "count_target": count_target,
             "obs_col": obs_col,
         },
+        "extended_metrics": last_extended,
         "observed_summary": {
             "total_car": round(float(pent["observed_car"].sum()), 0),
             "total_truck": round(float(pent["observed_truck"].sum()), 0),

@@ -9,8 +9,9 @@ Workflow:
   3) normalize-network  – clean / normalise link attributes
   4) build-zones        – create TAZ zones + centroid connectors
   5) fetch-data         – download & preprocess external datasets
-  6) build-demand       – build OD matrix from SLDB commuting data
-  7) distribute         – gravity calibration + IPF on seed OD
+  6) build-supernetwork – build simplified national gateway supernetwork
+  7) build-demand       – build OD matrix from SLDB commuting data
+  8) distribute         – gravity calibration + IPF on seed OD
   8) assign             – traffic assignment (shortest path / equilibrium)
   9) calibrate          – iterative: assign → compare → scale → repeat
  10) tune-supply        – outer-loop supply parameter optimization
@@ -36,6 +37,7 @@ from sim.demand import load_or_build_od_matrix
 from sim.assignment import run_assignment
 from sim.calibration import run_calibration, run_validation_only
 from sim.temporal import run_learn_profile
+from sim.supernetwork import run_build_supernetwork
 
 STEPS = [
     "clean",
@@ -44,6 +46,7 @@ STEPS = [
     "normalize-network",
     "build-zones",
     "fetch-data",
+    "build-supernetwork",
     "build-demand",
     "distribute",
     "assign",
@@ -108,6 +111,8 @@ def main() -> None:
     elif step == "distribute":
         from sim.distribution import run_distribution
         run_distribution(cfg)
+    elif step == "build-supernetwork":
+        run_build_supernetwork(cfg)
     elif step == "assign":
         run_assignment(cfg)
     elif step == "calibrate":

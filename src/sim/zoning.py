@@ -17,6 +17,14 @@ NOVĚ:
   a z každého clusteru vytvoří jeden gateway.
 - External zóna se kotví na boundary point AOI, ne na anchor road node.
 - Žádná hardcoded gateway knihovna pro konkrétní město.
+
+DOPLNĚNO PRO SUPERNETWORK:
+- Merge gateway kandidátů je volitelný přes config:
+    zoning.external_gateways.merge_boundary_near_candidates
+- Exportuje se stabilní gateway seed lookup pro build-supernetwork:
+    zoning.external_gateways.export_lookup
+    zoning.external_gateways.export_lookup_path
+- gateway_diagnostics.csv obsahuje rozšířená metadata
 """
 
 from __future__ import annotations
@@ -107,6 +115,7 @@ def _guess_crs_from_coords(geoms: gpd.GeoSeries, target_epsg: int) -> str:
     if max_abs_x <= 180.0 and max_abs_y <= 90.0:
         return "EPSG:4326"
     return f"EPSG:{target_epsg}"
+
 
 def _circular_mean_ring_pos(values: List[float], ring_length: float) -> float:
     if not values:
@@ -564,22 +573,6 @@ def _resolve_whitelist(ext_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     ]
 
 
-def _match_ref_token(row: pd.Series, token_norm: str) -> int:
-    for col in ("osm_ref_norm", "osm_ref", "ref"):
-        if col in row and pd.notna(row.get(col)):
-            if _norm_text(row.get(col)) == token_norm:
-                return 1
-    return 0
-
-
-def _match_name_token(row: pd.Series, token_norm: str) -> int:
-    for col in ("osm_name_raw", "name"):
-        if col in row and pd.notna(row.get(col)):
-            if token_norm and token_norm in _norm_text(row.get(col)):
-                return 1
-    return 0
-
-
 # ----------------------------
 # Drop huge zones per source
 # ----------------------------
@@ -849,12 +842,16 @@ def calculate_centroids(zones: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             "anchor_y",
             "boundary_x",
             "boundary_y",
+            "boundary_pos",
             "centroid_x",
             "centroid_y",
             "outward_dx",
             "outward_dy",
             "matched_ref",
             "matched_name",
+            "link_type",
+            "whitelist_token",
+            "merged_from",
         ]
         if c in zones.columns
     ]
@@ -1098,91 +1095,6 @@ def _eligible_road_nodes(project: Project) -> Tuple[set[int], Dict[int, float]]:
 # Boundary-whitelist gateway discovery
 # ----------------------------
 
-def _prepare_boundary_candidate_links(
-    project: Project,
-    target_epsg: int,
-    model_area: Any,
-    *,
-    allowed_link_types: Optional[List[str]] = None,
-    boundary_buffer_m: float = 500.0,
-    outer_quantile: float = 0.95,
-) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, Dict[int, Any], set[int], Dict[int, float], float]:
-    road_nids, node_weight = _eligible_road_nodes(project)
-    if not road_nids:
-        empty = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
-        return empty, empty, {}, set(), {}, 0.0
-
-    nodes_gdf = _network_ref(project, "nodes", target_epsg)[["node_id", "geometry"]].copy()
-    nodes_gdf = nodes_gdf[nodes_gdf["node_id"].astype(int).isin(road_nids)].copy()
-
-    node_geom = {
-        int(r["node_id"]): r.geometry
-        for _, r in nodes_gdf.iterrows()
-    }
-
-    center = model_area.representative_point()
-    cx, cy = float(center.x), float(center.y)
-
-    nodes_gdf["_dist_center"] = np.sqrt(
-        (nodes_gdf.geometry.x - cx) ** 2 + (nodes_gdf.geometry.y - cy) ** 2
-    )
-    outer_thr = float(nodes_gdf["_dist_center"].quantile(float(outer_quantile))) if len(nodes_gdf) else 0.0
-    outer_node_ids = set(
-        nodes_gdf.loc[nodes_gdf["_dist_center"] >= outer_thr, "node_id"].astype(int).tolist()
-    )
-
-    links_gdf = _network_ref(project, "links", target_epsg).copy()
-    if links_gdf.empty:
-        empty = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
-        return empty, nodes_gdf, node_geom, outer_node_ids, node_weight, 0.0
-
-    links_gdf = links_gdf[
-        links_gdf["modes"].astype(str).str.contains("c", na=False)
-        & (links_gdf["link_type"].astype(str) != "centroid_connector")
-        & links_gdf["a_node"].astype(int).isin(road_nids)
-        & links_gdf["b_node"].astype(int).isin(road_nids)
-    ].copy()
-
-    if allowed_link_types:
-        allowed = {str(x).strip() for x in allowed_link_types}
-        if allowed:
-            links_gdf = links_gdf[links_gdf["link_type"].astype(str).isin(allowed)].copy()
-
-    boundary = model_area.boundary
-
-    def _nearest_boundary_point(geom: Any) -> Point:
-        try:
-            _, bp = nearest_points(geom, boundary)
-            return bp
-        except Exception:
-            mid = _safe_line_midpoint(geom)
-            try:
-                _, bp = nearest_points(mid, boundary)
-                return bp
-            except Exception:
-                return mid
-
-    links_gdf["_dist_boundary"] = links_gdf.geometry.distance(boundary)
-    links_gdf["_boundary_pt"] = links_gdf.geometry.apply(_nearest_boundary_point)
-    links_gdf["_boundary_pos"] = links_gdf["_boundary_pt"].apply(lambda p: float(boundary.project(p)))
-    links_gdf["_boundary_angle"] = links_gdf["_boundary_pt"].apply(
-        lambda p: _bearing_deg(cx, cy, float(p.x), float(p.y))
-    )
-    links_gdf["_road_class_weight"] = links_gdf["link_type"].astype(str).map(_ROAD_CLASS_WEIGHT).fillna(0.5)
-    links_gdf["_speed_num"] = links_gdf["speed_ab"].apply(lambda v: _first_number(v, default=0.0)) if "speed_ab" in links_gdf.columns else 0.0
-    links_gdf["_lanes_num"] = links_gdf["lanes_ab"].apply(lambda v: _first_number(v, default=1.0)) if "lanes_ab" in links_gdf.columns else 1.0
-
-    near_boundary = links_gdf[links_gdf["_dist_boundary"] <= float(boundary_buffer_m)].copy()
-    if near_boundary.empty and not links_gdf.empty:
-        near_boundary = links_gdf.nsmallest(min(200, len(links_gdf)), "_dist_boundary").copy()
-        print(
-            f"  [warn] no links within boundary_buffer_m={boundary_buffer_m:.0f}; "
-            f"using nearest {len(near_boundary)} links"
-        )
-
-    return near_boundary, nodes_gdf, node_geom, outer_node_ids, node_weight, float(boundary.length)
-
-
 def _cluster_positions_on_ring(df: pd.DataFrame, pos_col: str, threshold_m: float, ring_length: float) -> List[pd.DataFrame]:
     if df.empty:
         return []
@@ -1219,10 +1131,10 @@ def _select_gateway_target_nodes_boundary_whitelist(
     whitelist_specs: List[Dict[str, Any]],
     *,
     nodes_per_gateway: int = 2,
-    outer_quantile: float = 0.95,
     boundary_buffer_m: float = 600.0,
     min_gateway_separation_m: float = 1800.0,
     allowed_link_types: Optional[List[str]] = None,
+    merge_boundary_near_candidates: bool = False,
 ) -> Tuple[
     Dict[str, List[int]],
     Dict[str, Dict[str, Any]],
@@ -1452,6 +1364,7 @@ def _select_gateway_target_nodes_boundary_whitelist(
                 "link_type": str(best_link.get("link_type", "") or ""),
                 "boundary_angle": float(cluster_angle),
                 "dist_boundary_m": float(anchor_geom.distance(boundary)),
+                "merged_from": "",
             }
 
             print(
@@ -1480,16 +1393,18 @@ def _select_gateway_target_nodes_boundary_whitelist(
                     "geometry": node_geom[int(nid)],
                 })
 
-    # Global boundary-based merge across all tokens and carriageways
-    gateway_targets, gateway_meta = _merge_gateway_candidates_on_boundary(
-        gateway_targets=gateway_targets,
-        gateway_meta=gateway_meta,
-        node_geom=node_geom,
-        node_weight=node_weight,
-        model_area=model_area,
-        merge_distance_m=float(min_gateway_separation_m),
-        nodes_per_gateway=int(nodes_per_gateway),
-    )
+    if merge_boundary_near_candidates:
+        gateway_targets, gateway_meta = _merge_gateway_candidates_on_boundary(
+            gateway_targets=gateway_targets,
+            gateway_meta=gateway_meta,
+            node_geom=node_geom,
+            node_weight=node_weight,
+            model_area=model_area,
+            merge_distance_m=float(min_gateway_separation_m),
+            nodes_per_gateway=int(nodes_per_gateway),
+        )
+    else:
+        print("  boundary-near merge disabled by config")
 
     debug_corridors_gdf = (
         gpd.GeoDataFrame(pd.concat(debug_corridor_parts, ignore_index=True), crs=links_gdf.crs)
@@ -1554,12 +1469,16 @@ def _build_external_gateway_zones_from_boundary_meta(
             "anchor_y": float(meta["anchor_y"]),
             "boundary_x": bx,
             "boundary_y": by,
+            "boundary_pos": float(meta.get("boundary_pos", 0.0)),
             "centroid_x": cx,
             "centroid_y": cy,
             "outward_dx": ux,
             "outward_dy": uy,
             "matched_ref": str(meta.get("matched_ref", "")),
             "matched_name": str(meta.get("matched_name", "")),
+            "link_type": str(meta.get("link_type", "")),
+            "whitelist_token": str(meta.get("whitelist_token", "")),
+            "merged_from": str(meta.get("merged_from", "")),
             "geometry": geom,
         })
 
@@ -1571,6 +1490,7 @@ def _build_external_gateway_zones_from_boundary_meta(
         )
 
     return gpd.GeoDataFrame(rows, crs=f"EPSG:{target_epsg}")
+
 
 # ----------------------------
 # Download zones (OSM, generic)
@@ -2192,17 +2112,23 @@ def export_gateway_diagnostics(
         rows.append({
             "gateway_name": gw_name,
             "whitelist_token": meta.get("whitelist_token"),
+            "whitelist_priority": meta.get("whitelist_priority"),
+            "cluster_index": meta.get("cluster_index"),
             "anchor_node_id": meta.get("anchor_node_id"),
             "boundary_x": meta.get("boundary_x"),
             "boundary_y": meta.get("boundary_y"),
+            "boundary_pos": meta.get("boundary_pos"),
             "anchor_x": meta.get("anchor_x"),
             "anchor_y": meta.get("anchor_y"),
+            "outward_dx": meta.get("outward_dx"),
+            "outward_dy": meta.get("outward_dy"),
             "matched_ref": meta.get("matched_ref"),
             "matched_name": meta.get("matched_name"),
             "link_type": meta.get("link_type"),
             "boundary_angle": meta.get("boundary_angle"),
             "dist_boundary_m": meta.get("dist_boundary_m"),
             "target_node_ids": ",".join(str(x) for x in meta.get("target_node_ids", [])),
+            "merged_from": meta.get("merged_from", ""),
         })
 
     if rows:
@@ -2210,6 +2136,60 @@ def export_gateway_diagnostics(
         out = output_dir / "gateway_diagnostics.csv"
         pd.DataFrame(rows).to_csv(out, index=False)
         print(f"  Gateway diagnostics: {out} ({len(rows)} gateways)")
+
+
+def export_gateway_seed_lookup(
+    gateway_meta: Dict[str, Dict[str, Any]],
+    output_path: Path,
+    *,
+    crs_epsg: int,
+) -> None:
+    """
+    Export stable gateway seed lookup for build-supernetwork.
+
+    Writes:
+    - parquet (if suffix .parquet)
+    - or csv/geojson according to suffix
+    """
+    if not gateway_meta:
+        return
+
+    rows = []
+    for gw_name, meta in gateway_meta.items():
+        rows.append({
+            "gateway_name": gw_name,
+            "whitelist_token": str(meta.get("whitelist_token", "")),
+            "boundary_x": float(meta.get("boundary_x", 0.0)),
+            "boundary_y": float(meta.get("boundary_y", 0.0)),
+            "boundary_pos": float(meta.get("boundary_pos", 0.0)),
+            "anchor_node_id": int(meta.get("anchor_node_id", 0)),
+            "anchor_x": float(meta.get("anchor_x", 0.0)),
+            "anchor_y": float(meta.get("anchor_y", 0.0)),
+            "outward_dx": float(meta.get("outward_dx", 0.0)),
+            "outward_dy": float(meta.get("outward_dy", 0.0)),
+            "matched_ref": str(meta.get("matched_ref", "")),
+            "matched_name": str(meta.get("matched_name", "")),
+            "link_type": str(meta.get("link_type", "")),
+            "geometry": Point(float(meta.get("boundary_x", 0.0)), float(meta.get("boundary_y", 0.0))),
+        })
+
+    gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs=f"EPSG:{crs_epsg}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    suffix = output_path.suffix.lower()
+    if suffix == ".parquet":
+        gdf.to_parquet(output_path, index=False)
+    elif suffix == ".geojson":
+        gdf.to_file(output_path, driver="GeoJSON")
+    elif suffix == ".csv":
+        pd.DataFrame(gdf.drop(columns="geometry")).to_csv(output_path, index=False)
+    else:
+        # default: parquet
+        out = output_path.with_suffix(".parquet")
+        gdf.to_parquet(out, index=False)
+        output_path = out
+
+    print(f"  Gateway seed lookup: {output_path}")
 
 
 # ----------------------------
@@ -2242,6 +2222,9 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
     connector_penalty = float(zoning_cfg.get("connector_access_penalty_s", 120.0))
 
     ext_cfg = zoning_cfg.get("external_gateways", {}) or {}
+    merge_boundary_near_candidates = bool(ext_cfg.get("merge_boundary_near_candidates", False))
+    export_lookup = bool(ext_cfg.get("export_lookup", False))
+    export_lookup_path = _safe_path(ext_cfg.get("export_lookup_path", "data/cache/gateway_lookup_seed.parquet"))
 
     print("Zoning: opening project...")
     project = Project()
@@ -2275,6 +2258,8 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
 
         gateway_targets: Dict[str, List[int]] = {}
         gateway_meta: Dict[str, Dict[str, Any]] = {}
+        debug_corridors = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{crs_epsg}")
+        debug_points = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{crs_epsg}")
 
         if bool(ext_cfg.get("enabled", False)):
             whitelist_specs = _resolve_whitelist(ext_cfg)
@@ -2285,13 +2270,13 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
                 model_area=model_area,
                 whitelist_specs=whitelist_specs,
                 nodes_per_gateway=int(ext_cfg.get("connectors_per_gateway", 2)),
-                outer_quantile=float(ext_cfg.get("candidate_outer_quantile", 0.95)),
                 boundary_buffer_m=float(ext_cfg.get("boundary_buffer_m", 600.0)),
                 min_gateway_separation_m=float(ext_cfg.get("min_gateway_separation_m", 1800.0)),
                 allowed_link_types=ext_cfg.get(
                     "allowed_link_types",
                     ["motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link"],
                 ),
+                merge_boundary_near_candidates=merge_boundary_near_candidates,
             )
 
             if debug_corridors is not None and not debug_corridors.empty:
@@ -2325,6 +2310,13 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
                 print(f"✓ synthetic external gateway zones added: {len(ext_zones)}")
 
             export_gateway_diagnostics(gateway_meta, output_dir)
+
+            if export_lookup:
+                export_gateway_seed_lookup(
+                    gateway_meta,
+                    export_lookup_path,
+                    crs_epsg=crs_epsg,
+                )
 
         if zones.crs is None:
             zones = zones.set_crs(epsg=crs_epsg, allow_override=True)

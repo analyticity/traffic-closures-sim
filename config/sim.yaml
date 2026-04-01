@@ -8,9 +8,17 @@ osm:
 
 # Síť
 network:
-  experiment_profile: "motorway_push"
+  # Defaults and named profiles for normalize-network (speed/lanes/capacity gaps, experiment tweaks).
+  normalization_config: "config/network_normalization.yaml"
+  # baseline = no extra caps/penalties; named profiles adjust hierarchy / local penalties (see YAML above).
+  experiment_profile: "baseline"
   output_dir: "outputs/baseline/network"
   maps_dir: "outputs/baseline/maps"
+  # After trim: drop OSM non-road ways and links without car mode ``c`` (footway, path, cycleway, …).
+  drivable_network:
+    enabled: true
+    require_mode_car: true
+    # excluded_link_types: []  # optional override; if omitted, built-in OSM walk/cycle list is used
 
 # Zónování
 zoning:
@@ -138,6 +146,11 @@ demand:
       car_share: 0.35
       occupancy: 1.50
       beta: 0.00015
+      defaults:
+        trip_rate: 0.6
+        car_share: 0.35
+        occupancy: 1.50
+        beta: 0.00015
 
     external_local:
       enabled: false
@@ -191,6 +204,20 @@ demand:
         pm: 0.30
         ev: 0.18
 
+  temporal_policy:
+    weekend_split:
+      saturday_multiplier: 1.10
+      sunday_multiplier: 0.90
+      holiday_multiplier_to_sunday: 0.85
+    fallback_day_period_shares:
+      day: 0.785
+      evening: 0.137
+      night: 0.078
+    demand_period_split_from_day:
+      am: 0.35
+      ip: 0.40
+      pm: 0.25
+
   distribution:
     enabled: false
     deterrence_function: "EXPO"
@@ -232,11 +259,82 @@ calibration:
   scaling:
     enabled: true
     method: "global"
+    adaptive_data_driven: true
     damping: 0.08
     min_factor: 0.90
     max_factor: 1.10
+    adaptive_policy:
+      min_valid_pairs: 20
+      ratio_quantiles:
+        low: 0.10
+        mid: 0.50
+        high: 0.90
+      clip_bounds:
+        min_factor_low: 0.60
+        min_factor_high: 0.98
+        max_factor_low: 1.02
+        max_factor_high: 1.80
+      damping_formula:
+        base: 0.08
+        gain: 0.20
+        min: 0.05
+        max: 0.35
+      blend_with_defaults: 0.50
+
+  # Quality acceptance policy for calibration outputs.
+  quality_gates:
+    hard_class_bias_max_abs_pct: 90.0
+    warn_wmape_pct: 47.0
+    warn_geh_lt5_pct: 7.0
+    objective_patience: 3
+    # Keep weights in config to avoid hardcoded tuning constants.
+    objective_weights:
+      spearman: 120.0
+      geh_lt5: 1.8
+      wmape_pct: 1.0
+      class_bias_max_abs_pct: 0.35
+      pct_rmse: 0.35
 
   screenlines_path: "config/screenlines.yaml"
+
+# Experiment policy (dehack): scripts should read thresholds/ranges from here.
+experiments:
+  policy:
+    objective:
+      primary: "ObjB"
+      secondary: "ObjC"
+      legacy: "ObjA"
+      objB_weights:
+        spearman: 120.0
+        geh_lt5: 1.8
+        wmape_pct: 1.0
+        class_bias_max_abs_pct: 0.35
+        pct_rmse: 0.35
+      objC_weights:
+        spearman: 150.0
+        mean_mae_class: 0.12
+        abs_log_sum_ratio: 25.0
+        pct_rmse: 0.25
+      sum_ratio_clip:
+        min: 0.25
+        max: 4.0
+    guardrails:
+      hard_class_bias_max_abs_pct: 90.0
+      warn_wmape_pct: 47.0
+      warn_geh_lt5_pct: 7.0
+    tuning_ranges:
+      assignment:
+        max_iter: [100, 150, 200]
+        rgap_target: [0.001, 0.002]
+      matching:
+        match_buffer_m: [10.0, 25.0, 45.0]
+      scaling:
+        damping: [0.05, 0.08, 0.15]
+        min_factor: [0.75, 0.9]
+        max_factor: [1.1, 1.25]
+      gateway:
+        damping: [0.08, 0.15]
+      external_daily_trips: [10000, 20000, 30000]
 
 # Datové sady
 # Datové sady

@@ -8,13 +8,15 @@ import sqlite3
 import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import pandas as pd
 from aequilibrae import Project
 from shapely.geometry import box
 
+from sim.aequilibrae_paths import resolve_project_database_path
 from sim.io_project import load_config
 
 
@@ -23,14 +25,7 @@ def _ensure_dir(path: Path) -> None:
 
 
 def _project_db_path(project_dir: Path) -> Path:
-    candidates = (
-        list(project_dir.glob("*.sqlite"))
-        + list(project_dir.glob("*.db"))
-        + list(project_dir.glob("*.sqlite3"))
-    )
-    if candidates:
-        return candidates[0]
-    return project_dir / "project_database.sqlite"
+    return resolve_project_database_path(project_dir)
 
 _MAJOR_REF_PROPAGATION_TYPES = {
     "motorway",
@@ -67,7 +62,7 @@ def _fill_missing_refs_from_named_corridors(
     Second pass:
     If a major-road corridor has the same name and most of its connected links
     already have the same ref, propagate that ref to short missing gaps.
-    This helps with cases like Bratislavská where OSM ref is not present on every segment.
+    This helps when OSM ``ref`` is missing on short segments along a named major corridor.
     """
     df = project.network.links.data.copy()
     if df.empty:
@@ -405,6 +400,118 @@ def trim_network_to_bbox_raw(
         pass
 
     return {"nodes_deleted": nodes_deleted, "links_deleted": links_deleted}
+
+
+# ----------------------------
+# Non-drivable link removal (OSM highway → link_type)
+# ----------------------------
+
+# link_type values that are not motor-vehicle roads; keep configurable via sim.yaml
+DEFAULT_EXCLUDED_HIGHWAY_LINK_TYPES = frozenset(
+    {
+        "footway",
+        "path",
+        "pedestrian",
+        "track",
+        "steps",
+        "cycleway",
+        "bridleway",
+        "elevator",
+        "escalator",
+        "corridor",
+        "platform",
+        "proposed",
+    }
+)
+
+
+def prune_orphan_nodes(project: Project, project_dir: Path) -> int:
+    """Delete nodes not referenced by any link (raw SQLite; then refresh project)."""
+    db_path = _project_db_path(project_dir)
+    conn = sqlite3.connect(str(db_path), timeout=120.0)
+    try:
+        cur = conn.execute(
+            """
+            DELETE FROM nodes
+             WHERE node_id NOT IN (
+                 SELECT a_node FROM links
+                 UNION
+                 SELECT b_node FROM links
+             )
+            """
+        )
+        deleted = int(cur.rowcount or 0)
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        project.network.refresh()
+        project.network.nodes.refresh()
+        project.network.links.refresh()
+    except Exception:
+        pass
+
+    return deleted
+
+
+def remove_non_drivable_links(
+    project: Project,
+    project_dir: Path,
+    *,
+    excluded_link_types: Set[str],
+    require_mode_car: bool = True,
+) -> Dict[str, int]:
+    """Drop pedestrian / cycle-only OSM ways and optionally any link without car mode ``c``."""
+    try:
+        project.network.links.refresh()
+    except Exception:
+        pass
+
+    links = project.network.links.data
+    if links.empty or "link_id" not in links.columns:
+        return {"links_removed": 0, "nodes_pruned": 0}
+
+    if "link_type" in links.columns:
+        lt = links["link_type"].astype(str).str.lower().str.strip()
+        mask_excluded = lt.isin({x.lower() for x in excluded_link_types})
+    else:
+        mask_excluded = pd.Series(False, index=links.index)
+
+    if require_mode_car and "modes" in links.columns:
+        has_car = links["modes"].astype(str).str.contains("c", na=False, regex=False)
+        mask_remove = mask_excluded | (~has_car)
+    else:
+        mask_remove = mask_excluded
+
+    ids_to_remove = sorted({int(x) for x in links.loc[mask_remove, "link_id"].tolist()})
+    if not ids_to_remove:
+        return {"links_removed": 0, "nodes_pruned": 0}
+
+    db_path = _project_db_path(project_dir)
+    conn = sqlite3.connect(str(db_path), timeout=120.0)
+    chunk = 450
+    try:
+        for i in range(0, len(ids_to_remove), chunk):
+            part = ids_to_remove[i : i + chunk]
+            ph = ",".join("?" * len(part))
+            conn.execute(f"DELETE FROM links WHERE link_id IN ({ph})", part)
+        conn.commit()
+    finally:
+        conn.close()
+
+    removed = len(ids_to_remove)
+
+    try:
+        project.network.refresh()
+        project.network.links.refresh()
+        project.network.nodes.refresh()
+    except Exception:
+        pass
+
+    pruned = prune_orphan_nodes(project, project_dir)
+
+    return {"links_removed": removed, "nodes_pruned": pruned}
 
 
 # ----------------------------
@@ -827,6 +934,29 @@ def build_network_from_osm(
     trim_stats = trim_network_to_bbox_raw(project, bbox_native, project_dir)
     print("Trimmed network:", trim_stats)
 
+    # --- Keep motor-vehicle network only (pedestrian / cycle OSM ways, non-car modes) ---
+    dn = (cfg.get("network") or {}).get("drivable_network") or {}
+    drivable_stats: Dict[str, Any] = {}
+    if dn.get("enabled", True):
+        raw_excl = dn.get("excluded_link_types")
+        if raw_excl:
+            excluded = {str(x).strip().lower() for x in raw_excl if str(x).strip()}
+        else:
+            excluded = set(DEFAULT_EXCLUDED_HIGHWAY_LINK_TYPES)
+        require_car = bool(dn.get("require_mode_car", True))
+        print(
+            "Drivable-network filter: "
+            f"{len(excluded)} excluded link_type values, require_mode_car={require_car}"
+        )
+        drivable_stats = remove_non_drivable_links(
+            project,
+            project_dir,
+            excluded_link_types=excluded,
+            require_mode_car=require_car,
+        )
+        print("  removed links:", drivable_stats.get("links_removed", 0))
+        print("  pruned orphan nodes:", drivable_stats.get("nodes_pruned", 0))
+
     # --- OSM enrichment of links ---
     enrich_stats = enrich_links_from_osm(
         project,
@@ -860,6 +990,7 @@ def build_network_from_osm(
                     "maxy": bbox_native[3],
                 },
                 "trim_stats": trim_stats,
+                "drivable_network_stats": drivable_stats,
                 "enrich_stats": enrich_stats,
             },
             indent=2,

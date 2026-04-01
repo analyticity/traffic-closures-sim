@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Optional
 
 import geopandas as gpd
 import networkx as nx
@@ -10,168 +11,52 @@ import numpy as np
 import pandas as pd
 from aequilibrae import Project
 
+from sim.aequilibrae_paths import resolve_project_database_path
 from sim.io_project import load_config
 
 
-EXPERIMENT_PROFILES = {
-    "baseline": {
-        "speed_caps": {},
-        "capacity_factors": {},
-        "time_penalties": {},
-    },
-    "motorway_push": {
-        "speed_caps": {
-            "motorway": 130.0,
-            "motorway_link": 110.0,
-            "trunk": 100.0,
-            "trunk_link": 85.0,
-            "primary": 70.0,
-            "primary_link": 55.0,
-            "secondary": 48.0,
-            "secondary_link": 40.0,
-            "tertiary": 38.0,
-            "tertiary_link": 32.0,
-            "unclassified": 35.0,
-            "road": 35.0,
-            "residential": 30.0,
-            "service": 20.0,
-            "living_street": 20.0,
-        },
-        "speed_floors": {
-            "motorway": 120.0,
-            "motorway_link": 85.0,
-            "trunk": 85.0,
-            "trunk_link": 70.0,
-            "primary": 60.0,
-        },
-        "capacity_factors": {
-            "motorway": 1.35,
-            "motorway_link": 1.20,
-            "trunk": 1.25,
-            "trunk_link": 1.10,
-            "primary": 0.95,
-            "primary_link": 0.95,
-            "secondary": 0.90,
-            "secondary_link": 0.90,
-            "tertiary": 0.85,
-            "tertiary_link": 0.85,
-            "unclassified": 0.80,
-            "road": 0.80,
-            "residential": 0.75,
-            "service": 0.60,
-            "living_street": 0.50,
-        },
-        "time_penalties": {
-            "primary": 4.0,
-            "primary_link": 2.0,
-            "secondary": 8.0,
-            "secondary_link": 5.0,
-            "tertiary": 8.0,
-            "unclassified": 10.0,
-            "road": 10.0,
-            "residential": 15.0,
-            "service": 25.0,
-            "living_street": 35.0,
-        },
-    },
-    "hierarchy_strong": {
-        "speed_caps": {
-            "motorway": 130.0,
-            "motorway_link": 90.0,
-            "trunk": 90.0,
-            "trunk_link": 70.0,
-            "primary": 70.0,
-            "primary_link": 55.0,
-            "secondary": 45.0,
-            "secondary_link": 40.0,
-            "tertiary": 35.0,
-            "tertiary_link": 30.0,
-            "unclassified": 30.0,
-            "road": 30.0,
-            "residential": 25.0,
-            "service": 15.0,
-            "living_street": 15.0,
-        },
-        "capacity_factors": {
-            "motorway": 1.15,
-            "motorway_link": 1.10,
-            "trunk": 1.10,
-            "trunk_link": 1.05,
-            "primary": 1.00,
-            "primary_link": 1.00,
-            "secondary": 0.85,
-            "secondary_link": 0.85,
-            "tertiary": 0.75,
-            "tertiary_link": 0.75,
-            "unclassified": 0.65,
-            "road": 0.65,
-            "residential": 0.50,
-            "service": 0.35,
-            "living_street": 0.25,
-        },
-        "time_penalties": {},
-    },
-    "local_penalty": {
-        "speed_caps": {},
-        "capacity_factors": {},
-        "time_penalties": {
-            "tertiary": 5.0,
-            "unclassified": 8.0,
-            "road": 8.0,
-            "residential": 15.0,
-            "service": 30.0,
-            "living_street": 45.0,
-        },
-    },
-    "combined": {
-        "speed_caps": {
-            "motorway": 130.0,
-            "motorway_link": 90.0,
-            "trunk": 90.0,
-            "trunk_link": 70.0,
-            "primary": 70.0,
-            "primary_link": 55.0,
-            "secondary": 45.0,
-            "secondary_link": 40.0,
-            "tertiary": 35.0,
-            "tertiary_link": 30.0,
-            "unclassified": 30.0,
-            "road": 30.0,
-            "residential": 25.0,
-            "service": 15.0,
-            "living_street": 15.0,
-        },
-        "capacity_factors": {
-            "motorway": 1.15,
-            "motorway_link": 1.10,
-            "trunk": 1.10,
-            "trunk_link": 1.05,
-            "primary": 1.00,
-            "primary_link": 1.00,
-            "secondary": 0.85,
-            "secondary_link": 0.85,
-            "tertiary": 0.75,
-            "tertiary_link": 0.75,
-            "unclassified": 0.65,
-            "road": 0.65,
-            "residential": 0.50,
-            "service": 0.35,
-            "living_street": 0.25,
-        },
-        "time_penalties": {
-            "tertiary": 5.0,
-            "unclassified": 8.0,
-            "road": 8.0,
-            "residential": 15.0,
-            "service": 30.0,
-            "living_street": 45.0,
-        },
-    },
-}
+def _resolved_experiment_profile(network_cfg: dict, experiment_profile: str) -> dict:
+    profiles = network_cfg.get("experiment_profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+    prof = profiles.get(experiment_profile)
+    if prof is None:
+        prof = profiles.get("baseline")
+    if prof is None:
+        prof = {
+            "speed_caps": {},
+            "speed_floors": {},
+            "capacity_factors": {},
+            "time_penalties": {},
+        }
+    return prof
+
+
+def _normalization_defaults(network_cfg: dict) -> tuple[dict, dict]:
+    norm = network_cfg.get("normalization")
+    if not isinstance(norm, dict) or not isinstance(norm.get("defaults"), dict):
+        raise ValueError(
+            "network.normalization.defaults is missing. Set network.normalization_config in "
+            "sim.yaml (see config/network_normalization.yaml) or define network.normalization "
+            "inline."
+        )
+    defaults = norm["defaults"]
+    for key in ("speed_by_link_type", "lanes_by_link_type", "capacity_per_lane_by_link_type"):
+        if key not in defaults or not isinstance(defaults[key], dict):
+            raise ValueError(f"network.normalization.defaults.{key} must be a mapping")
+    thresholds = norm.get("thresholds") if isinstance(norm.get("thresholds"), dict) else {}
+    return defaults, thresholds
+
+
+def _threshold(thresholds: dict, key: str, default: float) -> float:
+    if key not in thresholds:
+        return float(default)
+    return float(thresholds[key])
 
 
 def _lt_mask(links: pd.DataFrame, link_type: str) -> pd.Series:
     return links["link_type"].astype(str).str.fullmatch(link_type, case=False, na=False)
+
 
 def _apply_speed_floors(links: pd.DataFrame, speed_floors: dict) -> None:
     for lt, floor_val in speed_floors.items():
@@ -180,6 +65,7 @@ def _apply_speed_floors(links: pd.DataFrame, speed_floors: dict) -> None:
             continue
         links.loc[m, "speed_ab"] = np.maximum(links.loc[m, "speed_ab"], floor_val)
         links.loc[m, "speed_ba"] = np.maximum(links.loc[m, "speed_ba"], floor_val)
+
 
 def _apply_speed_caps(links: pd.DataFrame, speed_caps: dict) -> None:
     for lt, cap in speed_caps.items():
@@ -208,24 +94,28 @@ def _apply_time_penalties(links: pd.DataFrame, time_penalties: dict) -> None:
         links.loc[m, "travel_time_ba"] = links.loc[m, "travel_time_ba"] + penalty_s
 
 
-def _apply_experiment_profile(links: pd.DataFrame, experiment_profile: str) -> pd.DataFrame:
-    profile = EXPERIMENT_PROFILES.get(experiment_profile, EXPERIMENT_PROFILES["baseline"])
-    print(f"Applying network experiment profile: {experiment_profile}")
+def _apply_experiment_profile(
+    links: pd.DataFrame,
+    profile: dict,
+    thresholds: dict,
+) -> pd.DataFrame:
+    _apply_speed_floors(links, profile.get("speed_floors") or {})
+    _apply_speed_caps(links, profile.get("speed_caps") or {})
+    _apply_capacity_factors(links, profile.get("capacity_factors") or {})
 
-    _apply_speed_floors(links, profile.get("speed_floors", {}))
-    _apply_speed_caps(links, profile.get("speed_caps", {}))
-    _apply_capacity_factors(links, profile.get("capacity_factors", {}))
-
-    links["speed_ab"] = links["speed_ab"].clip(lower=5.0)
-    links["speed_ba"] = links["speed_ba"].clip(lower=5.0)
-    links["capacity_ab"] = links["capacity_ab"].clip(lower=50.0)
-    links["capacity_ba"] = links["capacity_ba"].clip(lower=50.0)
+    min_spd = _threshold(thresholds, "min_speed_kmh", 5.0)
+    min_cap = _threshold(thresholds, "min_capacity_vph", 50.0)
+    links["speed_ab"] = links["speed_ab"].clip(lower=min_spd)
+    links["speed_ba"] = links["speed_ba"].clip(lower=min_spd)
+    links["capacity_ab"] = links["capacity_ab"].clip(lower=min_cap)
+    links["capacity_ba"] = links["capacity_ba"].clip(lower=min_cap)
 
     return links
 
+
 def normalize_network_attributes(
     project: Project,
-    project_dir: Path | None = None,
+    network_cfg: dict,
     experiment_profile: str = "baseline",
 ) -> pd.DataFrame:
     """Normalize/compute link attributes, preserving AB/BA directional asymmetry.
@@ -236,6 +126,17 @@ def normalize_network_attributes(
 
     Writes back per-direction values (speed_ab, speed_ba, ...) to the SQLite DB.
     """
+    defaults, thresholds = _normalization_defaults(network_cfg)
+    default_speeds = defaults["speed_by_link_type"]
+    default_lanes = defaults["lanes_by_link_type"]
+    cap_per_lane = defaults["capacity_per_lane_by_link_type"]
+    fallback_speed = _threshold(thresholds, "fallback_speed_kmh", 50.0)
+    generic_cpl = _threshold(thresholds, "generic_capacity_per_lane", 900.0)
+    min_tt = _threshold(thresholds, "min_travel_time_s", 0.01)
+
+    profile = _resolved_experiment_profile(network_cfg, experiment_profile)
+    print(f"Applying network experiment profile: {experiment_profile}")
+
     links = project.network.links.data.copy()
 
     links["estimated_distance"] = 0
@@ -263,59 +164,10 @@ def normalize_network_attributes(
     # ------------------------------------------------------------------
     # Helper: resolve per-direction attribute from OSM columns
     # ------------------------------------------------------------------
-    default_speeds = {
-        "motorway": 130.0,
-        "motorway_link": 80.0,
-        "trunk": 90.0,
-        "trunk_link": 70.0,
-        "primary": 70.0,
-        "primary_link": 50.0,
-        "secondary": 50.0,
-        "secondary_link": 40.0,
-        "tertiary": 40.0,
-        "tertiary_link": 35.0,
-        "unclassified": 35.0,
-        "road": 35.0,
-        "residential": 30.0,
-        "service": 20.0,
-        "living_street": 20.0,
-    }
-
-    default_lanes = {
-        "motorway": 3,
-        "motorway_link": 2,
-        "trunk": 2,
-        "trunk_link": 2,
-        "primary": 2,
-        "primary_link": 1,
-        "secondary": 1,
-        "secondary_link": 1,
-        "tertiary": 1,
-        "tertiary_link": 1,
-        "unclassified": 1,
-        "road": 1,
-        "residential": 1,
-        "service": 1,
-        "living_street": 1,
-    }
-
-    lane_capacity = [
-        ("motorway_link", 1800), ("motorway", 2200),
-        ("trunk_link", 1500), ("trunk", 1800),
-        ("primary_link", 1100), ("primary", 1400),
-        ("secondary_link", 850), ("secondary", 1000),
-        ("tertiary_link", 650), ("tertiary", 800),
-        ("unclassified", 600),
-        ("road", 600),
-        ("residential", 500),
-        ("service", 300),
-        ("living_street", 150),
-    ]
-
     def _resolve_directional(
         col_ab: str,
         col_ba: str,
-        defaults: dict,
+        default_map: dict,
         fallback_val: float,
         est_ab: str,
         est_ba: str,
@@ -346,9 +198,13 @@ def normalize_network_attributes(
         still_ab_missing = links[col_ab].isna()
         still_ba_missing = links[col_ba].isna()
         if "link_type" in links.columns:
-            for lt, dv in defaults.items():
-                m_ab = still_ab_missing & links["link_type"].astype(str).str.fullmatch(lt, case=False)
-                m_ba = still_ba_missing & links["link_type"].astype(str).str.fullmatch(lt, case=False)
+            for lt, dv in default_map.items():
+                m_ab = still_ab_missing & links["link_type"].astype(str).str.fullmatch(
+                    lt, case=False
+                )
+                m_ba = still_ba_missing & links["link_type"].astype(str).str.fullmatch(
+                    lt, case=False
+                )
                 links.loc[m_ab, col_ab] = dv
                 links.loc[m_ab, est_ab] = 1
                 links.loc[m_ba, col_ba] = dv
@@ -367,7 +223,7 @@ def normalize_network_attributes(
         "speed_ab",
         "speed_ba",
         default_speeds,
-        35.0,
+        fallback_speed,
         "estimated_speed_ab",
         "estimated_speed_ba",
     )
@@ -388,6 +244,8 @@ def normalize_network_attributes(
 
     # ------------------------------------------------------------------
     # 4. Capacity (preserve AB/BA)
+    # Total veh/h per direction: existing OSM/Aeq values kept; gaps filled as
+    # capacity_* = capacity_per_lane[link_type] * lanes_* (see network_normalization.yaml).
     # ------------------------------------------------------------------
     if "capacity_ab" in links.columns:
         links["capacity_ab"] = pd.to_numeric(links["capacity_ab"], errors="coerce")
@@ -407,7 +265,7 @@ def normalize_network_attributes(
     links.loc[tw_cba, "capacity_ab"] = links.loc[tw_cba, "capacity_ba"]
     links.loc[tw_cba, "estimated_capacity_ab"] = 1
 
-    # Estimate missing from lane_capacity * lanes
+    # Estimate missing from capacity_per_lane * lanes
     for suffix, est_col, lanes_col in [
         ("ab", "estimated_capacity_ab", "lanes_ab"),
         ("ba", "estimated_capacity_ba", "lanes_ba"),
@@ -415,20 +273,20 @@ def normalize_network_attributes(
         cap_col = f"capacity_{suffix}"
         cap_missing = links[cap_col].isna() | (links[cap_col] == 0)
         if cap_missing.any() and "link_type" in links.columns:
-            for lt, cpl in lane_capacity:
+            for lt, cpl in cap_per_lane.items():
                 m = cap_missing & links["link_type"].astype(str).str.fullmatch(lt, case=False)
-                links.loc[m, cap_col] = cpl * links.loc[m, lanes_col]
+                links.loc[m, cap_col] = float(cpl) * links.loc[m, lanes_col]
                 links.loc[m, est_col] = 1
 
             remaining = links[cap_col].isna() | (links[cap_col] == 0)
             if remaining.any():
-                links.loc[remaining, cap_col] = 900 * links.loc[remaining, lanes_col]
+                links.loc[remaining, cap_col] = generic_cpl * links.loc[remaining, lanes_col]
                 links.loc[remaining, est_col] = 1
 
     # ------------------------------------------------------------------
     # 4.5 Experiment profile adjustments (speed/capacity hierarchy)
     # ------------------------------------------------------------------
-    links = _apply_experiment_profile(links, experiment_profile)
+    links = _apply_experiment_profile(links, profile, thresholds)
 
     # ------------------------------------------------------------------
     # 5. Free-flow travel time (preserve AB/BA)
@@ -466,33 +324,20 @@ def normalize_network_attributes(
     # ------------------------------------------------------------------
     # 5.5 Experiment profile adjustments (time penalties)
     # ------------------------------------------------------------------
-    profile = EXPERIMENT_PROFILES.get(experiment_profile, EXPERIMENT_PROFILES["baseline"])
-    _apply_time_penalties(links, profile.get("time_penalties", {}))
+    _apply_time_penalties(links, profile.get("time_penalties") or {})
 
-    # Floor travel time at 0.01s to prevent zero-cost links in BPR
+    # Floor travel time to prevent zero-cost links in BPR
     for tt_col in ("travel_time_ab", "travel_time_ba"):
-        links[tt_col] = links[tt_col].clip(lower=0.01)
+        links[tt_col] = links[tt_col].clip(lower=min_tt)
 
     # ------------------------------------------------------------------
     # DB write-back (per-direction, preserving asymmetry)
     # ------------------------------------------------------------------
-    import sqlite3
-
-    if project_dir is None:
-        project_dir = Path(".")
-
-    project_path = Path(project_dir)
-    db_files = (
-        list(project_path.glob("*.sqlite"))
-        + list(project_path.glob("*.db"))
-        + list(project_path.glob("*.sqlite3"))
-    )
-
-    if not db_files:
-        print("Warning: project database not found, DB update skipped")
+    db_path = resolve_project_database_path(project)
+    if not db_path.is_file():
+        print(f"Warning: project database not found at {db_path}, DB update skipped")
         return links
 
-    db_path = db_files[0]
     conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
 
@@ -593,13 +438,17 @@ def export_stable_network(
     output_path: Path,
     connectivity_info: Dict[str, Any] | None = None,
     normalized_links: pd.DataFrame | None = None,
+    output_crs_epsg: Optional[int] = None,
 ) -> None:
     """
-    Uloží síť se stabilními ID uzlů/hran do GeoJSON a Parquet.
-    Stabilní ID jsou klíčem pro scénáře i delta analýzy.
+    Uloží síť se stabilními ID uzlů/hran do GeoPackage (projekční CRS = sloupec distance v m),
+    GeoJSON (WGS84 pro mapy), Parquet (bez geometrie).
     """
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
+
+    if output_crs_epsg is None:
+        output_crs_epsg = 5514
 
     if normalized_links is not None:
         links = normalized_links.copy()
@@ -635,10 +484,39 @@ def export_stable_network(
 
     links_export = links[available_cols].copy()
 
-    geojson_path = output_path / "network_links.geojson"
-    links_export.to_file(geojson_path, driver="GeoJSON")
+    export_meta: Dict[str, Any] = {
+        "distance_column_units": "meters",
+        "projected_crs_epsg": int(output_crs_epsg),
+    }
 
-    links_parquet = links_export.drop(columns=["geometry"]) if "geometry" in links_export.columns else links_export
+    if "geometry" in links_export.columns:
+        links_gdf = gpd.GeoDataFrame(
+            links_export,
+            geometry="geometry",
+            crs=getattr(links_export, "crs", None),
+        )
+        if links_gdf.crs is None:
+            links_gdf = links_gdf.set_crs(epsg=int(output_crs_epsg), allow_override=True)
+
+        gpkg_links = output_path / "network_links.gpkg"
+        links_gdf.to_file(gpkg_links, driver="GPKG", layer="links")
+
+        links_wgs84 = links_gdf.to_crs(epsg=4326)
+        links_wgs84.to_file(output_path / "network_links.geojson", driver="GeoJSON")
+
+        links_parquet = links_gdf.drop(columns=["geometry"])
+        export_meta["network_links.gpkg"] = {
+            "crs_epsg": int(output_crs_epsg),
+            "aligned_with_distance": True,
+        }
+        export_meta["network_links.geojson"] = {
+            "crs_epsg": 4326,
+            "note": "WGS84 for web maps; lengths in degrees — use `distance` (m) or GPKG for metrics.",
+        }
+    else:
+        links_parquet = links_export
+        export_meta["network_links.geojson"] = {"skipped": True, "reason": "no geometry column"}
+
     parquet_path = output_path / "network_links.parquet"
     links_parquet.to_parquet(parquet_path, index=False)
 
@@ -650,11 +528,22 @@ def export_stable_network(
 
     nodes_export = nodes[available_node_cols].copy()
 
-    nodes_geojson_path = output_path / "network_nodes.geojson"
     if "geometry" in nodes_export.columns:
-        nodes_export.to_file(nodes_geojson_path, driver="GeoJSON")
+        nodes_gdf = gpd.GeoDataFrame(
+            nodes_export,
+            geometry="geometry",
+            crs=getattr(nodes_export, "crs", None),
+        )
+        if nodes_gdf.crs is None:
+            nodes_gdf = nodes_gdf.set_crs(epsg=int(output_crs_epsg), allow_override=True)
+        nodes_gdf.to_file(output_path / "network_nodes.gpkg", driver="GPKG", layer="nodes")
+        nodes_gdf.to_crs(epsg=4326).to_file(output_path / "network_nodes.geojson", driver="GeoJSON")
+        nodes_parquet = nodes_gdf.drop(columns=["geometry"])
+        export_meta["network_nodes.gpkg"] = {"crs_epsg": int(output_crs_epsg)}
+        export_meta["network_nodes.geojson"] = {"crs_epsg": 4326}
+    else:
+        nodes_parquet = nodes_export
 
-    nodes_parquet = nodes_export.drop(columns=["geometry"]) if "geometry" in nodes_export.columns else nodes_export
     nodes_parquet_path = output_path / "network_nodes.parquet"
     nodes_parquet.to_parquet(nodes_parquet_path, index=False)
 
@@ -666,6 +555,7 @@ def export_stable_network(
         "links_count": len(links),
         "nodes_count": len(nodes),
         "connectivity": connectivity_info,
+        "exports": export_meta,
     }
     summary_path = output_path / "network_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -673,6 +563,9 @@ def export_stable_network(
     print(f"Exported network to: {output_path}")
     print(f"  - Links: {len(links)}")
     print(f"  - Nodes: {len(nodes)}")
+    if "geometry" in links_export.columns:
+        print(f"  - network_links.gpkg (EPSG:{output_crs_epsg}, metres, aligns with distance)")
+        print("  - network_links.geojson (EPSG:4326, for maps only)")
     if connectivity_info:
         print(f"  - Components: {connectivity_info['total_components']}")
         print(f"  - Largest component: {connectivity_info['largest_component_size']} nodes")
@@ -689,7 +582,8 @@ def normalize_and_export_network(
     if outputs_dir is None:
         outputs_dir = cfg.get("network", {}).get("output_dir", "outputs/baseline/network")
 
-    experiment_profile = cfg.get("network", {}).get("experiment_profile", "baseline")
+    network_cfg = cfg.get("network") or {}
+    experiment_profile = network_cfg.get("experiment_profile", "baseline")
     project_dir = Path(cfg["project_path"])
 
     project = Project()
@@ -699,7 +593,7 @@ def normalize_and_export_network(
         print("=== NORMALIZACE ATRIBUTŮ ===")
         links = normalize_network_attributes(
             project,
-            project_dir,
+            network_cfg,
             experiment_profile=experiment_profile,
         )
         print(f"Normalizováno {len(links)} hran")
@@ -713,7 +607,14 @@ def normalize_and_export_network(
 
         print("\n=== EXPORT SÍTĚ ===")
         out_dir = Path(outputs_dir)
-        export_stable_network(project, out_dir, connectivity_info, normalized_links=links)
+        crs_epsg = int(cfg.get("crs_epsg", 5514))
+        export_stable_network(
+            project,
+            out_dir,
+            connectivity_info,
+            normalized_links=links,
+            output_crs_epsg=crs_epsg,
+        )
 
         print("\n=== NORMALIZACE DOKONČENA ===")
 

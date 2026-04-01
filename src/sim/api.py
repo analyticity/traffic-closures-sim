@@ -47,20 +47,23 @@ def _get_links() -> gpd.GeoDataFrame:
     if _links_gdf is not None:
         return _links_gdf
 
+    gpkg_path = _out("network") / "network_links.gpkg"
     net_path = _out("network") / "network_links.parquet"
     geojson_path = _out("network") / "network_links.geojson"
-    if not net_path.exists() and not geojson_path.exists():
+    if not gpkg_path.exists() and not net_path.exists() and not geojson_path.exists():
         raise HTTPException(404, "network_links not found. Run normalize-network first.")
 
-    try:
-        links = gpd.read_parquet(str(net_path))
-    except (ValueError, Exception):
-        if geojson_path.exists():
-            links = gpd.read_file(geojson_path)
-        else:
+    if gpkg_path.exists():
+        links = gpd.read_file(gpkg_path)
+    elif geojson_path.exists():
+        links = gpd.read_file(geojson_path)
+    else:
+        try:
+            links = gpd.read_parquet(str(net_path))
+        except (ValueError, Exception):
             links = gpd.GeoDataFrame(pd.read_parquet(str(net_path)))
-            if links.crs is None:
-                links = links.set_crs(epsg=4326, allow_override=True)
+        if links.crs is None:
+            links = links.set_crs(epsg=4326, allow_override=True)
 
     vol_path = _out("demand") / "assignment_results.parquet"
     if vol_path.exists():

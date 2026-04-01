@@ -7,6 +7,17 @@ from typing import Any, Dict
 import yaml
 
 
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursive dict merge; values in ``override`` win."""
+    out = dict(base)
+    for k, v in override.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 def _as_abs_path(value: Any, base_dir: Path) -> Any:
     if value is None:
         return None
@@ -62,6 +73,30 @@ def load_config(config_path: str | Path = "config/sim.yaml") -> Dict[str, Any]:
         for k in ("output_dir", "maps_dir"):
             if k in network:
                 network[k] = _as_abs_path(network[k], project_root)
+        nc = network.get("normalization_config")
+        if nc:
+            nc_abs = Path(_as_abs_path(nc, project_root))
+            if not nc_abs.is_file():
+                raise FileNotFoundError(
+                    f"network.normalization_config not found: {nc_abs}"
+                )
+            blob = yaml.safe_load(nc_abs.read_text(encoding="utf-8")) or {}
+            file_norm = blob.get("normalization") if isinstance(blob.get("normalization"), dict) else {}
+            file_exp = (
+                blob.get("experiment_profiles")
+                if isinstance(blob.get("experiment_profiles"), dict)
+                else {}
+            )
+            inline_norm = (
+                network.get("normalization") if isinstance(network.get("normalization"), dict) else {}
+            )
+            inline_exp = (
+                network.get("experiment_profiles")
+                if isinstance(network.get("experiment_profiles"), dict)
+                else {}
+            )
+            network["normalization"] = _deep_merge(file_norm, inline_norm)
+            network["experiment_profiles"] = _deep_merge(file_exp, inline_exp)
         cfg["network"] = network
 
     datasets = cfg.get("datasets") or {}

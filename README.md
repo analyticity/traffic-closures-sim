@@ -107,6 +107,8 @@ Imports the transport network from OpenStreetMap into the AequilibraE project.
 
 This is the first real model-building step. It creates the base network representation that all later steps depend on.
 
+After trimming to the model bbox, **`network.drivable_network`** (enabled by default) removes non-road OSM classes (`footway`, `path`, `cycleway`, …) and, if `require_mode_car` is true, any link whose `modes` string does not contain car mode `c`. Set `enabled: false` to keep the full multimodal extract. Override `excluded_link_types` to change the drop list.
+
 ---
 
 ### 4. `normalize-network`
@@ -121,6 +123,26 @@ Typical tasks in this phase include:
 * exporting a normalized version for downstream processing
 
 This step is important because raw OSM data is usually not directly suitable for assignment.
+
+**Configuration**
+
+* `network.normalization_config` in `config/sim.yaml` points to a YAML file (default: `config/network_normalization.yaml`) with:
+  * `normalization.defaults` — per–`link_type` fallbacks for speed, lanes, and capacity per lane when OSM/AequilibraE leaves gaps
+  * `normalization.thresholds` — global floors (minimum speed/capacity/travel time, generic capacity per lane, fallback speed)
+  * `experiment_profiles` — named sets of speed caps/floors, capacity multipliers, and time penalties; `network.experiment_profile` selects one (`baseline` applies no extra tweaks)
+* You can override or extend any subsection inline under `network.normalization` / `network.experiment_profiles` in `sim.yaml`; values merge on top of the file.
+
+**Exports**
+
+* **`network_links.gpkg`** / **`network_nodes.gpkg`** use **`crs_epsg`** from `sim.yaml` (same CRS as the AequilibraE project). Geometries are in metres and are consistent with the `distance` column (also metres).
+* **`network_links.geojson`** / **`network_nodes.geojson`** are reprojected to **WGS84** for web maps; do not use raw GeoJSON geometry length as metres—use `distance` or the GPKG layer for metric analysis.
+
+**Data sources**
+
+* Observed speeds and lane counts should come from **OpenStreetMap** (`maxspeed`, `lanes`, directional variants) where tagged; they are imported with `build-network` and only filled from defaults where missing.
+* For **Czechia**, statutory limits depend on context (built-up vs. outside, motorway, signed residential zone). OSM `highway=residential` means typical access streets in housing areas, **not** the legal Czech *obytná zóna* (20 km/h); that is closer to `highway=living_street` or explicit `zone` tagging. OSM `highway=*` alone does not capture built-up vs. outside. Defaults in `network_normalization.yaml` are documented there relative to Act No. 361/2000 Sb.; use `maxspeed` / `zone` in OSM wherever possible so the model is not tied to a single heuristic table.
+* **Capacity:** `capacity_ab` / `capacity_ba` are **total veh/h in that direction** (per-lane rates from YAML × directional lane count). AequilibraE uses one value per directed arc; unused direction on one-way links is ignored. The YAML table is **order-of-magnitude / uninterrupted-flow style**, not a full signalised-intersection model—calibrate against local counts (e.g. Czech intensity datasets) if you need realistic absolute volumes; assignment may apply separate time multipliers on urban classes.
+* Finer speed calibration (e.g. probe or commercial speed layers) is optional and not required for this step.
 
 ---
 

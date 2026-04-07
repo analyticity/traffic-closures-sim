@@ -15,15 +15,17 @@ The pipeline supports the following workflow:
 2. **build-network** – import the road network from OpenStreetMap  
 3. **normalize-network** – clean and normalize network attributes  
 4. **build-zones** – create TAZ zones and centroid connectors  
-5. **fetch-data** – download and preprocess external datasets  
-6. **build-demand** – build the initial OD matrix from commuting data  
-7. **distribute** – perform distribution and balancing of demand  
-8. **assign** – run traffic assignment on the network  
-9. **calibrate** – iteratively calibrate the model against observations  
-10. **tune-supply** – optimize supply-side parameters in an outer loop  
-11. **validate** – run independent validation using CSD2020 data  
-12. **learn-profile** – learn temporal day-type profiles from CSD2020  
-13. **serve** – start a read-only REST API for exposing results  
+5. **fetch-data** – download and preprocess external datasets (optional; `datasets.enabled`)  
+6. **build-supernetwork** – coarse national network for external / through traffic at gateways  
+7. **build-demand** – build the seed OD matrix (commuting, gateways, synthetic segments)  
+8. **assign-warm-skims** – optional short assignment that always saves `skims.aem` for trip distribution  
+9. **distribute** – gravity calibration + IPF on the seed matrix (network skims or Euclidean; see below)  
+10. **assign** – full traffic assignment on the detailed network  
+11. **calibrate** – iterative demand scaling vs. link counts (pentlogram)  
+12. **tune-supply** – optional outer loop on supply-side factors after demand calibration  
+13. **validate** – independent checks vs. CSD (not used in calibration)  
+14. **learn-profile** – temporal day-type factors from CSD  
+15. **serve** – read-only REST API for results  
 
 ---
 
@@ -33,7 +35,7 @@ The pipeline is controlled by the main runner script:
 
 ```bash
 python run.py --config config/sim.yaml <step>
-````
+```
 
 Example:
 
@@ -60,7 +62,9 @@ python run.py build-network
 python run.py normalize-network
 python run.py build-zones
 python run.py fetch-data
+python run.py build-supernetwork
 python run.py build-demand
+python run.py assign-warm-skims
 python run.py distribute
 python run.py assign
 python run.py calibrate
@@ -71,6 +75,8 @@ python run.py serve
 ```
 
 In practice, not every run has to execute all steps. Once intermediate artifacts are generated, later steps can usually be rerun independently.
+
+**Skim-driven trip distribution.** The first run of `distribute` has no `skims.aem` unless you assigned traffic first. With `demand.distribution.impedance: auto` (default), gravity/IPF then uses **Euclidean distance** between zone centroids. To use **network travel times** as impedance, run **`assign-warm-skims`** (or a full `assign` with `calibration.save_skims: true`) **before** `distribute`, then `distribute`, then run **`assign` again** for production link volumes on the IPF-adjusted matrix. A warm pass overwrites `assignment_results.parquet` with an intermediate result; the final assignment pass replaces it.
 
 ---
 
@@ -107,7 +113,9 @@ Imports the transport network from OpenStreetMap into the AequilibraE project.
 
 This is the first real model-building step. It creates the base network representation that all later steps depend on.
 
-After trimming to the model bbox, **`network.drivable_network`** (enabled by default) removes non-road OSM classes (`footway`, `path`, `cycleway`, …) and, if `require_mode_car` is true, any link whose `modes` string does not contain car mode `c`. Set `enabled: false` to keep the full multimodal extract. Override `excluded_link_types` to change the drop list.
+The model bbox in config is used for maps and metadata; the full OSM extract is kept in the project. **`network.drivable_network`** (enabled by default) removes non-road OSM classes (`footway`, `path`, `cycleway`, …) and, if `require_mode_car` is true, any link whose `modes` string does not contain car mode `c`. Set `enabled: false` to keep the full multimodal extract. Override `excluded_link_types` to change the drop list.
+
+**`network.isolated_components`** (enabled by default) keeps only the largest undirected connected component by link count and deletes all other fragments, then prunes orphan nodes. Set `enabled: false` to retain every disconnected subgraph from the extract.
 
 ---
 
@@ -168,9 +176,21 @@ Builds the initial OD matrix from SLDB commuting data.
 
 This produces the base origin-destination demand representation, which acts as the seed for later distribution and calibration.
 
+When `demand.sldb.external_processing.enabled` is true, the runner checks for supernetwork outputs (gateway lookup parquet, through pairs if configured, and `supernetwork_summary.json`) before building demand. With external processing off, only zones and centroid mapping from `build-zones` are required.
+
 ---
 
-### 8. `distribute`
+### 8. `assign-warm-skims`
+
+Optional shorter traffic assignment whose main purpose is to write **`skims.aem`** under `demand.output_dir` for use as impedance in `distribute`.
+
+* Uses `assignment.warm_skim_pass` in `config/sim.yaml` for `algorithm`, `max_iter`, and `rgap_target` (defaults are lighter than full `calibrate` / `assign` settings).
+* Always saves skims (`save_skims` is forced on for this step).
+* Writes `assignment_results.parquet` like `assign`; treat it as an intermediate artifact if you run a full `assign` afterward.
+
+---
+
+### 9. `distribute`
 
 Runs demand distribution and balancing.
 
@@ -182,9 +202,14 @@ This step typically includes:
 
 The goal is to transform the initial demand into a network-ready OD matrix consistent with constraints and observed structure.
 
+**`demand.distribution.impedance`**
+
+* **`auto`** (default): load `skims.aem` from `demand.output_dir` if it exists; otherwise use Euclidean distance between zone centroids.
+* **`skim`**: require `skims.aem`; fail with a clear error if it is missing (run `assign-warm-skims` or `assign` with `calibration.save_skims: true` first).
+
 ---
 
-### 9. `assign`
+### 10. `assign`
 
 Runs traffic assignment.
 
@@ -197,7 +222,7 @@ The result is an estimate of flows on individual network links.
 
 ---
 
-### 10. `calibrate`
+### 11. `calibrate`
 
 Performs iterative model calibration.
 
@@ -210,17 +235,21 @@ This phase typically follows the loop:
 
 The objective is to reduce the difference between simulated and observed traffic patterns.
 
+**Configuration (excerpt)**
+
+* `calibration.aggregate_corridor` — when `true`, volumes on parallel divided-highway links are summed for comparison to a single count station (recommended for motorways).
+
 ---
 
-### 11. `tune-supply`
+### 12. `tune-supply`
 
 Runs outer-loop optimization of supply-side parameters.
 
-While `calibrate` focuses on repeated internal adjustment, this step searches for better supply-related parameters at a higher level. It is intended for more systematic tuning of the network model itself.
+While `calibrate` focuses on repeated internal adjustment, this step searches for better supply-related parameters at a higher level. Enable with `calibration.supply_tuning.enabled`. The composite objective weights GEH, screenline fit, and journey-time checks (fixed weights in code).
 
 ---
 
-### 12. `validate`
+### 13. `validate`
 
 Runs independent validation using CSD2020.
 
@@ -228,7 +257,7 @@ Unlike calibration, this phase tests the model on separate validation data to as
 
 ---
 
-### 13. `learn-profile`
+### 14. `learn-profile`
 
 Learns temporal day-type factors from CSD2020.
 
@@ -238,7 +267,7 @@ It is especially useful when moving from a static baseline toward more realistic
 
 ---
 
-### 14. `serve`
+### 15. `serve`
 
 Starts a read-only REST API server.
 
@@ -263,7 +292,9 @@ The runner exposes the following steps:
 * `normalize-network`
 * `build-zones`
 * `fetch-data`
+* `build-supernetwork`
 * `build-demand`
+* `assign-warm-skims`
 * `distribute`
 * `assign`
 * `calibrate`
@@ -286,6 +317,36 @@ python run.py --config config/sim.yaml <step>
 
 ---
 
+## Full pipeline audit
+
+For an **end-to-end smoke test** of the runner, use [`scripts/full_pipeline_audit.py`](scripts/full_pipeline_audit.py). It runs the main pipeline steps in a fixed order (each step is invoked as `python run.py --config … <step>`), checks that expected files exist after each step, scans logs for tracebacks and common warnings, and writes a report bundle under the audit output directory.
+
+**Run from the repository root:**
+
+```bash
+python scripts/full_pipeline_audit.py
+```
+
+**Useful options:**
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--config` | `config/sim.yaml` | Config passed to every `run.py` step |
+| `--out-root` | `outputs/audit/full_pipeline_audit` | Directory for all audit outputs (under repo root) |
+| `--timeout-s` | `1200` | Per-step timeout in seconds (heavy steps use longer overrides inside the script) |
+| `--stop-on-fail` | off | Stop after the first step with status `fail` or `blocked` instead of continuing |
+
+**Outputs** (under `--out-root`):
+
+* `pipeline_audit.csv` / `pipeline_audit.json` — per-step exit code, elapsed time, status (`ok` / `warning` / `fail` / `blocked`), missing artifacts, warning tags
+* `step_logs/<step>.log` — captured stdout/stderr for each step
+* `config_snapshot.yaml` — copy of the config used for the run
+* `magic_constants_inventory.csv`, `metrics_consistency_report.md`, `data_driven_refactor_proposal.md`, `unused_policy_keys.md`, `before_after_compare.json` — auxiliary reports used for consistency / documentation reviews
+
+The list of steps and expected artifact paths is maintained in the script; it assumes layout consistent with the default paths in `config/sim.yaml` (for example the AequilibraE project under `project_path`). After a successful `clean`, the audit directory may be removed and is recreated as the run continues.
+
+---
+
 ## Recommended Execution Strategy
 
 For development, it is usually best to run the workflow incrementally:
@@ -295,6 +356,7 @@ For development, it is usually best to run the workflow incrementally:
 * rebuild the network only when OSM-related inputs change
 * rerun `build-zones` when zoning logic changes
 * rerun `build-demand` or `distribute` when demand inputs change
+* use `assign-warm-skims` before `distribute` when you want IPF/gravity driven by network skims instead of Euclidean distance
 * rerun `assign`, `calibrate`, and `validate` frequently during model tuning
 * use `serve` only after the required outputs have been prepared
 
@@ -327,3 +389,5 @@ The workflow is implemented in the main script and dispatches individual steps t
 * `sim.api`
 
 This keeps the runner lightweight while the domain logic remains separated into dedicated components.
+
+Batch validation of the same steps is described under **Full pipeline audit** above ([`scripts/full_pipeline_audit.py`](scripts/full_pipeline_audit.py)).

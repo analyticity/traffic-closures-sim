@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import math
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -584,10 +586,12 @@ def add_or_relax_edge(G: nx.DiGraph, u: int, v: int, length_m: float, travel_tim
         G.add_edge(u, v, length_m=float(length_m), travel_time_s=float(travel_time_s), highway=highway, name=name, ref=ref)
 
 
-def build_graph_from_roads(roads: gpd.GeoDataFrame) -> nx.DiGraph:
+def build_graph_from_roads(roads: gpd.GeoDataFrame) -> Tuple[nx.DiGraph, Dict[str, int]]:
     G = nx.DiGraph()
     coord_to_node: Dict[Tuple[float, float], int] = {}
     next_id = 1
+    segment_count = 0
+    bidir_segments = 0
 
     def node_id(x: float, y: float) -> int:
         nonlocal next_id
@@ -598,31 +602,38 @@ def build_graph_from_roads(roads: gpd.GeoDataFrame) -> nx.DiGraph:
             next_id += 1
         return coord_to_node[key]
 
-    for _, row in roads.iterrows():
-        speed_kmh = _edge_speed_kmh(row.get("maxspeed"), row.get("highway"))
-        oneway = str(row.get("oneway", "") or "").strip().lower()
+    for row in roads.itertuples(index=False):
+        geom = getattr(row, "geometry", None)
+        highway = str(getattr(row, "highway", "") or "")
+        name = str(getattr(row, "name", "") or "")
+        ref = str(getattr(row, "ref", "") or "")
+        speed_kmh = _edge_speed_kmh(getattr(row, "maxspeed", None), highway)
+        oneway = str(getattr(row, "oneway", "") or "").strip().lower()
         reverse_only = oneway == "-1"
         forward_only = oneway in {"yes", "1", "true", "t"} or reverse_only
 
-        for line in _iter_lines(row.geometry):
+        for line in _iter_lines(geom):
             coords = list(line.coords)
             for a, b in zip(coords[:-1], coords[1:]):
                 u = node_id(a[0], a[1])
                 v = node_id(b[0], b[1])
-                seg_len = float(LineString([a, b]).length)
+                seg_len = float(math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1])))
                 tt = _meters_to_seconds(seg_len, speed_kmh)
-                highway = str(row.get("highway", "") or "")
-                name = str(row.get("name", "") or "")
-                ref = str(row.get("ref", "") or "")
+                segment_count += 1
                 if reverse_only:
                     add_or_relax_edge(G, v, u, seg_len, tt, highway, name, ref)
                 elif forward_only:
                     add_or_relax_edge(G, u, v, seg_len, tt, highway, name, ref)
                 else:
+                    bidir_segments += 1
                     add_or_relax_edge(G, u, v, seg_len, tt, highway, name, ref)
                     add_or_relax_edge(G, v, u, seg_len, tt, highway, name, ref)
 
-    return G
+    return G, {
+        "roads_rows": int(len(roads)),
+        "segments_total": int(segment_count),
+        "segments_bidirectional": int(bidir_segments),
+    }
 
 
 def snap_points_to_graph(G: nx.DiGraph, points: gpd.GeoDataFrame, label_col: str) -> pd.DataFrame:
@@ -741,7 +752,9 @@ def single_source_costs(G: nx.DiGraph, source_node: int) -> Dict[int, float]:
 def build_gateway_costs(
     G: nx.DiGraph,
     gateways: gpd.GeoDataFrame,
+    profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Dict[int, float]], Dict[str, Dict[int, float]], pd.DataFrame]:
+    t0 = time.perf_counter()
     gateway_nodes = {str(r["gateway_name"]): int(r["graph_node"]) for _, r in gateways.iterrows()}
     costs_from_gateway = {name: single_source_costs(G, node) for name, node in gateway_nodes.items()}
     reverse = G.reverse(copy=False)
@@ -753,6 +766,12 @@ def build_gateway_costs(
                 continue
             cost = costs_from_gateway[a].get(b_node)
             rows.append({"gateway_in": a, "gateway_out": b, "internal_cost_s": float(cost) if cost is not None else np.nan})
+    if profile is not None:
+        profile["gateway_costs"] = {
+            "gateway_count": int(len(gateway_nodes)),
+            "sssp_runs": int(2 * len(gateway_nodes)),
+            "elapsed_s": round(time.perf_counter() - t0, 3),
+        }
     return costs_from_gateway, costs_to_gateway, pd.DataFrame(rows)
 
 
@@ -762,6 +781,7 @@ def build_gateway_lookup(
     costs_to_gateway: Dict[str, Dict[int, float]],
     cfg: SuperCfg,
 ) -> pd.DataFrame:
+    t0 = time.perf_counter()
     columns = [
         "unit_id",
         "place_key",
@@ -777,11 +797,11 @@ def build_gateway_lookup(
         "route_cost_s",
     ]
     rows = []
+    gateway_names = tuple(sorted(set(costs_from_gateway.keys()) | set(costs_to_gateway.keys())))
     for _, unit in units.iterrows():
         scored_in = []
         scored_out = []
         unit_node = int(unit["graph_node"])
-        gateway_names = sorted(set(costs_from_gateway.keys()) | set(costs_to_gateway.keys()))
         for gw_name in gateway_names:
             to_cost = costs_to_gateway.get(gw_name, {}).get(unit_node)
             from_cost = costs_from_gateway.get(gw_name, {}).get(unit_node)
@@ -793,8 +813,18 @@ def build_gateway_lookup(
         if not scored_in and not scored_out:
             continue
 
-        in_rank = {name: rank for rank, (name, _) in enumerate(sorted(scored_in, key=lambda x: x[1])[:cfg.max_candidate_gateways], start=1)}
-        out_rank = {name: rank for rank, (name, _) in enumerate(sorted(scored_out, key=lambda x: x[1])[:cfg.max_candidate_gateways], start=1)}
+        in_rank = {
+            name: rank for rank, (name, _) in enumerate(
+                heapq.nsmallest(cfg.max_candidate_gateways, scored_in, key=lambda x: x[1]),
+                start=1,
+            )
+        }
+        out_rank = {
+            name: rank for rank, (name, _) in enumerate(
+                heapq.nsmallest(cfg.max_candidate_gateways, scored_out, key=lambda x: x[1]),
+                start=1,
+            )
+        }
 
         selected = sorted(set(in_rank.keys()) | set(out_rank.keys()))
         for gw_name in selected:
@@ -815,7 +845,14 @@ def build_gateway_lookup(
                 "route_cost_from_gateway_s": float(from_cost) if from_cost is not None and np.isfinite(from_cost) else np.nan,
                 "route_cost_s": float(preferred) if preferred is not None and np.isfinite(preferred) else np.nan,
             })
-    return pd.DataFrame(rows, columns=columns)
+    out = pd.DataFrame(rows, columns=columns)
+    out.attrs["profile"] = {
+        "units_total": int(len(units)),
+        "gateway_count": int(len(gateway_names)),
+        "candidate_evaluations": int(len(units) * len(gateway_names)),
+        "elapsed_s": round(time.perf_counter() - t0, 3),
+    }
+    return out
 
 
 def shortest_path_cost(G: nx.DiGraph, source: int, target: int, cache: Dict[Tuple[int, int], float]) -> float:
@@ -830,6 +867,33 @@ def shortest_path_cost(G: nx.DiGraph, source: int, target: int, cache: Dict[Tupl
     return value
 
 
+def shortest_path_cost_batched(
+    G: nx.DiGraph,
+    source: int,
+    target: int,
+    pair_cache: Dict[Tuple[int, int], float],
+    source_cache: Dict[int, Dict[int, float]],
+) -> Tuple[float, bool, bool]:
+    """Return shortest path cost with source-level SSSP cache.
+
+    Returns tuple: (value, pair_cache_hit, source_cache_hit).
+    """
+    key = (int(source), int(target))
+    if key in pair_cache:
+        return pair_cache[key], True, True
+    src = int(source)
+    if src in source_cache:
+        dist_map = source_cache[src]
+        source_hit = True
+    else:
+        dist_map = nx.single_source_dijkstra_path_length(G, source=src, weight="travel_time_s")
+        source_cache[src] = dist_map
+        source_hit = False
+    value = float(dist_map.get(int(target), float("nan")))
+    pair_cache[key] = value
+    return value, False, source_hit
+
+
 def classify_relations(
     G: nx.DiGraph,
     commuting_pairs: pd.DataFrame,
@@ -839,6 +903,7 @@ def classify_relations(
     cfg_root: Dict[str, Any],
     cfg: SuperCfg,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    t0 = time.perf_counter()
     # Backward/empty-schema guard: keep compatibility with older lookup schema.
     if "rank_in" not in gateway_lookup.columns:
         if "rank" in gateway_lookup.columns:
@@ -878,6 +943,11 @@ def classify_relations(
     unit_map_out = {str(r[id_col]).strip(): r for _, r in best_out.iterrows()}
     pair_map = {(str(r["gateway_in"]), str(r["gateway_out"])): float(r["internal_cost_s"]) for _, r in gateway_pair_costs.iterrows()}
     direct_cost_cache: Dict[Tuple[int, int], float] = {}
+    direct_cost_source_cache: Dict[int, Dict[int, float]] = {}
+    direct_cache_hits = 0
+    direct_cache_misses = 0
+    source_cache_hits = 0
+    source_cache_misses = 0
 
     rows = []
     through_rows = []
@@ -952,7 +1022,23 @@ def classify_relations(
             continue
 
         pair_cost = pair_map.get((gw_in, gw_out), float("nan"))
-        direct_cost = shortest_path_cost(G, int(o_info["unit_graph_node"]), int(d_info["unit_graph_node"]), direct_cost_cache)
+        o_node = int(o_info["unit_graph_node"])
+        d_node = int(d_info["unit_graph_node"])
+        direct_cost, pair_hit, source_hit = shortest_path_cost_batched(
+            G,
+            o_node,
+            d_node,
+            direct_cost_cache,
+            direct_cost_source_cache,
+        )
+        if pair_hit:
+            direct_cache_hits += 1
+        else:
+            direct_cache_misses += 1
+        if source_hit:
+            source_cache_hits += 1
+        else:
+            source_cache_misses += 1
         o_to_gateway = float(o_info["route_cost_to_gateway_s"]) if np.isfinite(o_info.get("route_cost_to_gateway_s", np.nan)) else float("nan")
         gateway_to_d = float(d_info["route_cost_from_gateway_s"]) if np.isfinite(d_info.get("route_cost_from_gateway_s", np.nan)) else float("nan")
         via_cost = (
@@ -997,6 +1083,15 @@ def classify_relations(
     else:
         # Empty list -> DataFrame had no columns; demand preflight needs stable schema.
         through_pairs = pd.DataFrame(columns=["gateway_in", "gateway_out", "vehicles_daily"])
+    classified.attrs["profile"] = {
+        "elapsed_s": round(time.perf_counter() - t0, 3),
+        "direct_shortest_path_cache_hits": int(direct_cache_hits),
+        "direct_shortest_path_cache_misses": int(direct_cache_misses),
+        "direct_shortest_path_unique_pairs": int(len(direct_cost_cache)),
+        "direct_shortest_path_source_cache_hits": int(source_cache_hits),
+        "direct_shortest_path_source_cache_misses": int(source_cache_misses),
+        "direct_shortest_path_unique_sources": int(len(direct_cost_source_cache)),
+    }
     return classified, through_pairs
 
 
@@ -1022,6 +1117,9 @@ def plot_overview(edges_metric: gpd.GeoDataFrame, model_area: gpd.GeoDataFrame, 
 # ---------------------------------------------------------------------------
 
 def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
+    t_run = time.perf_counter()
+    phase_t = time.perf_counter()
+    profile: Dict[str, Any] = {"phases_s": {}}
     cfg_root = load_config(config_path)
     cfg = build_cfg(cfg_root)
     _ensure_dir(cfg.output_dir)
@@ -1030,19 +1128,35 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
     model_area = load_model_area(cfg.model_area_path, cfg.metric_epsg)
     gateways = load_gateways(cfg)
     internal_zone_names = load_internal_zone_names(cfg.zones_path)
+    profile["phases_s"]["load_core_inputs"] = round(time.perf_counter() - phase_t, 3)
 
+    phase_t = time.perf_counter()
     commuting_raw = read_commuting(cfg)
     commuting_pairs = aggregate_commuting_pairs(commuting_raw)
     place_centroids = load_place_centroids(cfg)
     external_units = resolve_external_units(place_centroids, commuting_pairs, internal_zone_names, cfg.unresolved_places_path)
+    profile["phases_s"]["load_and_prepare_datasets"] = round(time.perf_counter() - phase_t, 3)
+    profile["relation_counts"] = {
+        "commuting_pairs": int(len(commuting_pairs)),
+        "external_units": int(len(external_units)),
+    }
 
     if cfg.national_nodes_path.exists() and cfg.national_edges_path.exists():
+        phase_t = time.perf_counter()
         G = graph_from_parquets(cfg.national_nodes_path, cfg.national_edges_path)
         nodes_metric = gpd.read_parquet(cfg.national_nodes_path)
         edges_metric = gpd.read_parquet(cfg.national_edges_path)
+        profile["phases_s"]["load_cached_graph"] = round(time.perf_counter() - phase_t, 3)
+        profile["graph_source"] = "cache"
     else:
+        phase_t = time.perf_counter()
         roads = load_or_extract_major_roads(cfg)
-        G_raw = build_graph_from_roads(roads)
+        profile["phases_s"]["load_or_extract_roads"] = round(time.perf_counter() - phase_t, 3)
+
+        phase_t = time.perf_counter()
+        G_raw, graph_build_stats = build_graph_from_roads(roads)
+        profile["graph_build"] = graph_build_stats
+        profile["phases_s"]["build_graph_from_roads"] = round(time.perf_counter() - phase_t, 3)
 
         gw_metric = gateways.to_crs(epsg=cfg.metric_epsg) if gateways.crs and gateways.crs.to_epsg() != cfg.metric_epsg else gateways.copy()
         units_metric = external_units.to_crs(epsg=cfg.metric_epsg) if external_units.crs.to_epsg() != cfg.metric_epsg else external_units.copy()
@@ -1054,11 +1168,25 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
             how="left",
         )
         protected = set(gw_raw["graph_node"].dropna().astype(int)) | set(unit_raw["graph_node"].dropna().astype(int))
+        phase_t = time.perf_counter()
         G = contract_graph(G_raw, protected, cfg.contract_degree) if cfg.contract_graph else G_raw
+        profile["phases_s"]["contract_graph"] = round(time.perf_counter() - phase_t, 3)
+        profile["contract_graph"] = {
+            "enabled": bool(cfg.contract_graph),
+            "protected_nodes": int(len(protected)),
+            "nodes_before": int(G_raw.number_of_nodes()),
+            "edges_before": int(G_raw.number_of_edges()),
+            "nodes_after": int(G.number_of_nodes()),
+            "edges_after": int(G.number_of_edges()),
+        }
+        phase_t = time.perf_counter()
         nodes_metric, edges_metric = graph_to_gdfs(G, cfg.metric_epsg)
         nodes_metric.to_parquet(cfg.national_nodes_path, index=False)
         edges_metric.to_parquet(cfg.national_edges_path, index=False)
+        profile["phases_s"]["persist_graph_cache"] = round(time.perf_counter() - phase_t, 3)
+        profile["graph_source"] = "rebuilt"
 
+    phase_t = time.perf_counter()
     gateways_join = gateways.merge(snap_points_to_graph(G, gateways[["gateway_name", "geometry"]].to_crs(epsg=cfg.metric_epsg), "gateway_name"), on="gateway_name", how="left")
     units_join = external_units.merge(
         snap_points_to_graph(
@@ -1070,6 +1198,7 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
         how="left",
     )
     units_join = units_join.dropna(subset=["graph_node"]).copy()
+    profile["phases_s"]["snap_gateways_and_units"] = round(time.perf_counter() - phase_t, 3)
 
     # Guard against stale/misaligned cached supernetwork graph.
     # If nearly all external units snap to one node, the graph/cache is invalid for CZ-wide lookup.
@@ -1085,15 +1214,25 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
     unit_lookup = units_join[
         ["unit_id", "place_code", "place_name", "district_name", "admin_level", "place_key", "graph_node", "graph_x", "graph_y", "geometry"]
     ].rename(columns={"graph_node": "unit_graph_node"})
+    phase_t = time.perf_counter()
     unit_lookup.to_parquet(cfg.external_unit_lookup_path, index=False)
+    profile["phases_s"]["write_unit_lookup"] = round(time.perf_counter() - phase_t, 3)
 
-    costs_from_gateway, costs_to_gateway, gateway_pair_costs = build_gateway_costs(G, gateways_join)
+    costs_from_gateway, costs_to_gateway, gateway_pair_costs = build_gateway_costs(G, gateways_join, profile=profile)
     gateway_lookup = build_gateway_lookup(units_join, costs_from_gateway, costs_to_gateway, cfg)
+    profile["gateway_lookup"] = gateway_lookup.attrs.get("profile", {})
+    phase_t = time.perf_counter()
     gateway_lookup.to_parquet(cfg.external_gateway_lookup_path, index=False)
+    profile["phases_s"]["write_gateway_lookup"] = round(time.perf_counter() - phase_t, 3)
 
+    phase_t = time.perf_counter()
     classified, through_pairs = classify_relations(G, commuting_pairs, gateway_lookup, gateway_pair_costs, internal_zone_names, cfg_root, cfg)
+    profile["classify_relations"] = classified.attrs.get("profile", {})
+    profile["phases_s"]["classify_relations"] = round(time.perf_counter() - phase_t, 3)
+    phase_t = time.perf_counter()
     classified.to_parquet(cfg.classified_relations_path, index=False)
     through_pairs.to_parquet(cfg.through_gateway_pairs_path, index=False)
+    profile["phases_s"]["write_relation_outputs"] = round(time.perf_counter() - phase_t, 3)
 
     rejected_ext_ext = classified[(classified["classification"] == "external_external") & (classified["accepted"] == False)]
     reason_counts = (
@@ -1148,9 +1287,11 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
     units_geojson = cfg.output_dir / "used_external_units.geojson"
     plot_png = cfg.output_dir / "supernetwork_overview.png"
 
+    phase_t = time.perf_counter()
     gateways_join.to_crs(epsg=4326).to_file(gateways_geojson, driver="GeoJSON")
     units_join.to_crs(epsg=4326).to_file(units_geojson, driver="GeoJSON")
     plot_overview(edges_metric, model_area, gateways_join.to_crs(epsg=cfg.metric_epsg), units_join.to_crs(epsg=cfg.metric_epsg), plot_png)
+    profile["phases_s"]["write_geo_outputs_and_plot"] = round(time.perf_counter() - phase_t, 3)
 
     summary = {
         "gateway_count": int(len(gateways_join)),
@@ -1168,6 +1309,8 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
         "through_gateway_pairs_detail": through_by_pair,
         "graph_nodes": int(len(nodes_metric)),
         "graph_edges": int(len(edges_metric)),
+        "profiling": profile,
+        "elapsed_total_s": round(time.perf_counter() - t_run, 3),
         "outputs": {
             "national_nodes": str(cfg.national_nodes_path),
             "national_edges": str(cfg.national_edges_path),

@@ -31,7 +31,11 @@ from aequilibrae import Project
 from aequilibrae.matrix import AequilibraeMatrix
 
 from sim.io_project import load_config
-from sim.assignment import execute_assignment, fix_node_ids, _detect_volume_col
+from sim.assignment import (
+    execute_assignment,
+    fix_node_ids,
+    _detect_volume_col,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -322,6 +326,20 @@ _NON_CAR_LINK_TYPES = frozenset({
     "service", "rest_area", "services", "traffic_mirror", "virtual",
     "crossing", "busway",
 })
+
+
+def _links_for_csd_coarse_class_stats(links_gdf: gpd.GeoDataFrame, vol_col: str) -> gpd.GeoDataFrame:
+    """Car road links only; drop centroid connectors; volumes NaN → 0 for class means."""
+    out = links_gdf
+    if "link_type" in out.columns:
+        lt = out["link_type"].astype(str)
+        mask = (lt != "centroid_connector") & (~lt.isin(_NON_CAR_LINK_TYPES))
+        out = out.loc[mask].copy()
+    else:
+        out = out.copy()
+    if vol_col in out.columns:
+        out[vol_col] = pd.to_numeric(out[vol_col], errors="coerce").fillna(0.0)
+    return out
 
 
 def match_counts_to_links(
@@ -649,6 +667,64 @@ def _compute_sector_factors(
         raw = float(np.average(c[mask] / m[mask], weights=c[mask]))
         factors[str(lt)] = float(np.clip(1.0 + damping * (raw - 1.0), min_factor, max_factor))
     return factors
+
+
+def _estimate_data_driven_scaling_params(
+    valid: pd.DataFrame,
+    vol_col: str,
+    *,
+    obs_col: str,
+    default_damping: float,
+    default_min_factor: float,
+    default_max_factor: float,
+    enable: bool,
+    policy: Optional[Dict[str, Any]] = None,
+) -> Tuple[float, float, float]:
+    """Estimate damping and bounds from observed/model ratio distribution."""
+    if not enable or valid.empty:
+        return default_damping, default_min_factor, default_max_factor
+    try:
+        m = pd.to_numeric(valid[vol_col], errors="coerce").to_numpy(dtype=float)
+        o = pd.to_numeric(valid[obs_col], errors="coerce").to_numpy(dtype=float)
+        pol = policy or {}
+        min_pairs = int(pol.get("min_valid_pairs", 20))
+        q = pol.get("ratio_quantiles") or {}
+        q_low = float(q.get("low", 0.10))
+        q_mid = float(q.get("mid", 0.50))
+        q_high = float(q.get("high", 0.90))
+        clip = pol.get("clip_bounds") or {}
+        min_lo = float(clip.get("min_factor_low", 0.60))
+        min_hi = float(clip.get("min_factor_high", 0.98))
+        max_lo = float(clip.get("max_factor_low", 1.02))
+        max_hi = float(clip.get("max_factor_high", 1.80))
+        dpol = pol.get("damping_formula") or {}
+        d_base = float(dpol.get("base", 0.08))
+        d_gain = float(dpol.get("gain", 0.20))
+        d_min = float(dpol.get("min", 0.05))
+        d_max = float(dpol.get("max", 0.35))
+        blend = float(pol.get("blend_with_defaults", 0.50))
+        blend = float(np.clip(blend, 0.0, 1.0))
+
+        mask = (m > 1e-9) & (o > 1e-9) & np.isfinite(m) & np.isfinite(o)
+        if int(mask.sum()) < min_pairs:
+            return default_damping, default_min_factor, default_max_factor
+        ratios = o[mask] / m[mask]
+        q10, q50, q90 = np.quantile(ratios, [q_low, q_mid, q_high])
+        spread = max(float(q90 - q10), 1e-6)
+        min_f = float(np.clip(q10, min_lo, min_hi))
+        max_f = float(np.clip(q90, max_lo, max_hi))
+        if max_f <= min_f:
+            max_f = min_f + 0.05
+        # Smaller spread -> higher confidence -> slightly higher damping.
+        damp = float(np.clip(d_base + d_gain / (1.0 + spread), d_min, d_max))
+        # Blend with configured defaults so behavior remains predictable.
+        return (
+            blend * default_damping + (1.0 - blend) * damp,
+            blend * default_min_factor + (1.0 - blend) * min_f,
+            blend * default_max_factor + (1.0 - blend) * max_f,
+        )
+    except Exception:
+        return default_damping, default_min_factor, default_max_factor
 
 
 def scale_matrix(
@@ -1228,7 +1304,7 @@ def run_supply_tuning(config_path: str | Path = "config/sim.yaml") -> None:
     speed_range = tuning_cfg.get("speed_factor_range", [0.8, 0.9, 1.0, 1.1, 1.2])
     cap_range = tuning_cfg.get("capacity_factor_range", [0.8, 0.9, 1.0, 1.1, 1.2])
     inner_max_iter = int(tuning_cfg.get("inner_max_iterations", 3))
-    obj_weights = tuning_cfg.get("objective_weights", {"geh": 1.0, "screenline": 2.0, "jt": 1.0})
+    obj_weights = {"geh": 1.0, "screenline": 2.0, "jt": 1.0}
 
     print("=== SUPPLY PARAMETER TUNING ===")
     print(f"  Road classes: {road_classes}")
@@ -1387,6 +1463,18 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     damping = float(scale_cfg.get("damping", 0.5))
     min_factor = float(scale_cfg.get("min_factor", 0.5))
     max_factor = float(scale_cfg.get("max_factor", 2.0))
+    adaptive_scaling = bool(scale_cfg.get("adaptive_data_driven", True))
+    quality_cfg = calib_cfg.get("quality_gates") or {}
+    q_bias_hard = float(quality_cfg.get("hard_class_bias_max_abs_pct", 90.0))
+    q_wmape_warn = float(quality_cfg.get("warn_wmape_pct", 47.0))
+    q_geh_warn = float(quality_cfg.get("warn_geh_lt5_pct", 7.0))
+    q_obj_patience = int(quality_cfg.get("objective_patience", 3))
+    q_obj_weights = quality_cfg.get("objective_weights") or {}
+    w_rho = float(q_obj_weights.get("spearman", 120.0))
+    w_geh = float(q_obj_weights.get("geh_lt5", 1.8))
+    w_wmape = float(q_obj_weights.get("wmape_pct", 1.0))
+    w_bias = float(q_obj_weights.get("class_bias_max_abs_pct", 0.35))
+    w_rmse = float(q_obj_weights.get("pct_rmse", 0.35))
 
     count_target = str(calib_cfg.get("count_target", "total"))
     obs_col = "observed_car" if count_target == "car_only" else "observed_total"
@@ -1445,6 +1533,8 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     prev_geh5 = 0.0
     mq: Dict[str, Any] = {}
     last_extended: Dict[str, Any] = {}
+    obj_best = float("-inf")
+    obj_non_improve = 0
 
     try:
         for it in range(1, max_iterations + 1):
@@ -1456,7 +1546,8 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             save_skims_now = bool(calib_cfg.get("save_skims", False)) and it == 1
             use_select_link = scale_method == "select_link" and sl_query
             vol_df, skims, sl_matrices = execute_assignment(
-                project, mat,
+                project,
+                mat,
                 algorithm=algorithm,
                 max_iter=max_iter_assign,
                 rgap_target=rgap,
@@ -1507,6 +1598,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             r2 = stats.get("r2")
             print(f"  GEH<5: {geh5:.1f}%  GEH<10: {geh10:.1f}%  R²: {r2}")
 
+            last_extended = {}
             if not valid.empty and compare_col and compare_col in valid.columns:
                 try:
                     last_extended = compute_extended_link_metrics(
@@ -1543,6 +1635,26 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 "assigned_total": round(total_vol, 0),
                 **stats,
             }
+            if last_extended:
+                iter_record["wmape_pct"] = last_extended.get("wmape_pct")
+                iter_record["class_bias_max_abs_pct"] = last_extended.get("class_bias_max_abs_pct")
+                iter_record["spearman_rho"] = last_extended.get("spearman_rho")
+            if last_extended:
+                # ObjB-like quality objective (higher is better), used only for
+                # anti-degradation early stopping.
+                try:
+                    rho = float(last_extended.get("spearman_rho") or 0.0)
+                    wmape = float(last_extended.get("wmape_pct") or 0.0)
+                    bias_abs = float(last_extended.get("class_bias_max_abs_pct") or 0.0)
+                    obj_q = (w_rho * rho) + (w_geh * geh5) - (w_wmape * wmape) - (w_bias * bias_abs) - (w_rmse * float(stats.get("pct_rmse", 0.0)))
+                    iter_record["quality_objective"] = round(obj_q, 4)
+                    if obj_q > obj_best + 1e-9:
+                        obj_best = obj_q
+                        obj_non_improve = 0
+                    else:
+                        obj_non_improve += 1
+                except Exception:
+                    pass
             history.append(iter_record)
 
             # 4) Convergence check
@@ -1555,6 +1667,12 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 print(f"  STALLED: improvement {improvement:.2f}% < {min_improvement}%")
                 break
 
+            # Quality-gate anti-degradation stop: prevent long drift when objective
+            # worsens repeatedly even if GEH progress is noisy.
+            if q_obj_patience > 0 and obj_non_improve >= q_obj_patience:
+                print(f"  QUALITY STOP: objective non-improving for {obj_non_improve} iterations")
+                break
+
             prev_geh5 = geh5
 
             # 5) Scale OD matrix (use compare_col -- corridor volume when available)
@@ -1564,10 +1682,20 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 and compare_col
                 and total_vol > 0
             ):
+                d_damping, d_min_factor, d_max_factor = _estimate_data_driven_scaling_params(
+                    valid,
+                    compare_col,
+                    obs_col=obs_col,
+                    default_damping=damping,
+                    default_min_factor=min_factor,
+                    default_max_factor=max_factor,
+                    enable=adaptive_scaling,
+                    policy=scale_cfg.get("adaptive_policy"),
+                )
                 if scale_method == "global":
                     factor = _compute_global_factor(
-                        valid, compare_col, damping=damping,
-                        min_factor=min_factor, max_factor=max_factor,
+                        valid, compare_col, damping=d_damping,
+                        min_factor=d_min_factor, max_factor=d_max_factor,
                         obs_col=obs_col,
                     )
                     print(f"  Global scaling factor: {factor:.3f}")
@@ -1575,31 +1703,33 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 elif scale_method == "select_link" and sl_matrices:
                     corrections = _apply_select_link_od_correction(
                         mat, core_name, sl_matrices, sl_results,
-                        damping=damping, min_factor=min_factor, max_factor=max_factor,
+                        damping=d_damping, min_factor=d_min_factor, max_factor=d_max_factor,
                     )
                     if corrections:
                         print(f"  Select-link corrections: {corrections}")
                     else:
                         print("  Select-link: no corrections applied, falling back to global")
                         factor = _compute_global_factor(
-                            valid, compare_col, damping=damping,
-                            min_factor=min_factor, max_factor=max_factor,
+                            valid, compare_col, damping=d_damping,
+                            min_factor=d_min_factor, max_factor=d_max_factor,
                             obs_col=obs_col,
                         )
                         scale_matrix(mat, core_name, factor)
-                elif scale_method == "sector_od":
+                elif scale_method in {"sector", "sector_od"}:
+                    # Class-aware / segment-aware correction: apply OD-sector pair factors
+                    # instead of collapsing per-class ratios to a single global multiplier.
                     _do_sector_od_scaling(
                         mat, core_name, valid, compare_col,
                         links_gdf=links_gdf,
                         project_dir=project_dir,
-                        damping=damping, min_factor=min_factor,
-                        max_factor=max_factor, obs_col=obs_col,
+                        damping=d_damping, min_factor=d_min_factor,
+                        max_factor=d_max_factor, obs_col=obs_col,
                         sector_cfg=scale_cfg.get("sectors"),
                     )
-                else:
+                elif scale_method == "sector_legacy":
                     factors = _compute_sector_factors(
-                        valid, compare_col, damping=damping,
-                        min_factor=min_factor, max_factor=max_factor,
+                        valid, compare_col, damping=d_damping,
+                        min_factor=d_min_factor, max_factor=d_max_factor,
                         obs_col=obs_col,
                     )
                     if factors:
@@ -1613,6 +1743,14 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                         scale_matrix(mat, core_name, factors, weights=obs_weights)
                     else:
                         print("  No sector factors computed — skipping scaling")
+                else:
+                    print(f"  Unknown scale_method='{scale_method}', falling back to global")
+                    factor = _compute_global_factor(
+                        valid, compare_col, damping=d_damping,
+                        min_factor=d_min_factor, max_factor=d_max_factor,
+                        obs_col=obs_col,
+                    )
+                    scale_matrix(mat, core_name, factor)
             elif not scale_enabled:
                 print("  Scaling disabled (principle: frozen / diagnostic run)")
             else:
@@ -1658,7 +1796,8 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     print(f"    Demand: {p_demand:,.0f}")
 
                     vol_df_p, _, _sl_p = execute_assignment(
-                        project_p, mat_p,
+                        project_p,
+                        mat_p,
                         algorithm=algorithm,
                         max_iter=max_iter_assign,
                         rgap_target=rgap,
@@ -1707,8 +1846,30 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             "damping": damping,
             "count_target": count_target,
             "obs_col": obs_col,
+            "aggregate_corridor": agg_corridor,
+            "matching": calib_cfg.get("matching") or {},
         },
         "extended_metrics": last_extended,
+        "quality_gates": {
+            "hard_class_bias_max_abs_pct": q_bias_hard,
+            "warn_wmape_pct": q_wmape_warn,
+            "warn_geh_lt5_pct": q_geh_warn,
+            "objective_patience": q_obj_patience,
+            "objective_weights": {
+                "spearman": w_rho,
+                "geh_lt5": w_geh,
+                "wmape_pct": w_wmape,
+                "class_bias_max_abs_pct": w_bias,
+                "pct_rmse": w_rmse,
+            },
+            "hard_reject": bool((last_extended or {}).get("class_bias_max_abs_pct", 0.0) > q_bias_hard) if last_extended else False,
+            "warnings": [
+                w for w in [
+                    (f"wmape_pct>{q_wmape_warn}" if last_extended and (last_extended.get("wmape_pct") or 0.0) > q_wmape_warn else None),
+                    (f"geh_lt5_pct<{q_geh_warn}" if history and (history[-1].get("geh_lt5_pct", 0.0) < q_geh_warn) else None),
+                ] if w is not None
+            ],
+        },
         "observed_summary": {
             "total_car": round(float(pent["observed_car"].sum()), 0),
             "total_truck": round(float(pent["observed_truck"].sum()), 0),
@@ -1739,7 +1900,15 @@ def match_csd_to_links(
     links_gdf: gpd.GeoDataFrame,
     metric_epsg: int = 5514,
 ) -> pd.DataFrame:
-    """Match CSD2020 sections to model links by road class and spatial proximity."""
+    """Coarse road-class comparison only (no spatial join).
+
+    For each CSD coarse class, compares mean car AADT over **CSD counting sections**
+    to mean assigned volume over **all model links** whose OSM ``link_type`` maps to
+    that class. These are different statistical populations (sampled official sections
+    vs full OSM graph), so secondary/tertiary gaps are often large even when the model
+    is reasonable—use pentlogram / screenline blocks for observation-matched metrics.
+    """
+    _ = metric_epsg  # reserved for a future spatial match implementation
     csd = csd.copy()
     if "sil" in csd.columns:
         csd["road_class"] = csd["sil"].apply(_classify_csd_road)
@@ -1766,22 +1935,41 @@ def match_csd_to_links(
             continue
 
         csd_mean_aadt = float(csd_sub["o"].mean()) if "o" in csd_sub.columns else 0
+        csd_med_aadt = float(csd_sub["o"].median()) if "o" in csd_sub.columns else 0
         csd_total_aadt = float(csd_sub["o"].sum()) if "o" in csd_sub.columns else 0
         model_mean_vol = 0.0
+        model_median_vol = 0.0
+        model_len_weighted_mean = 0.0
         model_total_vol = 0.0
+        n_model_car = 0
         vol_cols = [c for c in links_sub.columns if c.endswith("_tot") and links_sub[c].sum() > 0]
         if vol_cols:
             vc = vol_cols[0]
-            model_mean_vol = float(links_sub[vc].mean())
-            model_total_vol = float(links_sub[vc].sum())
+            lf = _links_for_csd_coarse_class_stats(links_sub, vc)
+            if len(lf) == 0:
+                continue
+            n_model_car = len(lf)
+            model_mean_vol = float(lf[vc].mean())
+            model_median_vol = float(lf[vc].median())
+            model_total_vol = float(lf[vc].sum())
+            if "distance" in lf.columns:
+                dist = pd.to_numeric(lf["distance"], errors="coerce").fillna(0.0).to_numpy()
+                v = lf[vc].to_numpy()
+                dsum = float(dist.sum())
+                if dsum > 0:
+                    model_len_weighted_mean = float((v * dist).sum() / dsum)
 
         matched_rows.append({
             "road_class": rc,
             "csd_sections": len(csd_sub),
             "model_links": len(links_sub),
+            "model_links_car_roads": n_model_car,
             "csd_mean_cars": round(csd_mean_aadt, 0),
+            "csd_median_cars": round(csd_med_aadt, 0),
             "csd_total_cars": round(csd_total_aadt, 0),
             "model_mean_vol": round(model_mean_vol, 0),
+            "model_median_vol": round(model_median_vol, 0),
+            "model_len_weighted_mean_vol": round(model_len_weighted_mean, 0),
             "model_total_vol": round(model_total_vol, 0),
         })
 
@@ -1893,10 +2081,31 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
             print(f"    {r['road_class']:12s}  sections={int(r['sections']):4d}  "
                   f"mean_AADT={r['mean_sv']:>8.0f}  mean_cars={r['mean_o']:>8.0f}")
         if not csd_match_df.empty:
-            print(f"  Link-matched: {len(csd_match_df)} road classes")
+            print(f"  Coarse class comparison (not spatially matched): {len(csd_match_df)} classes")
             for _, r in csd_match_df.iterrows():
-                print(f"    {r['road_class']:12s}  csd_mean={r['csd_mean_cars']:>8.0f}  "
-                      f"model_mean={r['model_mean_vol']:>8.0f}")
+                lw = r.get("model_len_weighted_mean_vol", 0) or 0
+                print(
+                    f"    {r['road_class']:12s}  csd_mean={r['csd_mean_cars']:>8.0f}  "
+                    f"csd_med={r.get('csd_median_cars', 0):>8.0f}  "
+                    f"model_mean={r['model_mean_vol']:>8.0f}  "
+                    f"model_med={r.get('model_median_vol', 0):>8.0f}  "
+                    f"model_Lw_mean={lw:>8.0f}"
+                )
+            print(
+                "  NOTE: CSD columns are mean/median car AADT per official counting section; model columns are"
+            )
+            print(
+                "  over all OSM links in that coarse class (excl. centroid connectors / non-car types)."
+            )
+            print(
+                "  Czech silnice class II/III vs OSM highway=secondary/tertiary often diverge; many local"
+            )
+            print(
+                "  OSM links carry assigned demand without a CSD twin, so means need not align. For fit vs"
+            )
+            print(
+                "  observations use pentlogram (above) and screenlines."
+            )
     except Exception as e:
         print(f"  SKIP: {e}")
 
@@ -1971,6 +2180,26 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
     print("\n5) FHWA / Scottish benchmarks ...")
     benchmarks = compute_validation_benchmarks(pent_stats, sl_results, jt_results)
     report["benchmarks"] = benchmarks
+    qcfg = (calib_cfg.get("quality_gates") or {})
+    q_bias_hard = float(qcfg.get("hard_class_bias_max_abs_pct", 90.0))
+    q_wmape_warn = float(qcfg.get("warn_wmape_pct", 47.0))
+    q_geh_warn = float(qcfg.get("warn_geh_lt5_pct", 7.0))
+    ext = report.get("extended_metrics") or {}
+    bias = float(ext.get("class_bias_max_abs_pct", 0.0)) if ext else None
+    wmape = float(ext.get("wmape_pct", 0.0)) if ext else None
+    geh = float(benchmarks.get("geh_lt5_pct", 0.0))
+    q_warns: List[str] = []
+    if wmape is not None and wmape > q_wmape_warn:
+        q_warns.append(f"wmape_pct>{q_wmape_warn:g}")
+    if geh < q_geh_warn:
+        q_warns.append(f"geh_lt5_pct<{q_geh_warn:g}")
+    report["quality_gates"] = {
+        "hard_class_bias_max_abs_pct": q_bias_hard,
+        "warn_wmape_pct": q_wmape_warn,
+        "warn_geh_lt5_pct": q_geh_warn,
+        "hard_reject": bool((bias is not None) and (bias > q_bias_hard)),
+        "warnings": q_warns,
+    }
     overall = "PASS" if benchmarks["overall_pass"] else "FAIL"
     print(f"  GEH<5 >= 85%:  {benchmarks['geh_lt5_pct']:.1f}%  "
           f"{'PASS' if benchmarks['geh_benchmark_pass'] else 'FAIL'}")

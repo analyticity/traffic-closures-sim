@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import networkx as nx
 import pandas as pd
 from aequilibrae import Project
 from shapely.geometry import box
@@ -336,7 +337,7 @@ def trim_network_to_bbox_raw(
     project_dir: Path,
 ) -> Dict[str, int]:
     """
-    HARD trim in native/raw coordinate space:
+    HARD trim in native/raw coordinate space (optional; not used by ``build_network_from_osm``):
     - keep nodes within bbox
     - keep links where both endpoints are kept AND link geometry intersects bbox
     """
@@ -512,6 +513,94 @@ def remove_non_drivable_links(
     pruned = prune_orphan_nodes(project, project_dir)
 
     return {"links_removed": removed, "nodes_pruned": pruned}
+
+
+def remove_disconnected_components_keep_largest(
+    project: Project,
+    project_dir: Path,
+) -> Dict[str, Any]:
+    """
+    Delete links that are not in the largest undirected connected component
+    (component size = number of links). Isolated nodes are removed via ``prune_orphan_nodes``.
+    Parallel links (same endpoints) are kept or dropped with their component.
+    """
+    try:
+        project.network.links.refresh()
+    except Exception:
+        pass
+
+    links = project.network.links.data
+    empty = {
+        "links_removed": 0,
+        "nodes_pruned": 0,
+        "components": 0,
+        "kept_links": 0,
+    }
+    if links.empty or "link_id" not in links.columns:
+        return empty
+    if "a_node" not in links.columns or "b_node" not in links.columns:
+        raise RuntimeError("Network links missing a_node/b_node")
+
+    G = nx.MultiGraph()
+    for _, row in links.iterrows():
+        G.add_edge(int(row["a_node"]), int(row["b_node"]), key=int(row["link_id"]))
+
+    n_links = int(len(links))
+    if G.number_of_nodes() == 0:
+        return {**empty, "components": 0, "kept_links": n_links}
+
+    components = list(nx.connected_components(G))
+    n_comp = len(components)
+    if n_comp <= 1:
+        return {
+            "links_removed": 0,
+            "nodes_pruned": 0,
+            "components": n_comp,
+            "kept_links": n_links,
+        }
+
+    def _edge_count(nodes: Set[Any]) -> int:
+        return int(G.subgraph(nodes).number_of_edges())
+
+    best_nodes = max(components, key=_edge_count)
+    subgraph = G.subgraph(best_nodes)
+    kept_link_ids = {int(k) for _u, _v, k in subgraph.edges(keys=True)}
+    all_link_ids = {int(x) for x in links["link_id"].tolist()}
+    ids_to_remove = sorted(all_link_ids - kept_link_ids)
+    if not ids_to_remove:
+        return {
+            "links_removed": 0,
+            "nodes_pruned": 0,
+            "components": n_comp,
+            "kept_links": n_links,
+        }
+
+    db_path = _project_db_path(project_dir)
+    conn = sqlite3.connect(str(db_path), timeout=120.0)
+    chunk = 450
+    try:
+        for i in range(0, len(ids_to_remove), chunk):
+            part = ids_to_remove[i : i + chunk]
+            ph = ",".join("?" * len(part))
+            conn.execute(f"DELETE FROM links WHERE link_id IN ({ph})", part)
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        project.network.refresh()
+        project.network.links.refresh()
+        project.network.nodes.refresh()
+    except Exception:
+        pass
+
+    pruned = prune_orphan_nodes(project, project_dir)
+    return {
+        "links_removed": len(ids_to_remove),
+        "nodes_pruned": pruned,
+        "components": n_comp,
+        "kept_links": len(kept_link_ids),
+    }
 
 
 # ----------------------------
@@ -920,19 +1009,18 @@ def build_network_from_osm(
             project.network.create_from_osm(place_name=place_name)
             print(f"Network created from place_name: {place_name}")
 
-    # --- Trim to desired area ---
+    # --- Bbox for maps / metadata only (no link deletion) ---
     if bbox_cfg:
         bbox_native = _native_bbox_from_wgs84_bbox(project, bbox_cfg, crs_epsg_hint)
         bbox_wgs84_used = tuple(float(x) for x in bbox_cfg)
-        print("Trim bbox from config (WGS84):", bbox_wgs84_used)
-        print("Trim bbox converted to native coords:", bbox_native)
+        print("Reference bbox from config (WGS84):", bbox_wgs84_used)
+        print("Reference bbox (native):", bbox_native)
     else:
         bbox_native = compute_bbox_from_links_raw(project)
         bbox_wgs84_used = None
-        print("Trim bbox (native, derived from links):", bbox_native)
+        print("Network extent bbox (native):", bbox_native)
 
-    trim_stats = trim_network_to_bbox_raw(project, bbox_native, project_dir)
-    print("Trimmed network:", trim_stats)
+    trim_stats = {"nodes_deleted": 0, "links_deleted": 0}
 
     # --- Keep motor-vehicle network only (pedestrian / cycle OSM ways, non-car modes) ---
     dn = (cfg.get("network") or {}).get("drivable_network") or {}
@@ -956,6 +1044,20 @@ def build_network_from_osm(
         )
         print("  removed links:", drivable_stats.get("links_removed", 0))
         print("  pruned orphan nodes:", drivable_stats.get("nodes_pruned", 0))
+
+    iso = (cfg.get("network") or {}).get("isolated_components") or {}
+    isolated_stats: Dict[str, Any] = {}
+    if iso.get("enabled", True):
+        print("Largest-component filter: removing disconnected subgraphs")
+        isolated_stats = remove_disconnected_components_keep_largest(project, project_dir)
+        print(
+            "  components (before):",
+            isolated_stats.get("components", 0),
+            "| removed links:",
+            isolated_stats.get("links_removed", 0),
+            "| pruned orphan nodes:",
+            isolated_stats.get("nodes_pruned", 0),
+        )
 
     # --- OSM enrichment of links ---
     enrich_stats = enrich_links_from_osm(
@@ -991,6 +1093,7 @@ def build_network_from_osm(
                 },
                 "trim_stats": trim_stats,
                 "drivable_network_stats": drivable_stats,
+                "isolated_components_stats": isolated_stats,
                 "enrich_stats": enrich_stats,
             },
             indent=2,
@@ -1009,7 +1112,7 @@ def build_network_from_osm(
     fig, ax = plt.subplots(figsize=(10, 10))
     links_gdf_native.plot(ax=ax, linewidth=0.2, zorder=1)
     bbox_gdf_native.boundary.plot(ax=ax, linewidth=3.0, zorder=3)
-    ax.set_title("AequilibraE links + native trim bbox")
+    ax.set_title("AequilibraE links + reference bbox (native)")
     ax.set_axis_off()
     png_path_native = out_dir / "links_native.png"
     fig.savefig(png_path_native, dpi=200, bbox_inches="tight")
@@ -1066,10 +1169,10 @@ def build_network_from_osm(
     print("=== NETWORK BUILD DONE ===")
     print("Project:", project_dir.resolve())
     print("Nodes:", nodes_n, "Links:", links_n)
-    print("Native trim bbox:", bbox_native)
+    print("Bbox used for map artifacts (native):", bbox_native)
     if bbox_wgs84_used is not None:
-        print("Requested trim bbox (WGS84):", bbox_wgs84_used)
-    print("Trim stats:", trim_stats)
+        print("Config reference bbox (WGS84):", bbox_wgs84_used)
+    print("Trim stats (disabled):", trim_stats)
     print("Enrich stats:", enrich_stats)
     print("Wrote:", counts_path)
     print("Wrote:", png_path_native)

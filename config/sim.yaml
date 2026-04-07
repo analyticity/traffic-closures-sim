@@ -14,65 +14,40 @@ network:
   experiment_profile: "baseline"
   output_dir: "outputs/baseline/network"
   maps_dir: "outputs/baseline/maps"
-  # After trim: drop OSM non-road ways and links without car mode ``c`` (footway, path, cycleway, …).
+  # Drop OSM non-road ways and links without car mode ``c`` (footway, path, cycleway, …).
   drivable_network:
     enabled: true
     require_mode_car: true
     # excluded_link_types: []  # optional override; if omitted, built-in OSM walk/cycle list is used
 
-# Zónování
+  # Keep only the largest connected piece of the graph (undirected); removes tiny islands / orphans.
+  isolated_components:
+    enabled: true
+
+# Zónování — zdroje: sim.zoning_sources (type: osm | type: file, nebo klíče place vs path/file).
 zoning:
   sources:
-    - place: "Okres Brno-město, Czechia"
+    - type: osm
+      place: "Okres Brno-město, Czechia"
       admin_level: "9"
-    - place: "Okres Brno-venkov, Czechia"
+    - type: osm
+      place: "Okres Brno-venkov, Czechia"
       admin_level: "9"
-
-  aoi:
-    quantile: 0.003
-    pad_ratio: 0.008
-    extra_margin_m: 200
-    shift_x_m: 0
-    shift_y_m: 0
-
-  zone_area_filter:
-    enabled: true
-    rel_factor: 10
-    abs_max_km2: 250
-
-  max_connectors: 6
-  max_distance_m: 3000
-  connector_speed_kmh: 20
-  connector_capacity_vph: 2000
-  connector_lanes: 1
-  connector_access_penalty_s: 300
+    # - type: file
+    #   path: data/path/to/zones.gpkg
+    #   layer: zones
+    #   id_column: zone_id
+    #   name_column: name
 
   cache_file: "data/zones/zones.gpkg"
   output_dir: "outputs/baseline/zones"
-  map_dpi: 250
 
   external_gateways:
     enabled: true
+    # Řetězce z whitelistu se párují na ref / osm_ref u linků v projektu (podle regionu).
     whitelist: ["D1", "D2", "I/43", "I/50", "I/52", "I/23"]
-
-    boundary_buffer_m: 600
-    min_gateway_separation_m: 1800
-    zone_size_m: 40
-    zone_offset_m: 10
-    connectors_per_gateway: 2
-    candidate_outer_quantile: 0.95
-
-    allowed_link_types:
-      - motorway
-      - motorway_link
-      - trunk
-      - trunk_link
-      - primary
-      - primary_link
-
     export_lookup: true
     export_lookup_path: "data/cache/gateway_lookup_seed.parquet"
-    merge_boundary_near_candidates: false
 
 # Coarse national supernetwork
 supernetwork:
@@ -100,6 +75,13 @@ supernetwork:
     detour_ratio_max: 1.25
     max_extra_minutes: 20.0
     allow_same_gateway_pair: false
+
+# Krátký assign před distribute — vždy uloží skims.aem (viz README).
+assignment:
+  warm_skim_pass:
+    algorithm: "bfw"
+    max_iter: 30
+    rgap_target: 0.01
 
 # OD matice
 demand:
@@ -220,6 +202,8 @@ demand:
 
   distribution:
     enabled: false
+    # auto = skims.aem pokud existuje, jinak eukleidovská vzdálenost centroidů; skim = vyžadovat skims
+    impedance: auto
     deterrence_function: "EXPO"
     pa_trip_rate: 2.5
     pa_car_share: 0.50
@@ -248,6 +232,11 @@ calibration:
   count_target: "car_only"
   aggregate_corridor: false
   save_skims: true
+
+  # Optional outer search over speed/capacity by road class (enable when experimenting).
+  supply_tuning:
+    enabled: false
+    inner_max_iterations: 3
 
   max_iterations: 15
   # Restore data/demand/od_matrix.aem from .aem.orig at each calibrate (needed for fair tuning runs).

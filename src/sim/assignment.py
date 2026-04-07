@@ -26,6 +26,25 @@ from aequilibrae.paths import TrafficAssignment, TrafficClass
 from sim.io_project import load_config
 
 
+# Built-in multipliers on in-memory travel time (signals / urban friction) before graph build.
+DEFAULT_ASSIGNMENT_DELAY_FACTORS: Dict[str, float] = {
+    "motorway": 1.0,
+    "motorway_link": 1.0,
+    "trunk": 1.0,
+    "trunk_link": 1.05,
+    "primary": 1.15,
+    "primary_link": 1.20,
+    "secondary": 1.40,
+    "secondary_link": 1.50,
+    "tertiary": 1.60,
+    "tertiary_link": 1.70,
+    "residential": 1.80,
+    "unclassified": 1.60,
+    "living_street": 2.00,
+    "service": 2.00,
+}
+
+
 # ---------------------------------------------------------------------------
 # Pre-flight checks
 # ---------------------------------------------------------------------------
@@ -106,6 +125,7 @@ def execute_assignment(
     rgap_target: float = 0.001,
     save_skims: bool = False,
     select_links: Optional[Dict[str, list]] = None,
+    delay_factors: Optional[Dict[str, float]] = None,
 ) -> Tuple[pd.DataFrame, Optional[AequilibraeMatrix], Dict[str, np.ndarray]]:
     """Run assignment on an already-open project with a loaded matrix.
 
@@ -125,23 +145,10 @@ def execute_assignment(
     if time_field is None:
         raise RuntimeError(f"No time field in graph. Columns: {gcols}")
 
-    # Apply intersection/signal delay factors to create road class hierarchy.
-    # OSM gives all urban roads ~50 km/h (Czech built-up area limit), so
-    # without this, secondary/tertiary/residential are equally attractive
-    # as primary/trunk for route choice. These factors account for traffic
-    # signals, intersections, and urban friction that lower effective speed.
-    # Applied to the graph IN MEMORY only -- does NOT modify the DB.
-    _DELAY_FACTORS = {
-        "motorway": 1.0, "motorway_link": 1.0,
-        "trunk": 1.0, "trunk_link": 1.05,
-        "primary": 1.15, "primary_link": 1.20,
-        "secondary": 1.40, "secondary_link": 1.50,
-        "tertiary": 1.60, "tertiary_link": 1.70,
-        "residential": 1.80, "unclassified": 1.60,
-        "living_street": 2.00, "service": 2.00,
-    }
+    # Intersection/signal delay factors (see DEFAULT_ASSIGNMENT_DELAY_FACTORS).
+    factors = delay_factors if delay_factors is not None else DEFAULT_ASSIGNMENT_DELAY_FACTORS
     if "link_type" in graph.network.columns:
-        for lt, factor in _DELAY_FACTORS.items():
+        for lt, factor in factors.items():
             if factor <= 1.0:
                 continue
             mask = graph.network["link_type"].astype(str) == lt
@@ -216,7 +223,17 @@ def _detect_volume_col(df: pd.DataFrame) -> str | None:
 # CLI entry-point
 # ---------------------------------------------------------------------------
 
-def run_assignment(config_path: str | Path = "config/sim.yaml") -> None:
+def _run_assignment_pass(
+    config_path: str | Path,
+    *,
+    algorithm: str,
+    max_iter: int,
+    rgap: float,
+    save_skims: bool,
+    banner: str,
+    log_volume_note: str = "",
+) -> None:
+    """Shared body for ``assign`` and ``assign-warm-skims``."""
     cfg = load_config(config_path)
     project_dir = Path(cfg["project_path"])
     demand_cfg = cfg.get("demand") or {}
@@ -224,15 +241,10 @@ def run_assignment(config_path: str | Path = "config/sim.yaml") -> None:
     matrix_path = Path(demand_cfg.get("matrix_path", "data/demand/od_matrix.aem"))
     output_dir = Path(demand_cfg.get("output_dir", "outputs/baseline/demand"))
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    algorithm = str(calib_cfg.get("algorithm", "bfw"))
-    max_iter = int(calib_cfg.get("max_iter", 100))
-    rgap = float(calib_cfg.get("rgap_target", 0.001))
     core_name = str(calib_cfg.get("core_name", "wd_daily"))
 
-    print("=== TRAFFIC ASSIGNMENT ===")
+    print(banner)
 
-    # Pre-flight
     print("\n1) Pre-flight checks ...")
     renamed = fix_node_ids(project_dir)
     if renamed:
@@ -247,7 +259,6 @@ def run_assignment(config_path: str | Path = "config/sim.yaml") -> None:
     if not matrix_path.exists():
         raise FileNotFoundError(f"OD matrix not found: {matrix_path}")
 
-    # Load matrix
     print(f"\n2) Loading matrix: {matrix_path}")
     mat = AequilibraeMatrix()
     mat.load(str(matrix_path))
@@ -255,16 +266,16 @@ def run_assignment(config_path: str | Path = "config/sim.yaml") -> None:
     total_demand = float(mat.matrix_view.sum())
     print(f"   Core '{core_name}': {mat.zones} zones, demand={total_demand:,.0f}")
 
-    save_skims = bool(calib_cfg.get("save_skims", False))
-
-    # Run
     print(f"\n3) Running {algorithm.upper()} ...")
     project = Project()
     project.open(str(project_dir))
     try:
         df, skims, _sl = execute_assignment(
-            project, mat,
-            algorithm=algorithm, max_iter=max_iter, rgap_target=rgap,
+            project,
+            mat,
+            algorithm=algorithm,
+            max_iter=max_iter,
+            rgap_target=rgap,
             save_skims=save_skims,
         )
     finally:
@@ -273,7 +284,8 @@ def run_assignment(config_path: str | Path = "config/sim.yaml") -> None:
 
     tot_col = _detect_volume_col(df)
     total_vol = float(df[tot_col].sum()) if tot_col else 0.0
-    print(f"\n4) Results: {len(df)} links, vol_col={tot_col}, total={total_vol:,.0f}")
+    note = log_volume_note or "Results"
+    print(f"\n4) {note}: {len(df)} links, vol_col={tot_col}, total={total_vol:,.0f}")
 
     if total_vol <= 0:
         import sqlite3 as _sq
@@ -305,6 +317,42 @@ def run_assignment(config_path: str | Path = "config/sim.yaml") -> None:
             print(f"   Skims saved: {skim_path}")
         except Exception as e:
             print(f"   WARNING: could not save skims: {e}")
+
+
+def run_assignment(config_path: str | Path = "config/sim.yaml") -> None:
+    cfg = load_config(config_path)
+    calib_cfg = cfg.get("calibration") or {}
+    algorithm = str(calib_cfg.get("algorithm", "bfw"))
+    max_iter = int(calib_cfg.get("max_iter", 100))
+    rgap = float(calib_cfg.get("rgap_target", 0.001))
+    save_skims = bool(calib_cfg.get("save_skims", False))
+    _run_assignment_pass(
+        config_path,
+        algorithm=algorithm,
+        max_iter=max_iter,
+        rgap=rgap,
+        save_skims=save_skims,
+        banner="=== TRAFFIC ASSIGNMENT ===",
+    )
+
+
+def run_warm_skim_assignment(config_path: str | Path = "config/sim.yaml") -> None:
+    """Shorter assignment pass with skims always saved, for impedance before ``distribute``."""
+    cfg = load_config(config_path)
+    warm = (cfg.get("assignment") or {}).get("warm_skim_pass") or {}
+    calib_cfg = cfg.get("calibration") or {}
+    algorithm = str(warm.get("algorithm") or calib_cfg.get("algorithm", "bfw"))
+    max_iter = int(warm.get("max_iter", 30))
+    rgap = float(warm.get("rgap_target", 0.01))
+    _run_assignment_pass(
+        config_path,
+        algorithm=algorithm,
+        max_iter=max_iter,
+        rgap=rgap,
+        save_skims=True,
+        banner="=== WARM SKIM ASSIGNMENT (for trip distribution) ===",
+        log_volume_note="Warm-pass results (intermediate; re-run assign after distribute if needed)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -355,8 +403,11 @@ def run_temporal_assignment(
     project.open(str(project_dir))
     try:
         df, _skims, _sl = execute_assignment(
-            project, mat,
-            algorithm=algorithm, max_iter=max_iter, rgap_target=rgap,
+            project,
+            mat,
+            algorithm=algorithm,
+            max_iter=max_iter,
+            rgap_target=rgap,
         )
     finally:
         project.close()

@@ -60,6 +60,16 @@ def _classify_csd_road(sil: str) -> str:
 
 
 def learn_day_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    temporal_policy = ((cfg.get("demand") or {}).get("temporal_policy") or {})
+    wsplit = temporal_policy.get("weekend_split") or {}
+    sat_mul = float(wsplit.get("saturday_multiplier", 1.10))
+    sun_mul = float(wsplit.get("sunday_multiplier", 0.90))
+    hol_mul = float(wsplit.get("holiday_multiplier_to_sunday", 0.85))
+    fallback_shares = temporal_policy.get("fallback_day_period_shares") or {}
+    fb_day = float(fallback_shares.get("day", 0.785))
+    fb_eve = float(fallback_shares.get("evening", 0.137))
+    fb_night = float(fallback_shares.get("night", 0.078))
+
     """Compute day-type factors and period shares from CSD2020.
 
     Returns a profile dict and saves it to ``temporal_profile.json``.
@@ -85,9 +95,9 @@ def learn_day_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
     weekend_factor = float((valid["ivd_o"] / valid["o"]).mean()) if len(valid) else 0.83
 
     # Saturday vs Sunday: CSD doesn't separate them; approximate from typical splits
-    saturday_factor = round(weekend_factor * 1.10, 3)
-    sunday_factor = round(weekend_factor * 0.90, 3)
-    holiday_factor = round(sunday_factor * 0.85, 3)
+    saturday_factor = round(weekend_factor * sat_mul, 3)
+    sunday_factor = round(weekend_factor * sun_mul, 3)
+    holiday_factor = round(sunday_factor * hol_mul, 3)
 
     day_factors = {
         "workday": round(workday_factor, 3),
@@ -112,12 +122,29 @@ def learn_day_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
         by_class[rc] = {"workday": round(wf, 3), "weekend": round(wef, 3)}
 
     # --- Day period shares (den / vecer / noc) ---
-    period_df = df[["is_den", "is_ve_er", "is_noc"]].copy()
+    # Some datasets use slightly different naming for evening column.
+    evening_col = None
+    for cand in ("is_ve_er", "is_vecer", "is_veer", "is_evening"):
+        if cand in df.columns:
+            evening_col = cand
+            break
+    if "is_den" not in df.columns:
+        df["is_den"] = 0
+    if "is_noc" not in df.columns:
+        df["is_noc"] = 0
+    if evening_col is None:
+        df["_is_evening_fallback"] = 0
+        evening_col = "_is_evening_fallback"
+
+    period_df = df[["is_den", evening_col, "is_noc"]].copy()
+    period_df = period_df.rename(columns={evening_col: "is_ve_er"})
+    for c in ("is_den", "is_ve_er", "is_noc"):
+        period_df[c] = pd.to_numeric(period_df[c], errors="coerce").fillna(0.0)
     total = period_df.sum(axis=1)
     mask = total > 0
-    day_share = float((period_df.loc[mask, "is_den"] / total[mask]).mean()) if mask.any() else 0.785
-    evening_share = float((period_df.loc[mask, "is_ve_er"] / total[mask]).mean()) if mask.any() else 0.137
-    night_share = float((period_df.loc[mask, "is_noc"] / total[mask]).mean()) if mask.any() else 0.078
+    day_share = float((period_df.loc[mask, "is_den"] / total[mask]).mean()) if mask.any() else fb_day
+    evening_share = float((period_df.loc[mask, "is_ve_er"] / total[mask]).mean()) if mask.any() else fb_eve
+    night_share = float((period_df.loc[mask, "is_noc"] / total[mask]).mean()) if mask.any() else fb_night
 
     profile = {
         "source": "CSD2020_JMK",
@@ -186,11 +213,17 @@ def get_demand_period_shares(profile: Dict[str, Any]) -> Dict[str, float]:
     day_s = float(shares.get("day", 0.785))
     eve_s = float(shares.get("evening", 0.137))
     night_s = float(shares.get("night", 0.078))
+    policy = profile.get("demand_period_split_policy") or {}
+    am_w = float(policy.get("am", 0.35))
+    ip_w = float(policy.get("ip", 0.40))
+    pm_w = float(policy.get("pm", 0.25))
+    w_sum = max(am_w + ip_w + pm_w, 1e-9)
+    am_w, ip_w, pm_w = am_w / w_sum, ip_w / w_sum, pm_w / w_sum
 
     return {
-        "am": round(day_s * 0.35, 4),
-        "ip": round(day_s * 0.40, 4),
-        "pm": round(day_s * 0.25, 4),
+        "am": round(day_s * am_w, 4),
+        "ip": round(day_s * ip_w, 4),
+        "pm": round(day_s * pm_w, 4),
         "ev": round(eve_s + night_s, 4),
         "daily": 1.0,
     }
@@ -218,4 +251,14 @@ def day_info(d: date | str, profile: Dict[str, Any]) -> Dict[str, Any]:
 def run_learn_profile(config_path: str | Path = "config/sim.yaml") -> None:
     cfg = load_config(config_path)
     print("=== LEARN TEMPORAL PROFILE ===")
-    learn_day_profile(cfg)
+    profile = learn_day_profile(cfg)
+    temporal_policy = ((cfg.get("demand") or {}).get("temporal_policy") or {})
+    split = temporal_policy.get("demand_period_split_from_day") or {}
+    profile["demand_period_split_policy"] = {
+        "am": float(split.get("am", 0.35)),
+        "ip": float(split.get("ip", 0.40)),
+        "pm": float(split.get("pm", 0.25)),
+    }
+    out_dir = Path(cfg.get("demand", {}).get("output_dir", "outputs/baseline/demand"))
+    out_path = out_dir / "temporal_profile.json"
+    out_path.write_text(json.dumps(profile, indent=2, ensure_ascii=False), encoding="utf-8")

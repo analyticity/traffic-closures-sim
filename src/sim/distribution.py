@@ -1,13 +1,19 @@
 """Trip distribution: gravity calibration + IPF adjustment.
 
-Pipeline step ``distribute`` sits between ``build-demand`` and ``assign``:
+Typical order when using network skims as impedance:
+
+``build-demand`` → ``assign-warm-skims`` (writes ``skims.aem``) → ``distribute`` → ``assign``.
+
+If you run ``distribute`` first without skims, impedance falls back to Euclidean distance between
+centroids unless ``demand.distribution.impedance`` is ``skim`` (then the step fails until skims exist).
+
+Steps in this module:
 1. Load the seed OD matrix (from build-demand)
-2. Load impedance skims (from previous assignment, or Euclidean fallback)
+2. Load impedance skims (from previous assignment, or Euclidean fallback in ``auto`` mode)
 3. Calibrate gravity model from commuting seed + impedance
 4. Build P/A vectors from population
-5. Apply gravity model for synthetic "other" trips
-6. Run IPF on combined seed to match P/A row/column totals
-7. Save adjusted matrix
+5. Run IPF on the seed to match P/A row/column totals
+6. Save adjusted matrix
 """
 from __future__ import annotations
 
@@ -267,16 +273,39 @@ def run_distribution(config_path: str | Path = "config/sim.yaml") -> None:
     zone_ids = np.array(sorted(zones_gdf["zone_id"].astype(int).unique()), dtype=np.int64)
     population = _load_population(cfg)
 
-    # Load or compute impedance
-    impedance = _load_impedance(output_dir, zone_index)
-    if impedance is not None:
-        print(f"  Impedance: loaded from skims.aem")
+    imp_mode = str(dist_cfg.get("impedance", "auto")).lower().strip()
+    if imp_mode not in ("auto", "skim"):
+        raise ValueError(
+            f"demand.distribution.impedance must be 'auto' or 'skim', got {imp_mode!r}"
+        )
+    skim_path = output_dir / "skims.aem"
+
+    if imp_mode == "skim":
+        if not skim_path.exists():
+            raise FileNotFoundError(
+                f"No skim matrix at {skim_path}. Run assign (with calibration.save_skims=true) "
+                "or assign-warm-skims, then distribute again."
+            )
+        impedance = _load_impedance(output_dir, zone_index)
+        if impedance is None:
+            raise RuntimeError(
+                f"demand.distribution.impedance=skim but could not load a valid matrix from {skim_path} "
+                f"(check zone count matches matrix, n={n})."
+            )
+        print("  Impedance: loaded from skims.aem (required mode)")
+        imp_source = "skim"
     else:
-        print(f"  Impedance: Euclidean distance (no skims available)")
-        impedance = _euclidean_impedance(zones_gdf, zone_ids)
-        if impedance.shape[0] != n:
-            print(f"  WARNING: impedance shape mismatch ({impedance.shape[0]} vs {n}), using uniform")
-            impedance = np.ones((n, n), dtype=np.float64) * 5000.0
+        impedance = _load_impedance(output_dir, zone_index)
+        if impedance is not None:
+            print("  Impedance: loaded from skims.aem")
+            imp_source = "skim"
+        else:
+            print("  Impedance: Euclidean distance (no skims available)")
+            impedance = _euclidean_impedance(zones_gdf, zone_ids)
+            if impedance.shape[0] != n:
+                print(f"  WARNING: impedance shape mismatch ({impedance.shape[0]} vs {n}), using uniform")
+                impedance = np.ones((n, n), dtype=np.float64) * 5000.0
+            imp_source = "euclidean"
 
     # Gravity calibration
     deterrence = str(dist_cfg.get("deterrence_function", "EXPO"))
@@ -316,6 +345,8 @@ def run_distribution(config_path: str | Path = "config/sim.yaml") -> None:
 
     # Save distribution report
     report = {
+        "impedance_mode": imp_mode,
+        "impedance_source": imp_source,
         "gravity_params": params,
         "pa_config": {
             "trip_rate": pa_trip_rate,

@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import shutil
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -1274,6 +1275,16 @@ def _load_zones(cfg: Dict[str, Any]) -> gpd.GeoDataFrame:
 # ---------------------------------------------------------------------------
 
 def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None:
+    t0 = time.perf_counter()
+    marks: Dict[str, float] = {}
+    t_prev = t0
+
+    def _mark(name: str) -> None:
+        nonlocal t_prev
+        now = time.perf_counter()
+        marks[name] = round(now - t_prev, 3)
+        t_prev = now
+
     cfg = load_config(config_path)
     bcfg = _build_cfg(cfg)
 
@@ -1281,6 +1292,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
 
     print("Loading zones ...")
     zones_gdf = _load_zones(cfg)
+    _mark("load_zones")
 
     external_zone_ids: set[int] = set(
         zones_gdf.loc[zones_gdf["is_external"].fillna(0).astype(int) == 1, "zone_id"].astype(int)
@@ -1308,10 +1320,12 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
 
     print("Reading commuting data ...")
     df_raw = _read_commuting(bcfg)
+    _mark("read_commuting")
 
     zone_population = _load_zone_population(
         Path(cfg.get("datasets", {}).get("cache_dir", "data/cache"))
     )
+    _mark("load_zone_population")
 
     origin_place_col = "op_obec" if "op_obec" in df_raw.columns else None
     dest_place_col = "doj_obec" if "doj_obec" in df_raw.columns else None
@@ -1343,6 +1357,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
     if groups:
         for group_name, members in groups.items():
             print(f"  Group '{group_name}': {len(members)} zones")
+    _mark("build_hub_groups")
 
     gateways = _load_gateways(zones_gdf)
     if gateways:
@@ -1353,6 +1368,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
         print("  No external gateway zones found")
 
     _preflight_external_inputs(bcfg, gateways)
+    _mark("preflight_external_inputs")
 
     external_lookup: Dict[str, List[Tuple[int, float]]] = {}
     external_lookup_gateway: Dict[str, str] = {}
@@ -1364,6 +1380,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
 
     df = _filter_commuting(df_raw, bcfg)
     print(f"  {len(df)} rows after filtering")
+    _mark("filter_commuting")
 
     print("Building commuting OD cores ...")
     cores, summary = _build_od_cores(
@@ -1377,6 +1394,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
         external_lookup=external_lookup,
         external_lookup_gateway=external_lookup_gateway,
     )
+    _mark("build_commuting_cores")
 
     segments_cfg = _get(cfg, ["demand", "segments"], {}) or {}
     other_cfg = segments_cfg.get("other", {}) or {}
@@ -1388,13 +1406,14 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
     # --- Internal "other" trips ---
     if other_cfg and other_cfg.get("source", "gravity") == "gravity":
         print("Building 'other' trips (gravity seed) ...")
+        other_defaults = (other_cfg.get("defaults") or {})
         other_daily = _build_gravity_seed(
             zone_ids,
             zone_population,
-            trip_rate=float(other_cfg.get("trip_rate", 1.5)),
-            car_share=float(other_cfg.get("car_share", 0.45)),
-            occupancy=float(other_cfg.get("occupancy", 1.40)),
-            beta=float(other_cfg.get("beta", 0.0001)),
+            trip_rate=float(other_cfg.get("trip_rate", other_defaults.get("trip_rate", 0.6))),
+            car_share=float(other_cfg.get("car_share", other_defaults.get("car_share", 0.35))),
+            occupancy=float(other_cfg.get("occupancy", other_defaults.get("occupancy", 1.50))),
+            beta=float(other_cfg.get("beta", other_defaults.get("beta", 0.00015))),
             centroids_gdf=zones_gdf,
             excluded_zone_ids=external_zone_ids,
             metric_epsg=int(cfg.get("crs_epsg", 5514)),
@@ -1402,6 +1421,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
         print(f"  'other' daily total: {float(other_daily.sum()):,.0f}")
     else:
         other_daily = _zero_matrix(n_zones)
+    _mark("build_other_seed")
 
     # --- Residual synthetic external_local (optional) ---
     if (
@@ -1422,6 +1442,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
         print(f"  'external_local' daily total: {float(external_local_daily.sum()):,.0f}")
     else:
         external_local_daily = _zero_matrix(n_zones)
+    _mark("build_external_local")
 
     # --- Data-driven external_through from coarse supernetwork ---
     data_driven_through_daily = _zero_matrix(n_zones)
@@ -1435,6 +1456,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
                 through_pairs_df,
             )
             print(f"  'external_through_data' daily total: {float(data_driven_through_daily.sum()):,.0f}")
+    _mark("build_external_through_data")
 
     # --- Optional residual synthetic external_through ---
     if (
@@ -1459,6 +1481,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
         print(f"  'external_through_residual' daily total: {float(residual_external_through_daily.sum()):,.0f}")
     else:
         residual_external_through_daily = _zero_matrix(n_zones)
+    _mark("build_external_through_residual")
 
     external_through_daily = data_driven_through_daily + residual_external_through_daily
 
@@ -1509,6 +1532,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
         )
 
     all_cores["wd_daily"] = sum(all_cores[f"wd_{period}"] for period in bcfg.periods)
+    _mark("assemble_cores")
 
     segment_totals = {
         "commuting": round(float(all_cores["wd_daily_commuting"].sum()), 0),
@@ -1524,6 +1548,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
 
     print(f"Writing AEM matrix: {bcfg.matrix_path}")
     _write_aem(bcfg.matrix_path, centroid_ids, all_cores, matrix_name=bcfg.matrix_name)
+    _mark("write_aem_matrix")
 
     _ensure_dir(bcfg.output_dir)
 
@@ -1568,6 +1593,14 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
     if project_dir and Path(project_dir).exists():
         print(f"Registering matrix in AequilibraE project: {project_dir}")
         _register_in_project(Path(project_dir), bcfg.matrix_path)
+    _mark("register_matrix")
+
+    summary_data["timing_breakdown_s"] = marks
+    summary_data["elapsed_total_s"] = round(time.perf_counter() - t0, 3)
+    summary_path.write_text(
+        json.dumps(summary_data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
     print("\n--- OD build summary ---")
     print(f"  Zones:                         {summary['zones']}")
@@ -1588,6 +1621,62 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
 
     print(f"\n  Matrix:  {bcfg.matrix_path}")
     print(f"  Summary: {summary_path}")
+    print(f"  Timing:  {marks}")
+
+
+def assert_build_demand_prerequisites(cfg: dict) -> None:
+    """Fail fast before ``load_or_build_od_matrix`` (used by ``run.py`` preflight)."""
+    root = Path(cfg["_meta"]["project_root"])
+    zoning = cfg.get("zoning") or {}
+    zout = Path(zoning.get("output_dir", "outputs/baseline/zones"))
+    zones_path = zout / "zones.geojson"
+    mapping_path = zout / "zone_centroid_mapping.json"
+    if not zones_path.exists():
+        raise FileNotFoundError(
+            f"build-demand: missing zones export {zones_path}. Run build-zones first."
+        )
+    if not mapping_path.exists():
+        raise FileNotFoundError(
+            f"build-demand: missing centroid mapping {mapping_path}. Run build-zones first."
+        )
+
+    ext = ((cfg.get("demand") or {}).get("sldb") or {}).get("external_processing") or {}
+    if not ext.get("enabled", False):
+        return
+
+    demand = cfg.get("demand") or {}
+    seg_ext_through = (demand.get("segments") or {}).get("external_through") or {}
+
+    def _resolve(p: Any) -> Path:
+        path = Path(p) if not isinstance(p, Path) else p
+        return path if path.is_absolute() else (root / path).resolve()
+
+    gw = _resolve(
+        ext.get("external_gateway_lookup_path", "data/cache/external_gateway_lookup.parquet")
+    )
+    tp_default = ext.get("through_gateway_pairs_path")
+    if not tp_default:
+        tp_default = seg_ext_through.get(
+            "data_driven_pairs_path", "data/cache/through_gateway_pairs.parquet"
+        )
+    tp = _resolve(tp_default)
+
+    if not gw.exists():
+        raise FileNotFoundError(
+            f"build-demand: missing external gateway lookup {gw}. Run build-supernetwork first."
+        )
+    if ext.get("use_external_external_via_brno", True) and not tp.exists():
+        raise FileNotFoundError(
+            f"build-demand: missing through gateway pairs {tp}. Run build-supernetwork first."
+        )
+
+    sn = cfg.get("supernetwork") or {}
+    sn_out = _resolve(sn.get("output_dir", "outputs/baseline/supernetwork"))
+    summary = sn_out / "supernetwork_summary.json"
+    if not summary.exists():
+        raise FileNotFoundError(
+            f"build-demand: missing supernetwork summary {summary}. Run build-supernetwork first."
+        )
 
 
 if __name__ == "__main__":

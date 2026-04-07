@@ -59,6 +59,13 @@ def load_config(config_path: str | Path = "config/sim.yaml") -> Dict[str, Any]:
         for k in ("cache_file", "output_dir"):
             if k in zoning:
                 zoning[k] = _as_abs_path(zoning[k], project_root)
+        sources = zoning.get("sources")
+        if isinstance(sources, list):
+            for src in sources:
+                if isinstance(src, dict):
+                    for path_key in ("path", "file"):
+                        if path_key in src and src[path_key]:
+                            src[path_key] = _as_abs_path(src[path_key], project_root)
         cfg["zoning"] = zoning
 
     demand = cfg.get("demand") or {}

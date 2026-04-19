@@ -19,20 +19,20 @@ export function ValidationCard({ data }: { data: ValidationReport }) {
         </div>
       )}
 
-      {data.csd2020_observed && (
+      {data.csd_observed && (
         <div>
-          <h3 className="mb-2 text-sm font-semibold text-gray-600">CSD2020 – Jihomoravský kraj</h3>
+          <h3 className="mb-2 text-sm font-semibold text-gray-600">CSD Validation</h3>
           <table className="w-full text-xs">
             <thead>
               <tr className="border-b text-left text-gray-500">
-                <th className="py-1">Třída</th>
-                <th>Úseků</th>
-                <th>Ø RPDI</th>
-                <th>Ø Osobní</th>
+                <th className="py-1">Class</th>
+                <th>Sections</th>
+                <th>Mean AADT</th>
+                <th>Mean Cars</th>
               </tr>
             </thead>
             <tbody>
-              {data.csd2020_observed.map((r) => (
+              {data.csd_observed.map((r) => (
                 <tr key={r.road_class} className="border-b">
                   <td className="py-1 font-medium">{r.road_class}</td>
                   <td>{r.sections}</td>

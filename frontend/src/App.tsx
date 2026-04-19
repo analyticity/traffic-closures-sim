@@ -1,11 +1,13 @@
-import { Map, BarChart3, Info } from "lucide-react";
+import { Map, BarChart3, Info, Search } from "lucide-react";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
 import { MapPage } from "./pages/MapPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { AboutPage } from "./pages/AboutPage";
+import { DiagnosticsPage } from "./pages/DiagnosticsPage";
 
 const NAV = [
   { to: "/", label: "Mapa", icon: Map },
+  { to: "/diagnostics", label: "Diagnostika", icon: Search },
   { to: "/reports", label: "Reporty", icon: BarChart3 },
   { to: "/about", label: "O projektu", icon: Info },
 ];
@@ -38,6 +40,7 @@ export default function App() {
       <main className="flex-1 overflow-hidden">
         <Routes>
           <Route path="/" element={<MapPage />} />
+          <Route path="/diagnostics" element={<DiagnosticsPage />} />
           <Route path="/reports" element={<ReportsPage />} />
           <Route path="/about" element={<AboutPage />} />
         </Routes>

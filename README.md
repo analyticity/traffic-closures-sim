@@ -13,19 +13,20 @@ The pipeline supports the following workflow:
 0. **clean** – remove generated data and start from a clean state  
 1. **check** – verify that the AequilibraE project is correctly bootstrapped  
 2. **build-network** – import the road network from OpenStreetMap  
-3. **normalize-network** – clean and normalize network attributes  
-4. **build-zones** – create TAZ zones and centroid connectors  
+3. **normalize-network** – clean and normalize network attributes; optionally apply baseline road closures  
+4. **build-zones** – create TAZ zones, external gateway zones, and centroid connectors  
 5. **fetch-data** – download and preprocess external datasets (optional; `datasets.enabled`)  
 6. **build-supernetwork** – coarse national network for external / through traffic at gateways  
 7. **build-demand** – build the seed OD matrix (commuting, gateways, synthetic segments)  
 8. **assign-warm-skims** – optional short assignment that always saves `skims.aem` for trip distribution  
 9. **distribute** – gravity calibration + IPF on the seed matrix (network skims or Euclidean; see below)  
 10. **assign** – full traffic assignment on the detailed network  
-11. **calibrate** – iterative demand scaling vs. link counts (pentlogram)  
+11. **calibrate** / **calibrate-odme** – iterative demand scaling vs. link counts (pentlogram)  
 12. **tune-supply** – optional outer loop on supply-side factors after demand calibration  
 13. **validate** – independent checks vs. CSD (not used in calibration)  
 14. **learn-profile** – temporal day-type factors from CSD  
-15. **serve** – read-only REST API for results  
+15. **strip-closures** – restore pre-closure network attributes (clean baseline after validation)  
+16. **serve** – read-only REST API for results  
 
 ---
 
@@ -59,22 +60,26 @@ A standard end-to-end workflow usually looks like this:
 python run.py clean
 python run.py check
 python run.py build-network
-python run.py normalize-network
+python run.py fetch-data                # downloads closures, counts, CSD, population
+python run.py normalize-network         # applies baseline closures if configured
 python run.py build-zones
-python run.py fetch-data
+python run.py fetch-data                # re-run: population is now mapped to zones
 python run.py build-supernetwork
 python run.py build-demand
 python run.py assign-warm-skims
 python run.py distribute
 python run.py assign
-python run.py calibrate
+python run.py calibrate                 # or calibrate-odme for ODME method
 python run.py tune-supply
 python run.py validate
 python run.py learn-profile
+python run.py strip-closures            # remove closures for clean baseline
 python run.py serve
 ```
 
 In practice, not every run has to execute all steps. Once intermediate artifacts are generated, later steps can usually be rerun independently.
+
+**Why `fetch-data` appears twice.** The first run downloads road closures (needed by `normalize-network`) and other external datasets. However, the population-to-zone mapping (`zone_population.parquet`) requires `zones.geojson` from `build-zones`. The second run re-processes population with proper zone IDs; previously downloaded files are cached and not re-downloaded.
 
 **Skim-driven trip distribution.** The first run of `distribute` has no `skims.aem` unless you assigned traffic first. With `demand.distribution.impedance: auto` (default), gravity/IPF then uses **Euclidean distance** between zone centroids. To use **network travel times** as impedance, run **`assign-warm-skims`** (or a full `assign` with `calibration.save_skims: true`) **before** `distribute`, then `distribute`, then run **`assign` again** for production link volumes on the IPF-adjusted matrix. A warm pass overwrites `assignment_results.parquet` with an intermediate result; the final assignment pass replaces it.
 
@@ -127,10 +132,14 @@ Typical tasks in this phase include:
 
 * standardizing attribute values
 * cleaning inconsistent link metadata
+* computing BPR function parameters, capacities, and free-flow speeds
+* applying baseline road closures (if configured)
 * preparing the network for zoning and assignment
 * exporting a normalized version for downstream processing
 
 This step is important because raw OSM data is usually not directly suitable for assignment.
+
+**Baseline closures** (`baseline_closures` in `config/sim.yaml`): when enabled, road closures from the Police ČR XML feed (fetched by `fetch-data`) are spatially matched to network links. Affected links receive reduced capacity and speed (via a configurable `capacity_reduction_factor`). Original values are stored in `_preclosure_*` columns so they can be restored later by `strip-closures`.
 
 **Configuration**
 
@@ -156,9 +165,18 @@ This step is important because raw OSM data is usually not directly suitable for
 
 ### 5. `build-zones`
 
-Builds transport analysis zones (TAZ) and centroid connectors.
+Builds transport analysis zones (TAZ), external gateway zones, and centroid connectors.
 
 This phase creates the zoning system used for demand modeling and connects zone centroids to the road network so OD flows can enter and leave the network during assignment.
+
+**External gateways** represent entry/exit points at the model boundary for traffic to/from outside the study area. They are created from two sources:
+
+* **Whitelist** (`zoning.external_gateways.whitelist`) — explicit list of road refs (e.g. `D1`, `I/50`). These are always kept in the supernetwork for through-traffic routing.
+* **Auto-discover** (`zoning.external_gateways.auto_discover`) — additional named roads near the model boundary not on the whitelist. These secondary gateways receive only local external demand, not through-traffic.
+
+**Class-aware merging**: gateways close to each other on the model boundary are merged, but only within the same road class group (motorway/trunk, primary, secondary). This prevents merging of different corridors that happen to cross the boundary near the same point (e.g. D1 motorway and I/50 primary on the east).
+
+**`max_anchor_distance_m`** (default 2000): gateways whose network anchor node is farther than this from the boundary are skipped, preventing phantom connectors for roads that don't actually reach the model edge.
 
 ---
 
@@ -166,21 +184,38 @@ This phase creates the zoning system used for demand modeling and connects zone 
 
 Downloads and preprocesses external datasets required by the model.
 
-These datasets may include demand, count, validation, or temporal reference inputs. The step prepares them into a consistent internal format for the following phases.
+These datasets may include demand, count, validation, temporal reference, or road closure inputs (e.g. Police ČR XML feed). The step prepares them into a consistent internal format for the following phases.
 
 ---
 
-### 7. `build-demand`
+### 7. `build-supernetwork`
 
-Builds the initial OD matrix from SLDB commuting data.
+Builds a coarse national road network for classifying external (through) traffic.
 
-This produces the base origin-destination demand representation, which acts as the seed for later distribution and calibration.
+Gateways from `build-zones` are snapped to the national graph (built from the Czech OSM `.pbf`). For each external municipality, the system determines the best gateway(s) by shortest-path cost. Through-traffic demand between gateway pairs is computed from SLDB commuting data filtered by detour/time thresholds.
+
+**`supernetwork.eligible_gateway_types`**: only gateways with matching road types participate in national routing. Auto-discovered secondary gateways are always excluded to prevent distorted place assignments. Whitelist gateways are always kept regardless of their OSM road class.
+
+**Demand distribution** for `external_local` trips uses road-class-based weights derived automatically from `gateway_diagnostics.csv`: motorway/trunk gateways get weight 1.0, primary 0.6, secondary 0.2. Explicit overrides can be set in `corridor_weights`.
+
+---
+
+### 8. `build-demand`
+
+Builds the initial OD matrix from SLDB commuting data and synthetic demand segments.
+
+This produces the base origin-destination demand representation, which acts as the seed for later distribution and calibration. The matrix includes:
+
+* **Commuting** — from SLDB (Czech census) origin-destination flows, converted to vehicles per period
+* **Other** — synthetic gravity-model trips for non-commuting purposes
+* **External local** — residual gateway-to-internal trips, weighted by road class
+* **External through** — data-driven through-traffic from supernetwork gateway pairs
 
 When `demand.sldb.external_processing.enabled` is true, the runner checks for supernetwork outputs (gateway lookup parquet, through pairs if configured, and `supernetwork_summary.json`) before building demand. With external processing off, only zones and centroid mapping from `build-zones` are required.
 
 ---
 
-### 8. `assign-warm-skims`
+### 9. `assign-warm-skims`
 
 Optional shorter traffic assignment whose main purpose is to write **`skims.aem`** under `demand.output_dir` for use as impedance in `distribute`.
 
@@ -190,7 +225,7 @@ Optional shorter traffic assignment whose main purpose is to write **`skims.aem`
 
 ---
 
-### 9. `distribute`
+### 10. `distribute`
 
 Runs demand distribution and balancing.
 
@@ -209,7 +244,7 @@ The goal is to transform the initial demand into a network-ready OD matrix consi
 
 ---
 
-### 10. `assign`
+### 11. `assign`
 
 Runs traffic assignment.
 
@@ -222,7 +257,7 @@ The result is an estimate of flows on individual network links.
 
 ---
 
-### 11. `calibrate`
+### 12. `calibrate` / `calibrate-odme`
 
 Performs iterative model calibration.
 
@@ -235,13 +270,18 @@ This phase typically follows the loop:
 
 The objective is to reduce the difference between simulated and observed traffic patterns.
 
+Two methods are available:
+
+* **`calibrate`** — iterative demand scaling vs. link counts (pentlogram data)
+* **`calibrate-odme`** — origin-destination matrix estimation (ODME) against link counts
+
 **Configuration (excerpt)**
 
 * `calibration.aggregate_corridor` — when `true`, volumes on parallel divided-highway links are summed for comparison to a single count station (recommended for motorways).
 
 ---
 
-### 12. `tune-supply`
+### 13. `tune-supply`
 
 Runs outer-loop optimization of supply-side parameters.
 
@@ -249,17 +289,17 @@ While `calibrate` focuses on repeated internal adjustment, this step searches fo
 
 ---
 
-### 13. `validate`
+### 14. `validate`
 
-Runs independent validation using CSD2020.
+Runs independent validation using CSD 2025.
 
 Unlike calibration, this phase tests the model on separate validation data to assess generalization and robustness. It helps confirm whether the calibrated model behaves reasonably outside the calibration target.
 
 ---
 
-### 14. `learn-profile`
+### 15. `learn-profile`
 
-Learns temporal day-type factors from CSD2020.
+Learns temporal day-type factors from CSD 2025.
 
 This step extracts temporal behavior patterns that can later be used to derive profiles for different types of days or time periods.
 
@@ -267,7 +307,15 @@ It is especially useful when moving from a static baseline toward more realistic
 
 ---
 
-### 15. `serve`
+### 16. `strip-closures`
+
+Restores the network to its pre-closure state after validation.
+
+During `normalize-network`, baseline closures (from the Police ČR feed or manual input) can reduce link capacity and speed to match real-world conditions during the measurement period. After validation confirms the model against observed data, `strip-closures` reverts these reductions by restoring values from `_preclosure_*` columns, yielding a clean baseline network suitable for scenario analysis.
+
+---
+
+### 17. `serve`
 
 Starts a read-only REST API server.
 
@@ -298,9 +346,11 @@ The runner exposes the following steps:
 * `distribute`
 * `assign`
 * `calibrate`
+* `calibrate-odme`
 * `tune-supply`
 * `validate`
 * `learn-profile`
+* `strip-closures`
 * `serve`
 
 Basic usage:
@@ -354,10 +404,12 @@ For development, it is usually best to run the workflow incrementally:
 * run `clean` only when necessary
 * use `check` before rebuilding everything
 * rebuild the network only when OSM-related inputs change
-* rerun `build-zones` when zoning logic changes
+* rerun `build-zones` when zoning logic or gateway config changes; then rerun `build-demand` onward (the OD matrix dimension must match the zone set)
+* rerun `build-supernetwork` when gateway or supernetwork config changes
 * rerun `build-demand` or `distribute` when demand inputs change
 * use `assign-warm-skims` before `distribute` when you want IPF/gravity driven by network skims instead of Euclidean distance
 * rerun `assign`, `calibrate`, and `validate` frequently during model tuning
+* run `strip-closures` after validation to produce a clean baseline for scenario work
 * use `serve` only after the required outputs have been prepared
 
 This keeps iteration fast and avoids recomputing expensive earlier phases unnecessarily.
@@ -368,8 +420,9 @@ This keeps iteration fast and avoids recomputing expensive earlier phases unnece
 
 * Many steps depend on outputs generated by previous steps.
 * The pipeline is designed to support both full rebuilds and partial reruns.
-* The configuration is centralized in `config/sim.yaml`.
+* The primary configuration is in `config/sim.yaml`. Supplementary configs: `config/network_normalization.yaml` (speed/capacity defaults), `config/screenlines.yaml` (calibration/validation count stations), `config/locale.yaml` (localization).
 * The script inserts `src/` into `sys.path`, so project modules are loaded directly from the source tree.
+* Each `run.py` invocation accepts exactly one step: `python run.py build-demand`. Chain calls in a shell script or run them sequentially.
 
 ---
 
@@ -377,16 +430,18 @@ This keeps iteration fast and avoids recomputing expensive earlier phases unnece
 
 The workflow is implemented in the main script and dispatches individual steps to dedicated modules such as:
 
-* `sim.network_pipeline`
-* `sim.network_normalization`
-* `sim.zoning`
-* `sim.fetch_datasets`
-* `sim.demand`
-* `sim.distribution`
-* `sim.assignment`
-* `sim.calibration`
-* `sim.temporal`
-* `sim.api`
+* `sim.network_pipeline` — OSM import
+* `sim.network_normalization` — attribute normalization, baseline closures
+* `sim.zoning` — TAZ and gateway zone generation
+* `sim.fetch_datasets` — external data download (CSD, SLDB, closures)
+* `sim.supernetwork` — national coarse network for through-traffic
+* `sim.demand` — OD matrix construction
+* `sim.distribution` — gravity model and IPF
+* `sim.assignment` — traffic assignment
+* `sim.calibration` — calibration, ODME, validation, supply tuning
+* `sim.scenarios` — scenario engine and delta analysis
+* `sim.temporal` — temporal profile learning
+* `sim.api` — REST API server
 
 This keeps the runner lightweight while the domain logic remains separated into dedicated components.
 

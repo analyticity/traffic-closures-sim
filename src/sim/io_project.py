@@ -1,4 +1,4 @@
-"""Config a pomocné funkce pro projekt."""
+"""Configuration loading and project helper functions."""
 from __future__ import annotations
 
 import os
@@ -47,7 +47,7 @@ def load_config(config_path: str | Path = "config/sim.yaml") -> Dict[str, Any]:
     cfg.setdefault("_meta", {})
     cfg["_meta"]["config_path"] = str(p)
     cfg["_meta"]["base_dir"] = str(base_dir)
-    # Kořen projektu (nad config/) – sem ukládáme data/, ne do config/
+    # Project root (parent of config/) — data files are stored here, not under config/
     project_root = base_dir.parent
     cfg["_meta"]["project_root"] = str(project_root)
 
@@ -119,3 +119,29 @@ def load_config(config_path: str | Path = "config/sim.yaml") -> Dict[str, Any]:
         cfg["datasets"] = datasets
 
     return cfg
+
+
+def resolve_project_database_path(cfg: Dict[str, Any]) -> Path:
+    """Return the AequilibraE project database path from config."""
+    project_path = cfg.get("project_path", "project")
+    return Path(project_path) / "project_database.sqlite"
+
+
+def load_locale(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Load locale-specific configuration (holidays, mappings, etc.).
+
+    The locale file path is taken from ``cfg["locale_path"]``, defaulting
+    to ``config/locale.yaml`` relative to the project root.
+    """
+    project_root = Path(cfg.get("_meta", {}).get("project_root", "."))
+    locale_path = Path(cfg.get("locale_path", project_root / "config" / "locale.yaml"))
+    if not locale_path.is_absolute():
+        locale_path = (project_root / locale_path).resolve()
+    if locale_path.exists():
+        return yaml.safe_load(locale_path.read_text(encoding="utf-8")) or {}
+    return {}
+
+
+def get_metric_epsg(cfg: Dict[str, Any]) -> int:
+    """Return the metric CRS EPSG code from config (``crs_epsg`` key)."""
+    return int(cfg.get("crs_epsg", 5514))

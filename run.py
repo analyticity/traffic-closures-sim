@@ -6,19 +6,21 @@ Workflow:
   0) clean              – delete generated data, start fresh
   1) check              – verify AequilibraE project bootstrap
   2) build-network      – import OSM network into AequilibraE
-  3) normalize-network  – clean / normalise link attributes
+  3) normalize-network  – clean / normalise link attributes (+ apply closures if enabled)
   4) build-zones        – create TAZ zones + centroid connectors
-  5) fetch-data         – download & preprocess external datasets
+  5) fetch-data         – download & preprocess external datasets (incl. closures)
   6) build-supernetwork – national coarse net → gateway lookups & through pairs
   7) build-demand        – seed OD matrix (SLDB, gateways, synthetic segments)
   8) assign-warm-skims  – optional short assign; always saves skims.aem for distribute
   9) distribute         – gravity + IPF (see skim vs Euclidean below)
  10) assign              – full traffic assignment (AoN / equilibrium)
- 11) calibrate           – iterative: assign → compare counts → scale OD
- 12) tune-supply         – optional outer loop on supply parameters
- 13) validate            – independent validation (CSD)
- 14) learn-profile       – day-type factors from CSD
- 15) serve               – REST API (read-only results)
+ 11) calibrate           – legacy iterative: assign → compare counts → scale OD
+ 12) calibrate-odme      – Spiess gradient ODME (preferred)
+ 13) tune-supply         – optional outer loop on supply parameters
+ 14) validate            – match diagnostics + independent validation (CSD)
+ 15) learn-profile       – day-type factors from CSD
+ 16) strip-closures      – remove baseline closures → clean network for scenarios
+ 17) serve               – REST API (read-only results)
 
   Skim-driven distribute: after build-demand, run assign-warm-skims (or assign with
   calibration.save_skims=true) so distribute can use network times; then distribute, then assign.
@@ -33,14 +35,14 @@ import argparse
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from sim.io_project import load_config
+from sim.io_project import load_config, resolve_project_database_path
 from sim.network_pipeline import build_network_from_osm
-from sim.network_normalization import normalize_and_export_network
+from sim.network_normalization import normalize_and_export_network, strip_closures
 from sim.zoning import build_zones_and_connectors
 from sim.fetch_datasets import run_fetch_datasets
 from sim.demand import assert_build_demand_prerequisites, load_or_build_od_matrix
 from sim.assignment import run_assignment, run_warm_skim_assignment
-from sim.calibration import run_calibration, run_validation_only
+from sim.calibration import run_calibration, run_odme_calibration, run_validation_only, run_match_diagnostics
 from sim.temporal import run_learn_profile
 from sim.supernetwork import run_build_supernetwork
 
@@ -57,9 +59,11 @@ STEPS = [
     "distribute",
     "assign",
     "calibrate",
+    "calibrate-odme",  # alias: calibrate --method odme
     "tune-supply",
     "validate",
     "learn-profile",
+    "strip-closures",
     "serve",
 ]
 
@@ -67,6 +71,15 @@ STEPS = [
 def _require_paths(cfg: dict, step: str, rel_paths: list[str]) -> None:
     root = Path(cfg["_meta"]["project_root"])
     missing = [rp for rp in rel_paths if not (root / rp).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"{step}: missing required inputs: {missing}. "
+            f"Run prerequisite steps first."
+        )
+
+
+def _require_abs_paths(cfg: dict, step: str, paths: list[Path]) -> None:
+    missing = [str(p) for p in paths if not p.exists()]
     if missing:
         raise FileNotFoundError(
             f"{step}: missing required inputs: {missing}. "
@@ -86,8 +99,7 @@ def _require_assign_inputs(cfg: dict, step: str) -> None:
 
 
 def run_clean(config_path: str) -> None:
-    """Delete all generated data so the next run starts fresh.
-    Use --keep-sources to preserve downloaded files (SLDB, pentlogram, CSD2020)."""
+    """Delete all generated data so the next run starts fresh."""
     cfg = load_config(config_path)
     project_root = Path(cfg["_meta"]["project_root"])
 
@@ -174,27 +186,34 @@ def main() -> None:
     elif step == "assign":
         _require_assign_inputs(load_config(cfg), step)
         run_assignment(cfg)
-    elif step == "calibrate":
-        _require_paths(cfg=load_config(cfg), step=step, rel_paths=[
-            "data/demand/od_matrix.aem",
-            "project/brno_aeq/project_database.sqlite",
-            "data/sources/brno/intensity/intenzita_dopravy_pentlogram_2024.geojson",
+    elif step in ("calibrate", "calibrate-odme"):
+        _c = load_config(cfg)
+        _require_abs_paths(_c, step, [
+            Path(_c["demand"]["matrix_path"]),
+            resolve_project_database_path(_c),
         ])
-        run_calibration(cfg)
+        method = (_c.get("calibration") or {}).get("method", "fsm")
+        if step == "calibrate-odme" or method == "odme":
+            run_odme_calibration(cfg)
+        else:
+            run_calibration(cfg)
     elif step == "tune-supply":
         from sim.calibration import run_supply_tuning
         run_supply_tuning(cfg)
     elif step == "validate":
-        _require_paths(cfg=load_config(cfg), step=step, rel_paths=[
-            "data/demand/od_matrix.aem",
-            "data/cache/v2_csd2025.parquet",
+        _c = load_config(cfg)
+        _require_abs_paths(_c, step, [
+            Path(_c["demand"]["matrix_path"]),
         ])
+        run_match_diagnostics(cfg)
         run_validation_only(cfg)
     elif step == "learn-profile":
-        _require_paths(cfg=load_config(cfg), step=step, rel_paths=[
-            "data/cache/v2_csd2025.parquet",
-        ])
+        _c = load_config(cfg)
+        cache_dir = Path(_c.get("datasets", {}).get("cache_dir", "data/cache"))
+        _require_abs_paths(_c, step, [cache_dir / "v2_csd2025.parquet"])
         run_learn_profile(cfg)
+    elif step == "strip-closures":
+        strip_closures(cfg)
     elif step == "serve":
         from sim.api import start_server
         start_server(cfg)

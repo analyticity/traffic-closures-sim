@@ -1,18 +1,24 @@
-"""Iterative FSM calibration and independent validation.
+"""Traffic model calibration and independent validation.
 
-Calibration loop
-----------------
-1. Run traffic assignment with current OD matrix
-2. Match assigned link volumes to observed counts (pentlogram)
-3. Compute GEH / RMSE metrics
-4. If converged → stop
-5. Scale OD matrix using observed/modeled ratios (global or sector-based)
-6. Go to 1
+ODME calibration (preferred — ``run_odme_calibration``)
+-------------------------------------------------------
+Spiess-style gradient-based OD Matrix Estimation.  Bi-level optimization:
+  Lower level: AequilibraE equilibrium assignment
+  Upper level: minimize weighted sum-of-squared residuals between modeled
+               and observed link volumes via relative-gradient descent.
+Select-link OD proportions from screenlines steer the gradient;
+a damped global residual correction handles aggregate bias from all
+matched count posts.  Elasticity bounds prevent overfitting.
+
+Legacy calibration (``run_calibration``)
+----------------------------------------
+Iterative FSM loop: assign → compare → scale OD → repeat.
+Preserved for backward compatibility.
 
 Validation
 ----------
 After calibration converges, ``validate`` compares the *final* assignment
-to an independent dataset (CSD2020) that was **not** used during calibration.
+to an independent dataset (CSD) that was **not** used during calibration.
 """
 from __future__ import annotations
 
@@ -22,7 +28,7 @@ import shutil
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -30,10 +36,12 @@ import geopandas as gpd
 from aequilibrae import Project
 from aequilibrae.matrix import AequilibraeMatrix
 
-from sim.io_project import load_config
+from sim.io_project import get_metric_epsg, load_config
 from sim.assignment import (
+    build_graph,
     execute_assignment,
     fix_node_ids,
+    resolve_daily_cap_factor_default,
     _detect_volume_col,
 )
 
@@ -54,6 +62,201 @@ def _get(cfg: Any, path: List[str], default: Any = None) -> Any:
     return cur
 
 
+_SCREENLINE_TO_GATEWAY = {
+    "D1_west": "D1_NW",
+    "D1_east": "D1_E",
+    "D2_south": "D2_S",
+    "I43_north": "I43_N",
+    "I52_south": "I52_S",
+}
+
+
+# ---------------------------------------------------------------------------
+# Gateway calibration helpers
+# ---------------------------------------------------------------------------
+
+def _load_gateway_zone_map(
+    cfg: Dict[str, Any],
+    mat_index: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    """Build gateway_name -> array of matrix row/col indices for external zones.
+
+    Reads ``zones.geojson`` from the zoning output directory, selects rows
+    where ``is_external == 1``, and maps each ``gateway_name`` to the
+    corresponding matrix indices (positions in ``mat_index``).
+
+    The matrix uses centroid IDs (1..N) while zones.geojson uses zone_ids
+    (which may be large synthetic values like 8000000020 for external zones).
+    A zone_centroid_mapping.json bridges the two ID spaces.
+    """
+    zoning_dir = Path(_get(cfg, ["zoning", "output_dir"], "outputs/baseline/zones"))
+    zones_path = zoning_dir / "zones.geojson"
+    if not zones_path.exists():
+        return {}
+
+    zones_gdf = gpd.read_file(zones_path)
+    if "is_external" not in zones_gdf.columns or "zone_id" not in zones_gdf.columns:
+        return {}
+
+    external = zones_gdf[zones_gdf["is_external"].fillna(0).astype(int) == 1].copy()
+    if external.empty:
+        return {}
+
+    mapping_path = zoning_dir / "zone_centroid_mapping.json"
+    zone_to_centroid: Dict[int, int] = {}
+    if mapping_path.exists():
+        import json
+        with open(mapping_path) as f:
+            raw = json.load(f)
+        zone_to_centroid = {int(k): int(v) for k, v in raw.items()}
+
+    idx_lookup = {int(v): i for i, v in enumerate(mat_index)}
+    result: Dict[str, np.ndarray] = {}
+
+    for _, row in external.iterrows():
+        gw = str(row.get("gateway_name", "")).strip()
+        if not gw:
+            name = str(row.get("name", "")).strip()
+            gw = name.replace("EXT_", "", 1) if name.startswith("EXT_") else name
+        if not gw:
+            continue
+        zid = int(row["zone_id"])
+        centroid_id = zone_to_centroid.get(zid, zid)
+        mat_idx = idx_lookup.get(centroid_id)
+        if mat_idx is not None:
+            result.setdefault(gw, []).append(mat_idx)
+
+    return {gw: np.array(indices, dtype=int) for gw, indices in result.items()}
+
+
+def _load_gateway_observed(
+    cfg: Dict[str, Any],
+) -> Dict[str, float]:
+    """Load observed AADT per gateway for gateway calibration.
+
+    Tries the parquet at ``calibration.gateway_calibration.observed_path``
+    first (columns: ``gateway_name``, ``observed_aadt``).  If not found,
+    falls back to CSD values from the screenlines YAML, using a hardcoded
+    screenline-name -> gateway-name mapping.
+    """
+    gw_cfg = _get(cfg, ["calibration", "gateway_calibration"], {}) or {}
+    obs_path = Path(gw_cfg.get("observed_path", "data/cache/gateway_counts_2025.parquet"))
+
+    if obs_path.exists():
+        try:
+            df = pd.read_parquet(obs_path)
+            if "gateway_name" in df.columns and "observed_aadt" in df.columns:
+                return {
+                    str(r["gateway_name"]).strip(): float(r["observed_aadt"])
+                    for _, r in df.iterrows()
+                    if float(r["observed_aadt"]) > 0
+                }
+        except Exception:
+            pass
+
+    from sim.screenlines import load_screenlines
+    sl_path = str(_get(cfg, ["calibration", "screenlines_path"], "config/screenlines.yaml"))
+    screenlines = load_screenlines(sl_path)
+
+    result: Dict[str, float] = {}
+    for sl in screenlines:
+        gw = _SCREENLINE_TO_GATEWAY.get(sl.name)
+        aadt = getattr(sl, "observed_aadt_cars", None)
+        if gw and aadt and float(aadt) > 0:
+            result[gw] = float(aadt)
+
+    return result
+
+
+def _apply_gateway_calibration(
+    demand: np.ndarray,
+    gateway_zone_map: Dict[str, np.ndarray],
+    gateway_observed: Dict[str, float],
+    gateway_modeled: Dict[str, float],
+    *,
+    damping: float = 0.08,
+    min_factor: float = 0.90,
+    max_factor: float = 1.10,
+    seed_lower: Optional[np.ndarray] = None,
+    seed_upper: Optional[np.ndarray] = None,
+) -> List[str]:
+    """Scale OD rows/columns for each gateway's external zones toward observed AADT.
+
+    For each gateway with both observed and modeled totals, compute
+    ``factor = 1 + damping * (obs/mod - 1)`` clipped to ``[min_factor, max_factor]``
+    and multiply all OD cells where either origin or destination belongs
+    to that gateway's external zones.
+
+    Returns a list of log strings describing corrections applied.
+    """
+    corrections: List[str] = []
+    n = demand.shape[0]
+
+    for gw_name, ext_indices in gateway_zone_map.items():
+        obs = gateway_observed.get(gw_name, 0.0)
+        mod = gateway_modeled.get(gw_name, 0.0)
+        if obs <= 0 or mod <= 0:
+            continue
+
+        ratio = obs / mod
+        if ratio > 10.0 or ratio < 0.1:
+            continue
+
+        factor = 1.0 + damping * (ratio - 1.0)
+        factor = float(np.clip(factor, min_factor, max_factor))
+
+        if abs(factor - 1.0) < 0.001:
+            continue
+
+        mask = np.zeros(n, dtype=bool)
+        mask[ext_indices] = True
+
+        demand[mask, :] *= factor
+        demand[:, mask] *= factor
+        # Undo double-scaling of ext-ext cells within same gateway
+        demand[np.ix_(mask, mask)] /= factor
+
+        if seed_lower is not None and seed_upper is not None:
+            rows_to_clip = np.where(mask)[0]
+            for ri in rows_to_clip:
+                np.clip(demand[ri, :], seed_lower[ri, :], seed_upper[ri, :], out=demand[ri, :])
+                np.clip(demand[:, ri], seed_lower[:, ri], seed_upper[:, ri], out=demand[:, ri])
+
+        corrections.append(f"{gw_name}: obs={obs:,.0f} mod={mod:,.0f} "
+                           f"ratio={ratio:.2f} factor={factor:.4f}")
+
+    return corrections
+
+
+def _compute_gateway_modeled_volumes(
+    vol_df: pd.DataFrame,
+    screenlines: list,
+    vol_col: str,
+) -> Dict[str, float]:
+    """Sum modeled volume on each screenline and map to gateway names."""
+    from sim.screenlines import evaluate_all_screenlines
+
+    result: Dict[str, float] = {}
+    if not screenlines or not vol_col:
+        return result
+
+    for sl in screenlines:
+        gw = _SCREENLINE_TO_GATEWAY.get(sl.name)
+        if not gw or not sl.links:
+            continue
+
+        total = 0.0
+        for link_id, direction in sl.links:
+            row = vol_df[vol_df["link_id"] == link_id]
+            if row.empty:
+                continue
+            vol = float(row[vol_col].iloc[0]) if vol_col in row.columns else 0.0
+            total += vol
+        result[gw] = total
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Observed data loaders
 # ---------------------------------------------------------------------------
@@ -71,7 +274,7 @@ def load_pentlogram(cfg: Dict[str, Any]) -> gpd.GeoDataFrame:
     out_epsg = int(_get(
         cfg,
         ["datasets", "sources", "calibration_brno_pentlogram_2024", "output", "out_epsg"],
-        5514,
+        get_metric_epsg(cfg),
     ))
 
     # Robust CRS handling: detect GeoJSON files with metric coordinates
@@ -107,18 +310,21 @@ def load_pentlogram(cfg: Dict[str, Any]) -> gpd.GeoDataFrame:
         if col in gdf.columns:
             gdf[col] = pd.to_numeric(gdf[col], errors="coerce").fillna(0)
 
-    # Pentlogram data from data.Brno: values are "v tisicich" (in thousands)
-    # per 24h. Multiplier is configurable in case a different layer uses
-    # different units (hundreds, absolute, etc.).
+    # Pentlogram data from data.Brno:
+    #   car_24  = total motor vehicles in thousands per 24h (ALL vehicles, not cars-only)
+    #   truc_24 = percentage of trucks/buses (0-100), NOT absolute count
+    # observed_car is named for backward compat but equals total motor vehicles.
     units_cfg = _get(cfg, [
         "datasets", "sources", "calibration_brno_pentlogram_2024", "units",
     ], {}) or {}
     car_mult = float(units_cfg.get("car_24_multiplier", 1000))
-    truc_mult = float(units_cfg.get("truc_24_multiplier", 1000))
 
-    gdf["observed_car"] = gdf.get("car_24", 0) * car_mult
-    gdf["observed_truck"] = gdf.get("truc_24", 0) * truc_mult
-    gdf["observed_total"] = gdf["observed_car"] + gdf["observed_truck"]
+    total_vehicles = gdf.get("car_24", 0) * car_mult
+    truck_pct = gdf.get("truc_24", 0).clip(0, 100)
+
+    gdf["observed_car"] = total_vehicles
+    gdf["observed_truck"] = total_vehicles * truck_pct / 100.0
+    gdf["observed_total"] = total_vehicles
 
     # Sanity check: warn if observed values are outside plausible range
     nz = gdf[gdf["observed_car"] > 0]["observed_car"]
@@ -135,7 +341,82 @@ def load_pentlogram(cfg: Dict[str, Any]) -> gpd.GeoDataFrame:
             print(f"  Pentlogram observed_car: median={p50:,.0f} max={p_max:,.0f} "
                   f"(multiplier={car_mult})")
 
-    return gdf[gdf["observed_total"] > 0].copy()
+    gdf = gdf[gdf["observed_total"] > 0].copy()
+
+    # Spatial consistency check: flag segments whose value is drastically
+    # lower than bearing-aligned neighbors (service roads / ramps running
+    # parallel to a major road).  These cause mis-matches when a 9k ramp
+    # segment gets assigned to a 26k trunk model link.
+    gdf = _flag_neighbor_outliers(gdf, metric_epsg=out_epsg)
+
+    return gdf
+
+
+def _flag_neighbor_outliers(
+    gdf: gpd.GeoDataFrame,
+    *,
+    metric_epsg: int = 5514,
+    search_radius_m: float = 100.0,
+    bearing_tol: float = 30.0,
+    min_neighbors: int = 2,
+    low_ratio: float = 0.30,
+) -> gpd.GeoDataFrame:
+    """Drop pentlogram segments inconsistent with bearing-aligned neighbors.
+
+    A segment is dropped when its ``observed_car`` is below *low_ratio*
+    of the median of nearby segments running in the same (or opposite)
+    direction.  These are typically service roads / ramps measured
+    separately but spatially overlapping with a major road.
+    """
+    work = gdf.to_crs(epsg=metric_epsg) if gdf.crs and gdf.crs.to_epsg() != metric_epsg else gdf
+
+    bearings = np.array([_bearing_from_geom(g) for g in work.geometry], dtype=object)
+    centroids = work.geometry.centroid
+    obs = gdf["observed_car"].values.astype(float)
+
+    drop_mask = np.zeros(len(gdf), dtype=bool)
+
+    has_sindex = hasattr(work, "sindex")
+
+    for i in range(len(work)):
+        b = bearings[i]
+        if b is None or obs[i] <= 0:
+            continue
+        pt = centroids.iloc[i]
+        if pt is None or pt.is_empty:
+            continue
+
+        if has_sindex:
+            buf = pt.buffer(search_radius_m)
+            cand_idxs = list(work.sindex.query(buf, predicate="intersects"))
+        else:
+            continue
+
+        neighbor_vals = []
+        for ci in cand_idxs:
+            if ci == i:
+                continue
+            nb = bearings[ci]
+            if nb is None:
+                continue
+            bdiff = _bearing_diff(b, nb)
+            if bdiff > bearing_tol and abs(bdiff - 180) > bearing_tol:
+                continue
+            if obs[ci] > 0:
+                neighbor_vals.append(obs[ci])
+
+        if len(neighbor_vals) < min_neighbors:
+            continue
+
+        med = float(np.median(neighbor_vals))
+        if med > 0 and obs[i] / med < low_ratio:
+            drop_mask[i] = True
+
+    n_dropped = int(drop_mask.sum())
+    if n_dropped > 0:
+        print(f"  Pentlogram validation: dropped {n_dropped} segments "
+              f"inconsistent with neighbors (ratio < {low_ratio})")
+    return gdf[~drop_mask].copy()
 
 
 def validate_geometries_or_fail(
@@ -194,11 +475,11 @@ def validate_geometries_or_fail(
         )
 
 
-def load_csd2020(cfg: Dict[str, Any], region_code: str = "CZ064") -> pd.DataFrame:
+def load_csd(cfg: Dict[str, Any], region_code: str = "CZ064") -> pd.DataFrame:
     cache_dir = Path(_get(cfg, ["datasets", "cache_dir"], "data/cache"))
     parquet_path = cache_dir / "v2_csd2025.parquet"
     if not parquet_path.exists():
-        raise FileNotFoundError(f"CSD2020 parquet not found: {parquet_path}")
+        raise FileNotFoundError(f"CSD parquet not found: {parquet_path}")
 
     df = pd.read_parquet(parquet_path)
     if "kk" in df.columns:
@@ -249,12 +530,17 @@ def _aggregate_corridor_volumes(
     buffer_m: float,
     bearing_tol: float = 30.0,
 ) -> gpd.GeoDataFrame:
-    """Sum volumes from parallel corridor links for bidirectional count stations.
+    """Sum volumes from the single best opposing carriageway for one-way links.
 
-    Restrictions to prevent accidental aggregation of ramps/frontage roads:
-    - Only links with the same ``link_type`` as the matched link are included
-    - Spatial index is used for efficient candidate search
-    - Bearing tolerance filters out perpendicular links
+    For one-way (``direction != 0``) links the pentlogram count is
+    bidirectional, so we need the volume from exactly **one** opposing
+    carriageway link to reconstruct the full cross-section.  Candidates
+    are scored by: same road ``name`` (strong bonus), opposite bearing
+    (within *bearing_tol* of 180°), and proximity.  Only the **single
+    best** candidate is added (max 2 links total).
+
+    Bidirectional links (``direction == 0``) already carry AB+BA and are
+    left untouched.
     """
     vol_cols = [c for c in joined.columns if c.endswith("_tot")]
     if not vol_cols or "link_id" not in joined.columns:
@@ -268,6 +554,12 @@ def _aggregate_corridor_volumes(
     link_lt = links["link_type"].astype(str).values if "link_type" in links.columns else np.array([])
     link_vol = links[vc].values if vc in links.columns else np.zeros(len(links))
     link_bearing = np.array([_bearing_from_geom(g) for g in links.geometry], dtype=object)
+    link_dir = links["direction"].values if "direction" in links.columns else np.zeros(len(links))
+    link_name = (
+        links["name"].fillna("").astype(str).values
+        if "name" in links.columns
+        else np.array([""] * len(links))
+    )
 
     has_sindex = hasattr(links, "sindex")
 
@@ -281,9 +573,17 @@ def _aggregate_corridor_volumes(
         matched_idx_in_links = np.where(link_lid == matched_lid)[0]
         if len(matched_idx_in_links) == 0:
             continue
-        mb = link_bearing[matched_idx_in_links[0]]
+
+        mi = matched_idx_in_links[0]
+        matched_direction = int(link_dir[mi])
+
+        if matched_direction == 0:
+            continue
+
+        mb = link_bearing[mi]
         if mb is None:
             continue
+        matched_name = str(link_name[mi])
 
         if has_sindex:
             buf_geom = count_pt.buffer(buffer_m)
@@ -291,8 +591,8 @@ def _aggregate_corridor_volumes(
         else:
             cand_idxs = range(len(links))
 
-        corridor_vol = float(row.get(vc, 0) or 0)
-        n_links = 1
+        best_score = -1.0
+        best_vol = 0.0
 
         for ci in cand_idxs:
             lid = int(link_lid[ci])
@@ -304,18 +604,36 @@ def _aggregate_corridor_volumes(
             lb = link_bearing[ci]
             if lb is None:
                 continue
-            if _bearing_diff(mb, lb) > bearing_tol:
+
+            bdiff = _bearing_diff(mb, lb)
+            if abs(bdiff - 180) > bearing_tol:
                 continue
+
             if not has_sindex:
                 dist = count_pt.distance(links.geometry.iloc[ci])
                 if dist > buffer_m:
                     continue
+                dist_score = 1.0 - min(dist / buffer_m, 1.0)
+            else:
+                d = count_pt.distance(links.geometry.iloc[ci])
+                dist_score = 1.0 - min(d / buffer_m, 1.0)
 
-            corridor_vol += float(link_vol[ci])
-            n_links += 1
+            bearing_score = 1.0 - abs(bdiff - 180) / bearing_tol
 
-        joined.at[idx, "_corridor_volume"] = corridor_vol
-        joined.at[idx, "_corridor_n_links"] = n_links
+            name_score = 0.0
+            cand_name = str(link_name[ci])
+            if matched_name and cand_name and matched_name == cand_name:
+                name_score = 1.0
+
+            score = 0.30 * dist_score + 0.30 * bearing_score + 0.40 * name_score
+            if score > best_score:
+                best_score = score
+                best_vol = float(link_vol[ci])
+
+        if best_score >= 0:
+            base_vol = float(row.get(vc, 0) or 0)
+            joined.at[idx, "_corridor_volume"] = base_vol + best_vol
+            joined.at[idx, "_corridor_n_links"] = 2
 
     return joined
 
@@ -324,22 +642,8 @@ _NON_CAR_LINK_TYPES = frozenset({
     "footway", "path", "track", "steps", "cycleway", "pedestrian",
     "corridor", "bridleway", "proposed", "construction", "elevator",
     "service", "rest_area", "services", "traffic_mirror", "virtual",
-    "crossing", "busway",
+    "crossing", "busway", "centroid_connector",
 })
-
-
-def _links_for_csd_coarse_class_stats(links_gdf: gpd.GeoDataFrame, vol_col: str) -> gpd.GeoDataFrame:
-    """Car road links only; drop centroid connectors; volumes NaN → 0 for class means."""
-    out = links_gdf
-    if "link_type" in out.columns:
-        lt = out["link_type"].astype(str)
-        mask = (lt != "centroid_connector") & (~lt.isin(_NON_CAR_LINK_TYPES))
-        out = out.loc[mask].copy()
-    else:
-        out = out.copy()
-    if vol_col in out.columns:
-        out[vol_col] = pd.to_numeric(out[vol_col], errors="coerce").fillna(0.0)
-    return out
 
 
 def match_counts_to_links(
@@ -352,6 +656,7 @@ def match_counts_to_links(
     direction_aware: bool = True,
     conflict_resolution: str = "nearest",
     aggregate_corridor: bool = True,
+    vol_col: Optional[str] = None,
 ) -> gpd.GeoDataFrame:
     """Spatial-join observed count points/lines to nearest network links.
 
@@ -386,9 +691,9 @@ def match_counts_to_links(
     pts = pts[valid_cent].copy()
     pts["geometry"] = centroids[valid_cent]
 
-    keep = ["link_id", "link_type", "name", "geometry"] + [
+    keep = ["link_id", "link_type", "name", "osm_ref", "geometry"] + [
         c for c in links.columns
-        if c not in ("link_id", "link_type", "name", "geometry", "ogc_fid")
+        if c not in ("link_id", "link_type", "name", "osm_ref", "geometry", "ogc_fid")
         and links[c].dtype in ("float64", "float32", "int64")
     ]
     keep = [c for c in keep if c in links.columns]
@@ -396,23 +701,89 @@ def match_counts_to_links(
     links_sel = links[keep].copy()
     links_sel["_link_bearing"] = links_sel.geometry.apply(_bearing_from_geom)
 
-    joined = gpd.sjoin_nearest(
-        pts, links_sel, how="left", max_distance=buffer_m, distance_col="_dist",
-    )
+    # --- Multi-candidate matching with composite scoring ---
+    # For each count point, evaluate ALL candidate links within buffer_m and
+    # pick the best by a weighted composite of distance, bearing, and road
+    # class.  This replaces sjoin_nearest + bearing re-match, preventing
+    # mis-matches to ramps when a mainline link is nearby.
+    _ROAD_CLASS_W: Dict[str, float] = {
+        "motorway": 1.0, "trunk": 0.875, "motorway_link": 0.875,
+        "trunk_link": 0.75, "primary": 0.5, "primary_link": 0.44,
+        "secondary": 0.25, "secondary_link": 0.225, "tertiary": 0.15,
+        "tertiary_link": 0.125, "unclassified": 0.09, "road": 0.09,
+        "residential": 0.05, "service": 0.025, "living_street": 0.006,
+    }
+    link_cols_to_copy = [c for c in links_sel.columns if c not in ("geometry", "_link_bearing")]
 
-    if direction_aware:
-        has_both = joined["_count_bearing"].notna() & joined["_link_bearing"].notna()
-        joined["_bearing_diff"] = np.nan
-        if has_both.any():
-            joined.loc[has_both, "_bearing_diff"] = joined.loc[has_both].apply(
-                lambda r: _bearing_diff(r["_count_bearing"], r["_link_bearing"]), axis=1,
-            )
-        bearing_penalty = joined["_bearing_diff"].fillna(0) / 180.0
-        dist_norm = joined["_dist"].fillna(buffer_m) / max(buffer_m, 1.0)
-        joined["_match_quality"] = 1.0 - 0.6 * dist_norm - 0.4 * bearing_penalty
-    else:
-        joined["_bearing_diff"] = np.nan
-        joined["_match_quality"] = 1.0 - joined["_dist"].fillna(buffer_m) / max(buffer_m, 1.0)
+    records: list = []
+    for _, pt_row in pts.iterrows():
+        pt = pt_row.geometry
+        base: dict = {c: pt_row[c] for c in pts.columns if c != "geometry"}
+        base["geometry"] = pt
+
+        if pt is None or pt.is_empty:
+            base.update({"_dist": np.nan, "_bearing_diff": np.nan, "_match_quality": 0.0})
+            records.append(base)
+            continue
+
+        cb = pt_row.get("_count_bearing")
+        cand_idxs = list(links_sel.sindex.query(pt.buffer(buffer_m), predicate="intersects"))
+
+        best_q = -1.0
+        best_data: Optional[dict] = None
+        for ci in cand_idxs:
+            cand = links_sel.iloc[ci]
+            d = float(pt.distance(cand.geometry))
+            if d > buffer_m:
+                continue
+
+            bd = 0.0
+            if direction_aware:
+                lb = cand.get("_link_bearing")
+                if cb is not None and lb is not None:
+                    try:
+                        if not np.isnan(float(cb)) and not np.isnan(float(lb)):
+                            bd = _bearing_diff(float(cb), float(lb))
+                    except (TypeError, ValueError):
+                        pass
+
+            lt = str(cand.get("link_type", ""))
+            rw = _ROAD_CLASS_W.get(lt, 0.06)
+            dn = d / max(buffer_m, 1.0)
+            bp = bd / 180.0
+
+            vb = 0.0
+            if vol_col and vol_col in cand.index:
+                try:
+                    v = float(cand[vol_col])
+                    if v > 0:
+                        vb = 1.0
+                        obs_v = float(pt_row.get("observed_car", 0))
+                        if obs_v > 0:
+                            ratio = min(obs_v, v) / max(obs_v, v)
+                            if ratio < 0.15:
+                                vb = 0.1
+                            elif ratio < 0.30:
+                                vb = 0.4
+                except (TypeError, ValueError):
+                    pass
+
+            q = 0.30 * (1.0 - dn) + 0.30 * (1.0 - bp) + 0.20 * rw + 0.20 * vb
+
+            if q > best_q:
+                best_q = q
+                best_data = {c: cand[c] for c in link_cols_to_copy if c in cand.index}
+                best_data["_dist"] = d
+                best_data["_bearing_diff"] = bd
+                best_data["_match_quality"] = q
+
+        if best_data is not None:
+            base.update(best_data)
+        else:
+            base.update({"_dist": np.nan, "_bearing_diff": np.nan, "_match_quality": 0.0})
+        records.append(base)
+
+    joined = gpd.GeoDataFrame(records, crs=pts.crs)
 
     # De-duplicate counts: keep best match per count station
     if id_col in joined.columns:
@@ -427,16 +798,98 @@ def match_counts_to_links(
         n_conflicts = int(conflicts.sum() - len(conflicts))
 
         if n_conflicts > 0 and conflict_resolution == "nearest":
-            joined = joined.sort_values("_dist")
-            joined = joined.drop_duplicates(subset=["link_id"], keep="first")
+            obs_col_for_sort = "observed_car" if "observed_car" in joined.columns else None
+            _MAJOR_TYPES = {"trunk", "trunk_link", "motorway", "motorway_link", "primary", "primary_link"}
+            is_major = (
+                joined["link_type"].astype(str).isin(_MAJOR_TYPES)
+                if "link_type" in joined.columns
+                else pd.Series(False, index=joined.index)
+            )
+
+            if obs_col_for_sort and is_major.any():
+                major = joined[is_major].sort_values(obs_col_for_sort, ascending=False)
+                major = major.drop_duplicates(subset=["link_id"], keep="first")
+                minor = joined[~is_major].sort_values("_dist")
+                minor = minor.drop_duplicates(subset=["link_id"], keep="first")
+                joined = pd.concat([major, minor], ignore_index=True)
+                joined = joined.drop_duplicates(subset=["link_id"], keep="first")
+            else:
+                joined = joined.sort_values("_dist")
+                joined = joined.drop_duplicates(subset=["link_id"], keep="first")
     else:
         joined["_link_conflict"] = False
 
     joined["_matched"] = joined["link_id"].notna() if "link_id" in joined.columns else False
 
+    # Flag structurally unreliable matches: very low modeled volume relative
+    # to a high observed count — almost always a wrong-link match (e.g. ramp
+    # or parallel residential road instead of the actual measured carriageway).
+    joined["_excluded"] = False
+    if vol_col and vol_col in joined.columns:
+        obs_cols = [c for c in joined.columns if c.startswith("observed")]
+        if obs_cols:
+            obs_max = joined[obs_cols].max(axis=1).fillna(0)
+            vol_vals = pd.to_numeric(joined[vol_col], errors="coerce").fillna(0)
+            bad_zero = (vol_vals <= 0) & (obs_max >= 5000)
+            bad_ratio = (obs_max >= 2000) & (vol_vals < obs_max * 0.01)
+            bad = bad_zero | bad_ratio
+            n_excluded = int(bad.sum())
+            if n_excluded > 0:
+                joined.loc[bad, "_excluded"] = True
+                print(f"  Matching: excluded {n_excluded} zero-volume links with high observed counts")
+
+        # Reverse mismatch: observed is far below modeled on major roads.
+        # E.g. a 9k pentlogram segment from a road below a bridge matched
+        # to a 62k trunk link above — clearly a spatial mis-match.
+        if "link_type" in joined.columns:
+            _MAJOR_EX = {"trunk", "trunk_link", "motorway", "motorway_link"}
+            is_major = joined["link_type"].astype(str).isin(_MAJOR_EX)
+            obs_car = pd.to_numeric(
+                joined["observed_car"] if "observed_car" in joined.columns else 0,
+                errors="coerce",
+            ).fillna(0)
+            extreme_low = (
+                is_major
+                & (vol_vals > 15000)
+                & (obs_car > 0)
+                & (obs_car / vol_vals.clip(lower=1) < 0.25)
+            )
+            n_extreme = int(extreme_low.sum())
+            if n_extreme > 0:
+                joined.loc[extreme_low, "_excluded"] = True
+                print(f"  Matching: excluded {n_extreme} major-road matches "
+                      f"with obs/model ratio < 0.25")
+
     # Corridor aggregation: sum volumes from parallel links (divided highways)
     if aggregate_corridor:
         joined = _aggregate_corridor_volumes(joined, links_sel, buffer_m)
+
+    # Post-aggregation exclusion: compare observed against the final
+    # corridor volume (which sums both carriageways for one-way links).
+    # This catches cases like a 9k service road segment matched to a
+    # 62k trunk corridor — the pre-aggregation check only sees ~31k
+    # per direction and misses the mismatch.
+    corr_col = "_corridor_volume" if "_corridor_volume" in joined.columns else None
+    if corr_col and "link_type" in joined.columns:
+        _MAJOR_POST = {"trunk", "trunk_link", "motorway", "motorway_link"}
+        is_major_p = joined["link_type"].astype(str).isin(_MAJOR_POST)
+        obs_car_p = pd.to_numeric(
+            joined["observed_car"] if "observed_car" in joined.columns else 0,
+            errors="coerce",
+        ).fillna(0)
+        corr_vals = pd.to_numeric(joined[corr_col], errors="coerce").fillna(0)
+        extreme_corr = (
+            is_major_p
+            & ~joined["_excluded"]
+            & (corr_vals > 15000)
+            & (obs_car_p > 0)
+            & (obs_car_p / corr_vals.clip(lower=1) < 0.25)
+        )
+        n_ext = int(extreme_corr.sum())
+        if n_ext > 0:
+            joined.loc[extreme_corr, "_excluded"] = True
+            print(f"  Matching: excluded {n_ext} major-road matches "
+                  f"with obs/corridor ratio < 0.25")
 
     for col in ("_count_bearing", "_link_bearing"):
         if col in joined.columns:
@@ -473,10 +926,10 @@ def _export_matching_diagnostics(
     output_dir: Path,
 ) -> None:
     """Export per-count matching diagnostics to CSV for external audit."""
-    diag_cols = ["objectid", "link_id", "link_type", "name"]
+    diag_cols = ["objectid", "link_id", "link_type", "name", "osm_ref"]
     for c in [obs_col, "observed_car", "observed_truck", "observed_total",
               "_dist", "_bearing_diff", "_match_quality",
-              "_corridor_volume", "_corridor_n_links", "_matched"]:
+              "_corridor_volume", "_corridor_n_links", "_matched", "_excluded"]:
         if c not in diag_cols:
             diag_cols.append(c)
     if model_col and model_col not in diag_cols:
@@ -487,11 +940,7 @@ def _export_matching_diagnostics(
 
     m_arr = diag[model_col].values.astype(float) if model_col and model_col in diag.columns else np.zeros(len(diag))
     o_arr = diag[obs_col].values.astype(float) if obs_col in diag.columns else np.zeros(len(diag))
-    denom = m_arr + o_arr
-    mask = denom > 0
-    geh = np.full(len(diag), np.nan)
-    geh[mask] = np.sqrt(2.0 * (m_arr[mask] - o_arr[mask]) ** 2 / denom[mask])
-    diag["GEH"] = geh
+    diag["GEH"] = compute_geh(m_arr, o_arr)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / "matching_diagnostics.csv"
@@ -503,16 +952,22 @@ def _export_matching_diagnostics(
 # Statistics: GEH, R², RMSE
 # ---------------------------------------------------------------------------
 
-def compute_geh(modeled: np.ndarray, observed: np.ndarray) -> np.ndarray:
-    m, c = np.asarray(modeled, dtype=float), np.asarray(observed, dtype=float)
-    denom = m + c
-    mask = denom > 0
-    geh = np.full_like(m, np.nan)
-    geh[mask] = np.sqrt(2.0 * (m[mask] - c[mask]) ** 2 / denom[mask])
-    return geh
+from sim._metrics import compute_geh  # noqa: E402 — re-exported for backward compat
 
 
-def compute_stats(modeled: np.ndarray, observed: np.ndarray) -> Dict[str, Any]:
+def compute_stats(
+    modeled: np.ndarray,
+    observed: np.ndarray,
+    *,
+    daily_capacity_factor: float = 1.0,
+) -> Dict[str, Any]:
+    """Compute link-level fit statistics.
+
+    When *daily_capacity_factor* > 1 the model operates on daily aggregates;
+    an adjusted GEH threshold (``5 * sqrt(K)``) is used alongside the
+    standard hourly GEH<5 so that daily-model convergence criteria are
+    meaningful (per FHWA/DMRB, GEH<5 targets apply to hourly flows).
+    """
     m = np.asarray(modeled, dtype=float)
     c = np.asarray(observed, dtype=float)
     valid = np.isfinite(m) & np.isfinite(c) & (c > 0)
@@ -530,17 +985,46 @@ def compute_stats(modeled: np.ndarray, observed: np.ndarray) -> Dict[str, Any]:
     ss_tot = float(np.sum((c - np.mean(c)) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
 
+    # OLS regression slope / intercept  (model = slope * observed + intercept)
+    if n >= 2:
+        coeffs = np.polyfit(c, m, 1)
+        slope = float(coeffs[0])
+        intercept = float(coeffs[1])
+    else:
+        slope = float("nan")
+        intercept = float("nan")
+
+    # MAPE: mean(|M-O|/O) * 100 — only for positive observed
+    mape = float(np.mean(np.abs(m - c) / c) * 100.0)
+
+    # Overall volume bias
+    sum_m, sum_c = float(m.sum()), float(c.sum())
+    bias_pct = (sum_m - sum_c) / sum_c * 100.0 if sum_c > 0 else float("nan")
+
+    # Daily-adjusted GEH threshold: GEH scales as ~sqrt(K) on daily
+    # volumes relative to hourly, so the "GEH<5" criterion becomes
+    # "GEH < 5*sqrt(K)" for an equivalent daily acceptance band.
+    k = max(daily_capacity_factor, 1.0)
+    daily_geh_thr = 5.0 * math.sqrt(k)
+    daily_geh_lt_adj_pct = float(np.nanmean(geh < daily_geh_thr) * 100.0)
+
     return {
         "n": int(n),
         "r2": round(r2, 4) if np.isfinite(r2) else None,
+        "slope": round(slope, 4) if np.isfinite(slope) else None,
+        "intercept": round(intercept, 1) if np.isfinite(intercept) else None,
         "rmse": round(rmse, 1),
         "pct_rmse": round(pct_rmse, 1) if np.isfinite(pct_rmse) else None,
+        "mape_pct": round(mape, 1) if np.isfinite(mape) else None,
+        "bias_pct": round(bias_pct, 2) if np.isfinite(bias_pct) else None,
         "geh_mean": round(float(np.nanmean(geh)), 2),
         "geh_median": round(float(np.nanmedian(geh)), 2),
         "geh_lt5_pct": round(float(np.nanmean(geh < 5) * 100), 1),
         "geh_lt10_pct": round(float(np.nanmean(geh < 10) * 100), 1),
-        "sum_modeled": round(float(m.sum()), 0),
-        "sum_observed": round(float(c.sum()), 0),
+        "daily_geh_threshold": round(daily_geh_thr, 1),
+        "daily_geh_lt_adj_pct": round(daily_geh_lt_adj_pct, 1),
+        "sum_modeled": round(sum_m, 0),
+        "sum_observed": round(sum_c, 0),
     }
 
 
@@ -623,409 +1107,63 @@ def compute_extended_link_metrics(
     }
 
 
-# ---------------------------------------------------------------------------
-# OD matrix scaling (FSM calibration step)
-# ---------------------------------------------------------------------------
-
-def _compute_global_factor(
-    matched: pd.DataFrame,
-    vol_col: str,
-    *,
-    damping: float,
-    min_factor: float,
-    max_factor: float,
-    obs_col: str = "observed_total",
-) -> float:
-    """Single factor = sum(observed) / sum(modeled), with damping."""
-    m = matched[vol_col].values.astype(float)
-    c = matched[obs_col].values.astype(float)
-    mask = (m > 0) & (c > 0)
-    if mask.sum() == 0:
-        return 1.0
-    raw = float(c[mask].sum() / m[mask].sum())
-    return float(np.clip(1.0 + damping * (raw - 1.0), min_factor, max_factor))
-
-
-def _compute_sector_factors(
-    matched: pd.DataFrame,
-    vol_col: str,
-    *,
-    damping: float,
-    min_factor: float,
-    max_factor: float,
-    obs_col: str = "observed_total",
-) -> Dict[str, float]:
-    """Per-road-class factor = weighted-mean(observed / modeled) within class."""
-    factors: Dict[str, float] = {}
-    for lt in matched["link_type"].dropna().unique():
-        sub = matched[matched["link_type"] == lt]
-        m = sub[vol_col].values.astype(float)
-        c = sub[obs_col].values.astype(float)
-        mask = (m > 0) & (c > 0)
-        if mask.sum() < 3:
-            continue
-        raw = float(np.average(c[mask] / m[mask], weights=c[mask]))
-        factors[str(lt)] = float(np.clip(1.0 + damping * (raw - 1.0), min_factor, max_factor))
-    return factors
-
-
-def _estimate_data_driven_scaling_params(
-    valid: pd.DataFrame,
-    vol_col: str,
-    *,
-    obs_col: str,
-    default_damping: float,
-    default_min_factor: float,
-    default_max_factor: float,
-    enable: bool,
-    policy: Optional[Dict[str, Any]] = None,
-) -> Tuple[float, float, float]:
-    """Estimate damping and bounds from observed/model ratio distribution."""
-    if not enable or valid.empty:
-        return default_damping, default_min_factor, default_max_factor
-    try:
-        m = pd.to_numeric(valid[vol_col], errors="coerce").to_numpy(dtype=float)
-        o = pd.to_numeric(valid[obs_col], errors="coerce").to_numpy(dtype=float)
-        pol = policy or {}
-        min_pairs = int(pol.get("min_valid_pairs", 20))
-        q = pol.get("ratio_quantiles") or {}
-        q_low = float(q.get("low", 0.10))
-        q_mid = float(q.get("mid", 0.50))
-        q_high = float(q.get("high", 0.90))
-        clip = pol.get("clip_bounds") or {}
-        min_lo = float(clip.get("min_factor_low", 0.60))
-        min_hi = float(clip.get("min_factor_high", 0.98))
-        max_lo = float(clip.get("max_factor_low", 1.02))
-        max_hi = float(clip.get("max_factor_high", 1.80))
-        dpol = pol.get("damping_formula") or {}
-        d_base = float(dpol.get("base", 0.08))
-        d_gain = float(dpol.get("gain", 0.20))
-        d_min = float(dpol.get("min", 0.05))
-        d_max = float(dpol.get("max", 0.35))
-        blend = float(pol.get("blend_with_defaults", 0.50))
-        blend = float(np.clip(blend, 0.0, 1.0))
-
-        mask = (m > 1e-9) & (o > 1e-9) & np.isfinite(m) & np.isfinite(o)
-        if int(mask.sum()) < min_pairs:
-            return default_damping, default_min_factor, default_max_factor
-        ratios = o[mask] / m[mask]
-        q10, q50, q90 = np.quantile(ratios, [q_low, q_mid, q_high])
-        spread = max(float(q90 - q10), 1e-6)
-        min_f = float(np.clip(q10, min_lo, min_hi))
-        max_f = float(np.clip(q90, max_lo, max_hi))
-        if max_f <= min_f:
-            max_f = min_f + 0.05
-        # Smaller spread -> higher confidence -> slightly higher damping.
-        damp = float(np.clip(d_base + d_gain / (1.0 + spread), d_min, d_max))
-        # Blend with configured defaults so behavior remains predictable.
-        return (
-            blend * default_damping + (1.0 - blend) * damp,
-            blend * default_min_factor + (1.0 - blend) * min_f,
-            blend * default_max_factor + (1.0 - blend) * max_f,
-        )
-    except Exception:
-        return default_damping, default_min_factor, default_max_factor
-
-
-def scale_matrix(
-    mat: AequilibraeMatrix,
-    core_name: str,
-    factor: float | Dict[str, float],
-    weights: Dict[str, float] | None = None,
-) -> None:
-    """Scale the matrix core in-place.
-
-    *factor* is either a single float (global) or a dict of per-sector
-    floats.  For the dict case, a weighted average is computed using
-    *weights* (typically total observed volume per sector).
-    """
-    if isinstance(factor, dict):
-        if not factor:
-            return
-        if weights:
-            total_w = sum(weights.get(k, 1.0) for k in factor)
-            avg = sum(f * weights.get(k, 1.0) for k, f in factor.items()) / max(total_w, 1e-9)
-        else:
-            avg = float(np.mean(list(factor.values())))
-        mat.matrix[core_name][:, :] *= avg
-    else:
-        mat.matrix[core_name][:, :] *= factor
-
-
-# ---------------------------------------------------------------------------
-# Sector-based OD scaling (geographic zones → sector pairs)
-# ---------------------------------------------------------------------------
-
-def _assign_zone_sectors(
-    project_dir: Path,
-    n_sectors: int = 5,
-    sector_labels: Optional[List[str]] = None,
-) -> Dict[int, str]:
-    """Assign each zone to a geographic sector based on azimuth from network centroid.
-
-    Sectors are angular slices centred on the network's geographic centre.
-    A special 'C' sector captures zones within the inner 20% radius.
-    Returns ``{zone_id: sector_label}``.
-    """
-    zones_path = Path("outputs/baseline/zones/centroids.geojson")
-    if not zones_path.exists():
-        zones_path = Path("outputs/baseline/zones/zones.geojson")
-    if not zones_path.exists():
-        return {}
-
-    gdf = gpd.read_file(zones_path)
-    if gdf.empty or "zone_id" not in gdf.columns:
-        return {}
-
-    if gdf.crs is not None and gdf.crs.to_epsg() != 5514:
-        gdf = gdf.to_crs(epsg=5514)
-
-    pts = gdf.geometry.representative_point() if gdf.geom_type.iloc[0] in ("Polygon", "MultiPolygon") else gdf.geometry
-    cx = float(pts.x.mean())
-    cy = float(pts.y.mean())
-
-    if sector_labels is None:
-        if n_sectors == 4:
-            sector_labels = ["N", "E", "S", "W"]
-        elif n_sectors == 5:
-            sector_labels = ["N", "E", "S", "W", "C"]
-        else:
-            sector_labels = [f"S{i}" for i in range(n_sectors)]
-
-    has_center = "C" in sector_labels
-    n_angular = n_sectors - 1 if has_center else n_sectors
-    sector_size = 360.0 / n_angular if n_angular > 0 else 360.0
-
-    dists = np.sqrt((pts.x - cx) ** 2 + (pts.y - cy) ** 2)
-    r_threshold = float(np.percentile(dists, 20)) if has_center else 0.0
-
-    angular_labels = [s for s in sector_labels if s != "C"]
-    result: Dict[int, str] = {}
-    for i, (_, row) in enumerate(gdf.iterrows()):
-        zid = int(row["zone_id"])
-        pt = pts.iloc[i]
-        d = float(dists.iloc[i])
-        if has_center and d <= r_threshold:
-            result[zid] = "C"
-        else:
-            angle = math.degrees(math.atan2(pt.x - cx, pt.y - cy)) % 360
-            sec_idx = int(angle // sector_size) % n_angular
-            result[zid] = angular_labels[sec_idx]
-    return result
-
-
-def _compute_sector_pair_factors(
-    matched: pd.DataFrame,
-    vol_col: str,
+def compute_class_volume_breakdown(
+    vol_df: pd.DataFrame,
     links_gdf: gpd.GeoDataFrame,
-    zone_sector_map: Dict[int, str],
-    *,
-    damping: float,
-    min_factor: float,
-    max_factor: float,
-    obs_col: str = "observed_total",
-) -> Dict[Tuple[str, str], float]:
-    """Compute correction factors per geographic sector pair.
+) -> Dict[str, Any]:
+    """Per-road-class volume breakdown split by traffic class (local vs through).
 
-    Each matched link is assigned to a sector based on its midpoint location.
-    Links in the same sector contribute to that sector's factor.
-    The factor is then applied to OD pairs whose O and D fall in sectors
-    estimated from the link's geographic position.
+    Joins assignment results with network link_type and groups total assigned
+    volume by coarse road class.  When multi-class columns are present
+    (e.g. ``local_tot``, ``through_tot``), reports each class separately so
+    callers can see how much local vs through traffic uses motorway vs trunk.
     """
-    valid = matched.dropna(subset=[vol_col, obs_col])
-    valid = valid[(valid[vol_col] > 0) & (valid[obs_col] > 0)].copy()
-    if valid.empty:
+    if vol_df.empty:
         return {}
 
-    all_sectors = sorted(set(zone_sector_map.values()))
-    if not all_sectors:
+    merged = vol_df.copy()
+    if "link_type" not in merged.columns and "link_id" in merged.columns:
+        lt_map = links_gdf.set_index("link_id")["link_type"] if "link_type" in links_gdf.columns else None
+        if lt_map is not None:
+            merged["link_type"] = merged["link_id"].map(lt_map)
+
+    if "link_type" not in merged.columns:
         return {}
 
-    if links_gdf.crs is not None and links_gdf.crs.to_epsg() != 5514:
-        links_metric = links_gdf.to_crs(epsg=5514)
-    else:
-        links_metric = links_gdf
-    if valid.crs is not None and valid.crs.to_epsg() != 5514:
-        valid = valid.to_crs(epsg=5514)
+    merged["_road_class"] = merged["link_type"].map(_coarse_road_class)
 
-    # Compute sector for each link midpoint
-    inv_map = {}
-    for zid, sec in zone_sector_map.items():
-        inv_map.setdefault(sec, []).append(zid)
+    tot_cols = [c for c in merged.columns if c.endswith("_tot")]
+    if not tot_cols:
+        return {}
 
-    cx = float(links_metric.geometry.centroid.x.mean())
-    cy = float(links_metric.geometry.centroid.y.mean())
+    breakdown: Dict[str, Any] = {}
+    for col in tot_cols:
+        grp = merged.groupby("_road_class")[col].agg(["sum", "count"])
+        breakdown[col] = {
+            rc: {"total_volume": round(float(row["sum"]), 0), "n_links": int(row["count"])}
+            for rc, row in grp.iterrows()
+        }
 
-    n_angular = len([s for s in all_sectors if s != "C"])
-    has_center = "C" in all_sectors
-    angular_labels = [s for s in all_sectors if s != "C"]
-    sector_size = 360.0 / n_angular if n_angular > 0 else 360.0
-
-    dists_all = np.sqrt((links_metric.geometry.centroid.x - cx) ** 2
-                        + (links_metric.geometry.centroid.y - cy) ** 2)
-    r_threshold = float(np.percentile(dists_all, 20)) if has_center else 0.0
-
-    def _link_sector(geom) -> str:
-        mp = geom.centroid
-        d = math.sqrt((mp.x - cx) ** 2 + (mp.y - cy) ** 2)
-        if has_center and d <= r_threshold:
-            return "C"
-        angle = math.degrees(math.atan2(mp.x - cx, mp.y - cy)) % 360
-        idx = int(angle // sector_size) % n_angular
-        return angular_labels[idx]
-
-    valid["_link_sector"] = valid.geometry.apply(_link_sector)
-
-    # Per-sector factor
-    sector_factor: Dict[str, float] = {}
-    for sec in all_sectors:
-        sub = valid[valid["_link_sector"] == sec]
-        if len(sub) < 2:
-            continue
-        m = sub[vol_col].values.astype(float)
-        c = sub[obs_col].values.astype(float)
-        raw = float(c.sum() / max(m.sum(), 1e-9))
-        sector_factor[sec] = float(np.clip(1.0 + damping * (raw - 1.0), min_factor, max_factor))
-
-    # Build sector-pair factors: for (O_sector, D_sector) use geometric mean
-    # of the two sectors' factors (heuristic until path-based proportions)
-    result: Dict[Tuple[str, str], float] = {}
-    for os in all_sectors:
-        fo = sector_factor.get(os, 1.0)
-        for ds in all_sectors:
-            fd = sector_factor.get(ds, 1.0)
-            result[(os, ds)] = float(np.sqrt(fo * fd))
-    return result
-
-
-def scale_matrix_by_sectors(
-    mat: AequilibraeMatrix,
-    core_name: str,
-    zone_sector_map: Dict[int, str],
-    sector_factors: Dict[Tuple[str, str], float],
-) -> None:
-    """Apply differentiated scaling by origin-destination sector pairs."""
-    idx = list(mat.index)
-    data = mat.matrix[core_name]
-    for i, oz in enumerate(idx):
-        os = zone_sector_map.get(int(oz), "C")
-        for ds_label in set(zone_sector_map.values()):
-            f = sector_factors.get((os, ds_label), 1.0)
-            if abs(f - 1.0) < 1e-6:
+    total_col = tot_cols[0]
+    if len(tot_cols) > 1:
+        for rc in ("motorway", "trunk"):
+            rc_mask = merged["_road_class"] == rc
+            if not rc_mask.any():
                 continue
-            for j, dz in enumerate(idx):
-                if zone_sector_map.get(int(dz), "C") == ds_label:
-                    data[i, j] *= f
+            parts = {col: round(float(merged.loc[rc_mask, col].sum()), 0) for col in tot_cols}
+            total = sum(parts.values())
+            shares = {col: round(v / max(total, 1), 3) for col, v in parts.items()}
+            breakdown.setdefault("_class_shares", {})[rc] = {
+                "volumes": parts, "shares": shares,
+            }
+
+    return breakdown
 
 
-def _do_sector_od_scaling(
-    mat: AequilibraeMatrix,
-    core_name: str,
-    valid: pd.DataFrame,
-    vol_col: str,
-    *,
-    links_gdf: gpd.GeoDataFrame,
-    project_dir: Path,
-    damping: float,
-    min_factor: float,
-    max_factor: float,
-    obs_col: str,
-    sector_cfg: Optional[Dict] = None,
-) -> None:
-    """Orchestrate sector-based OD matrix scaling."""
-    n_sectors = 5
-    sector_labels = None
-    if sector_cfg:
-        n_sectors = int(sector_cfg.get("n_sectors", 5))
-        sector_labels = sector_cfg.get("labels")
-
-    zone_sector_map = _assign_zone_sectors(project_dir, n_sectors=n_sectors,
-                                            sector_labels=sector_labels)
-    if not zone_sector_map:
-        print("  WARNING: could not assign zone sectors — falling back to global")
-        factor = _compute_global_factor(valid, vol_col, damping=damping,
-                                         min_factor=min_factor, max_factor=max_factor,
-                                         obs_col=obs_col)
-        scale_matrix(mat, core_name, factor)
-        return
-
-    sector_factors = _compute_sector_pair_factors(
-        valid, vol_col, links_gdf, zone_sector_map,
-        damping=damping, min_factor=min_factor, max_factor=max_factor,
-        obs_col=obs_col,
-    )
-
-    if not sector_factors:
-        print("  WARNING: no sector factors computed — falling back to global")
-        factor = _compute_global_factor(valid, vol_col, damping=damping,
-                                         min_factor=min_factor, max_factor=max_factor,
-                                         obs_col=obs_col)
-        scale_matrix(mat, core_name, factor)
-        return
-
-    unique_factors = set(round(f, 4) for f in sector_factors.values())
-    print(f"  Sector-OD factors: {len(sector_factors)} pairs, "
-          f"range [{min(sector_factors.values()):.3f}, {max(sector_factors.values()):.3f}], "
-          f"{len(unique_factors)} distinct values")
-
-    scale_matrix_by_sectors(mat, core_name, zone_sector_map, sector_factors)
 
 
 # ---------------------------------------------------------------------------
-# Select-link based OD correction (Spiess-like proportional adjustment)
-# ---------------------------------------------------------------------------
-
-def _apply_select_link_od_correction(
-    mat: AequilibraeMatrix,
-    core_name: str,
-    sl_matrices: Dict[str, np.ndarray],
-    sl_results: Dict[str, Any],
-    damping: float = 0.3,
-    min_factor: float = 0.5,
-    max_factor: float = 2.0,
-) -> Dict[str, float]:
-    """Adjust OD cells proportionally based on select-link screenline errors.
-
-    For each screenline with significant error, scales OD cells that
-    contribute to that screenline, weighted by their select-link proportion.
-    """
-    if not sl_matrices or not sl_results:
-        return {}
-
-    data = mat.matrix[core_name]
-    total_od = data[:, :].copy().astype(np.float64)
-    corrections: Dict[str, float] = {}
-
-    for sl_name, sl_od in sl_matrices.items():
-        sr = sl_results.get(sl_name, {})
-        obs = sr.get("observed_total", 0)
-        mod = sr.get("modeled_total", 0)
-        if obs <= 0 or mod <= 0:
-            continue
-
-        geh = sr.get("geh", 0)
-        if geh is not None and geh < 3.0:
-            continue
-
-        raw_factor = obs / mod
-        f = 1.0 + damping * (raw_factor - 1.0)
-        f = float(np.clip(f, min_factor, max_factor))
-        corrections[sl_name] = round(f, 4)
-
-        proportion = np.zeros_like(total_od)
-        mask = total_od > 0
-        proportion[mask] = sl_od[mask] / total_od[mask]
-        proportion = np.clip(proportion, 0, 1)
-
-        adjustment = 1.0 + (f - 1.0) * proportion
-        adjustment = np.clip(adjustment, min_factor, max_factor)
-        data[:, :] *= adjustment
-
-    return corrections
-
-
-# ---------------------------------------------------------------------------
-# Aggregate CSD2020 helpers (for validation)
+# Aggregate CSD helpers (for validation)
 # ---------------------------------------------------------------------------
 
 def _classify_csd_road(sil: str) -> str:
@@ -1035,12 +1173,12 @@ def _classify_csd_road(sil: str) -> str:
     try:
         num = int(s.replace("M", ""))
         if num < 100:
-            return "primary"
-        if num < 400:
+            return "trunk"
+        if num < 1000:
             return "secondary"
         return "tertiary"
     except ValueError:
-        return "primary" if "M" in s else "other"
+        return "trunk" if "M" in s else "other"
 
 
 def aggregate_csd_by_class(csd: pd.DataFrame) -> pd.DataFrame:
@@ -1093,11 +1231,8 @@ _CZECH_REFERENCE_SPEEDS = {
 
 def compute_class_speed_comparison(
     links_gdf: gpd.GeoDataFrame,
-    csd_data: pd.DataFrame,
 ) -> Dict[str, Dict[str, float]]:
-    """Compare modeled average speeds per car-driveable road class against
-    Czech reference design speeds.
-    """
+    """Compare modeled average speeds per road class against reference speeds."""
     result: Dict[str, Dict[str, float]] = {}
     for lt in sorted(_CAR_LINK_TYPES_FOR_SPEED):
         sub = links_gdf[links_gdf["link_type"] == lt] if "link_type" in links_gdf.columns else pd.DataFrame()
@@ -1180,7 +1315,6 @@ def validate_journey_times(
 class SupplyParams:
     speed_factors: Dict[str, float] = field(default_factory=lambda: {})
     capacity_factors: Dict[str, float] = field(default_factory=lambda: {})
-    connector_penalty_s: float = 120.0
 
 
 def _save_base_values(project_dir: Path) -> None:
@@ -1268,9 +1402,22 @@ def compute_objective(
     jt_results: List[Dict[str, Any]],
     weights: Dict[str, float],
 ) -> float:
-    """Weighted composite objective for supply calibration (lower is better)."""
+    """Weighted composite objective for supply calibration (lower is better).
+
+    Includes R², slope, and %RMSE terms so that daily-model supply tuning
+    optimises for regression fit rather than hourly-specific GEH.
+    """
     w = weights
     geh_term = (100.0 - float(count_stats.get("geh_lt5_pct", 0))) * w.get("geh", 1.0)
+
+    r2 = float(count_stats.get("r2") or 0.0)
+    r2_term = (1.0 - r2) * 100.0 * w.get("r2", 1.0)
+
+    slope = float(count_stats.get("slope") or 1.0)
+    slope_term = abs(slope - 1.0) * 100.0 * w.get("slope", 1.0)
+
+    prmse = float(count_stats.get("pct_rmse") or 0.0)
+    rmse_term = prmse * w.get("pct_rmse", 0.5)
 
     sl_term = 0.0
     for sr in screenline_results.values():
@@ -1282,7 +1429,7 @@ def compute_objective(
     jt_fail = sum(1 for r in jt_results if not r.get("pass", True))
     jt_term = jt_fail / max(len(jt_results), 1) * 100 * w.get("jt", 1.0) if jt_results else 0.0
 
-    return geh_term + sl_term + jt_term
+    return geh_term + r2_term + slope_term + rmse_term + sl_term + jt_term
 
 
 def run_supply_tuning(config_path: str | Path = "config/sim.yaml") -> None:
@@ -1429,34 +1576,723 @@ def run_supply_tuning(config_path: str | Path = "config/sim.yaml") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Iterative calibration
+# Convergence helpers
+# ---------------------------------------------------------------------------
+
+def _check_final_convergence(
+    history: List[Dict[str, Any]],
+    model_time_period: str,
+    geh_target: float,
+    daily_conv: Dict[str, Any],
+) -> bool:
+    """Check whether the final iteration satisfies convergence criteria."""
+    if not history:
+        return False
+    final = history[-1]
+    if model_time_period == "daily":
+        r2 = float(final.get("r2") or 0.0)
+        slp = float(final.get("slope") or 0.0)
+        prmse = float(final.get("pct_rmse") or 999.0)
+        bias = abs(float(final.get("bias_pct") or 999.0))
+        sr = daily_conv.get("slope_range", [0.85, 1.15])
+        return (
+            r2 >= float(daily_conv.get("r2_target", 0.80))
+            and float(sr[0]) <= slp <= float(sr[1])
+            and prmse <= float(daily_conv.get("pct_rmse_max", 35.0))
+            and bias <= float(daily_conv.get("bias_abs_max_pct", 15.0))
+        )
+    return float(final.get("geh_lt5_pct", 0)) >= geh_target
+
+
+# ---------------------------------------------------------------------------
+# ODME – Spiess gradient OD matrix estimation
+# ---------------------------------------------------------------------------
+
+def _sr_val(sr: Any, key: str) -> float:
+    """Extract a numeric value from a screenline result (dict or dataclass)."""
+    if isinstance(sr, dict):
+        return float(sr.get(key, 0) or 0)
+    return float(getattr(sr, key, 0) or 0)
+
+
+def _compute_count_weights(
+    observed: np.ndarray,
+    method: str = "inverse_sqrt",
+) -> np.ndarray:
+    """Weight vector for count-post observations.
+
+    ``inverse_sqrt`` (default): w_a = 1 / sqrt(max(obs_a, 100)).
+    Balances high- and low-volume count posts so the objective function
+    is not dominated by motorway links (Aimsun OD-adj. TN, 2019).
+    """
+    obs = np.maximum(np.asarray(observed, dtype=np.float64), 100.0)
+    if method == "inverse_sqrt":
+        return 1.0 / np.sqrt(obs)
+    if method == "inverse":
+        return 1.0 / obs
+    # uniform — plain least squares
+    return np.ones_like(obs)
+
+
+def _odme_objective(
+    modeled: np.ndarray,
+    observed: np.ndarray,
+    weights: np.ndarray,
+) -> float:
+    """Weighted sum-of-squares objective  Z = sum_a w_a*(v_a - v_a^obs)^2."""
+    residuals = np.asarray(modeled, dtype=np.float64) - np.asarray(observed, dtype=np.float64)
+    return float(np.sum(weights * residuals ** 2))
+
+
+class _CalibrationContext:
+    """Shared setup / teardown for calibration loops.
+
+    Encapsulates config loading, matrix backup/restore, observed data,
+    screenline resolution, project/graph setup, and seed elasticity bounds
+    so that ``run_calibration`` and ``run_odme_calibration`` can reuse
+    the same initialisation logic.
+    """
+
+    def __init__(self, config_path: str | Path = "config/sim.yaml") -> None:
+        from sim.screenlines import load_screenlines, resolve_screenline_links
+
+        cfg = load_config(config_path)
+        self.cfg = cfg
+        self.project_dir = Path(cfg["project_path"])
+
+        demand_cfg = cfg.get("demand") or {}
+        self.calib_cfg = calib_cfg = cfg.get("calibration") or {}
+        self.matrix_path = Path(demand_cfg.get("matrix_path", "data/demand/od_matrix.aem"))
+        self.output_dir = Path(demand_cfg.get("output_dir", "outputs/baseline/demand"))
+        _ensure_dir(self.output_dir)
+
+        # Assignment parameters
+        self.algorithm = str(calib_cfg.get("algorithm", "bfw"))
+        self.max_iter_assign = int(calib_cfg.get("max_iter", 100))
+        self.rgap = float(calib_cfg.get("rgap_target", 0.001))
+        self.core_name = str(calib_cfg.get("core_name", "wd_daily"))
+
+        assign_cfg = cfg.get("assignment") or {}
+        gc_cfg = assign_cfg.get("generalized_cost") or {}
+        gc_enabled = bool(gc_cfg.get("enabled", False))
+        self.gc_field: Optional[str] = (
+            str(gc_cfg["fixed_cost_field"])
+            if gc_enabled and "fixed_cost_field" in gc_cfg else None
+        )
+        self.gc_mult: float = float(gc_cfg.get("fixed_cost_multiplier", 0.0)) if gc_enabled else 0.0
+        self.gc_vot: float = float(gc_cfg.get("vot", 1.0))
+        bpr_cfg = assign_cfg.get("bpr") or {}
+        self.cfg_bpr: Optional[Dict[str, object]] = dict(bpr_cfg) if bpr_cfg else None
+        mc_cfg = assign_cfg.get("multi_class") or {}
+        self.cfg_multi: Optional[list] = (
+            list(mc_cfg["classes"]) if mc_cfg.get("enabled") and "classes" in mc_cfg else None
+        )
+        self.daily_cap_factor = resolve_daily_cap_factor_default(bpr_cfg)
+        self.cores = int(assign_cfg.get("cores", 0))
+
+        # Matching parameters
+        self.buffer_m = float(calib_cfg.get("match_buffer_m", 50.0))
+        self.direction_aware = bool(calib_cfg.get("match_direction_aware", True))
+        self.conflict_res = str(calib_cfg.get("match_conflict_resolution", "nearest"))
+        self.agg_corridor = bool(calib_cfg.get("aggregate_corridor", True))
+        self.count_target = str(calib_cfg.get("count_target", "total"))
+        self.obs_col = "observed_car" if self.count_target == "car_only" else "observed_total"
+
+        # Convergence
+        conv_cfg = calib_cfg.get("convergence") or {}
+        self.daily_conv = conv_cfg.get("daily") or {}
+
+        # ODME / elasticity
+        self.odme_cfg = calib_cfg.get("odme") or {}
+        self.max_deviation = float(self.odme_cfg.get("max_deviation", 3.0))
+
+        # Pre-flight
+        fix_node_ids(self.project_dir)
+        if not self.matrix_path.exists():
+            raise FileNotFoundError(f"OD matrix not found: {self.matrix_path}")
+
+        # Backup / restore seed matrix
+        backup = self.matrix_path.with_suffix(".aem.orig")
+        if not backup.exists():
+            shutil.copy2(self.matrix_path, backup)
+        reset_matrix = bool(calib_cfg.get("reset_matrix_before_run", True))
+        if reset_matrix and backup.exists():
+            shutil.copy2(backup, self.matrix_path)
+            print("  Restored OD matrix from .aem.orig")
+
+        # Observed counts + network links
+        self.pent = load_pentlogram(cfg)
+        validate_geometries_or_fail(
+            self.pent, name="pentlogram", expected_epsg=get_metric_epsg(self.cfg),
+        )
+        self.links_gdf = _load_network_links(self.project_dir)
+        print(f"  Pentlogram: {len(self.pent)} observed segments")
+
+        # Screenlines
+        sl_path = str(calib_cfg.get("screenlines_path", "config/screenlines.yaml"))
+        self.screenlines = load_screenlines(sl_path)
+        self.sl_query: Optional[Dict[str, list]] = None
+        if self.screenlines:
+            self.sl_query = {}
+            for sl in self.screenlines:
+                resolved = sl.links or resolve_screenline_links(sl, self.links_gdf)
+                if resolved:
+                    sl.links = resolved
+                    self.sl_query[sl.name] = [(lid, d) for lid, d in resolved]
+            print(f"  Screenlines: {len(self.screenlines)} defined, "
+                  f"{len(self.sl_query)} with links")
+
+        # Open matrix (stays open across iterations)
+        self.mat = AequilibraeMatrix()
+        self.mat.load(str(self.matrix_path))
+        self.mat.computational_view([self.core_name])
+
+        # Seed matrix for elasticity bounds
+        seed = self.mat.matrix[self.core_name][:, :].copy().astype(np.float64)
+        self.seed_lower = seed / self.max_deviation
+        self.seed_upper = seed * self.max_deviation
+        self.seed_lower[seed <= 0] = 0.0
+        self.seed_upper[seed <= 0] = 0.0
+
+        # AequilibraE project + graph (reused across iterations)
+        self.project = Project()
+        self.project.open(str(self.project_dir))
+        self.cached_graph = build_graph(self.project, self.mat, bpr_parameters=self.cfg_bpr)
+
+        # Gateway calibration
+        gw_cal_cfg = calib_cfg.get("gateway_calibration") or {}
+        self.gw_cal_enabled = bool(gw_cal_cfg.get("enabled", False))
+        self.gw_cal_damping = float(gw_cal_cfg.get("damping", 0.08))
+        self.gw_cal_min_factor = float(gw_cal_cfg.get("min_factor", 0.90))
+        self.gw_cal_max_factor = float(gw_cal_cfg.get("max_factor", 1.10))
+        self.gw_zone_map: Dict[str, np.ndarray] = {}
+        self.gw_observed: Dict[str, float] = {}
+
+        if self.gw_cal_enabled:
+            try:
+                self.gw_zone_map = _load_gateway_zone_map(cfg, self.mat.index[:])
+                self.gw_observed = _load_gateway_observed(cfg)
+                if self.gw_zone_map and self.gw_observed:
+                    active = set(self.gw_zone_map) & set(self.gw_observed)
+                    print(f"  Gateway calibration: {len(active)} gateways with observed data "
+                          f"({', '.join(sorted(active))})")
+                else:
+                    print("  Gateway calibration: no matching zone/observed data — disabled")
+                    self.gw_cal_enabled = False
+            except Exception as exc:
+                print(f"  Gateway calibration init failed: {exc}")
+                self.gw_cal_enabled = False
+
+        # Tracking state
+        self.best_Z: float = float("inf")
+        self.best_demand: Optional[np.ndarray] = None
+        self.best_iteration: int = 0
+        self.history: List[Dict[str, Any]] = []
+
+    # -- Shared helpers for the iteration body --
+
+    def run_assignment(self, *, save_skims: bool = False) -> tuple:
+        """Execute one equilibrium assignment pass."""
+        return execute_assignment(
+            self.project, self.mat,
+            algorithm=self.algorithm,
+            max_iter=self.max_iter_assign,
+            rgap_target=self.rgap,
+            save_skims=save_skims,
+            select_links=self.sl_query,
+            bpr_parameters=self.cfg_bpr,
+            gc_field=self.gc_field,
+            gc_multiplier=self.gc_mult,
+            gc_vot=self.gc_vot,
+            multi_class=self.cfg_multi,
+            graph=self.cached_graph,
+            cores=self.cores,
+        )
+
+    def restore_best_and_close(self) -> None:
+        """Restore best-Z demand matrix, save, and close resources."""
+        try:
+            if self.best_demand is not None:
+                self.mat.matrix[self.core_name][:, :] = self.best_demand
+                self.mat.save()
+                print(f"  Restored best matrix from iteration {self.best_iteration} "
+                      f"(Z={self.best_Z:,.1f})")
+            self.mat.close()
+            self.project.close()
+        except Exception:
+            pass
+
+    def save_results(self, vol_df: Optional[pd.DataFrame] = None) -> None:
+        """Persist assignment results parquet and report path."""
+        if self.history and vol_df is not None:
+            results_path = self.output_dir / "assignment_results.parquet"
+            vol_df.to_parquet(str(results_path), index=False)
+            print(f"  Saved: {results_path}")
+
+
+def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
+    """Spiess-style gradient ODME calibration.
+
+    Bi-level optimization:
+      Lower level – AequilibraE equilibrium assignment (BFW)
+      Upper level – minimize weighted squared residuals between modeled
+                    and observed link volumes by adjusting the OD matrix
+                    via relative-gradient descent with optimal step length.
+
+    The gradient is computed from select-link OD proportions (screenlines).
+    Remaining aggregate bias (from all matched count posts) is corrected
+    with a damped global scalar after the gradient step.
+    """
+    ctx = _CalibrationContext(config_path)
+    calib_cfg = ctx.calib_cfg
+    odme_cfg = ctx.odme_cfg
+
+    from sim.screenlines import evaluate_all_screenlines
+
+    # Aliases for loop body backward compat
+    mat = ctx.mat
+    project = ctx.project
+    cached_graph = ctx.cached_graph
+    links_gdf = ctx.links_gdf
+    pent = ctx.pent
+    sl_query = ctx.sl_query
+    screenlines = ctx.screenlines
+    output_dir = ctx.output_dir
+    core_name = ctx.core_name
+    algorithm = ctx.algorithm
+    max_iter_assign = ctx.max_iter_assign
+    rgap = ctx.rgap
+    gc_field = ctx.gc_field
+    gc_mult = ctx.gc_mult
+    gc_vot = ctx.gc_vot
+    cfg_bpr = ctx.cfg_bpr
+    cfg_multi = ctx.cfg_multi
+    daily_cap_factor = ctx.daily_cap_factor
+    cores = ctx.cores
+    buffer_m = ctx.buffer_m
+    direction_aware = ctx.direction_aware
+    conflict_res = ctx.conflict_res
+    agg_corridor = ctx.agg_corridor
+    obs_col = ctx.obs_col
+    count_target = ctx.count_target
+    daily_conv = ctx.daily_conv
+    max_deviation = ctx.max_deviation
+    seed_lower = ctx.seed_lower
+    seed_upper = ctx.seed_upper
+
+    max_outer = int(odme_cfg.get("max_outer_iterations", 20))
+    gd_inner = int(odme_cfg.get("gradient_descent_iterations", 3))
+    weight_method = str(odme_cfg.get("weight_function", "inverse_sqrt"))
+    conv_tol = float(odme_cfg.get("convergence_tol", 0.01))
+    global_residual_damping = float(odme_cfg.get("global_residual_damping", 0.3))
+
+    print("=== ODME GRADIENT CALIBRATION (Spiess method) ===")
+    print(f"  max_outer={max_outer}, gd_inner={gd_inner}, max_deviation={ctx.max_deviation}")
+    print(f"  weight_function={weight_method}, convergence_tol={conv_tol}")
+    print(f"  global_residual_damping={global_residual_damping}")
+
+    history = ctx.history
+    prev_Z = float("inf")
+    best_Z = ctx.best_Z
+    best_demand = ctx.best_demand
+    best_iteration = ctx.best_iteration
+    effective_global_damping = global_residual_damping
+
+    try:
+        for outer_it in range(1, max_outer + 1):
+            print(f"\n{'='*60}")
+            print(f"  ODME Outer Iteration {outer_it}/{max_outer}")
+            print(f"{'='*60}")
+
+            total_demand = float(mat.matrix_view.sum())
+            print(f"  Demand total: {total_demand:,.0f}")
+
+            # --- 1) Equilibrium assignment with select-link ---
+            save_skims_now = bool(calib_cfg.get("save_skims", False)) and outer_it == 1
+            vol_df, skims, sl_matrices = execute_assignment(
+                project, mat,
+                algorithm=algorithm,
+                max_iter=max_iter_assign,
+                rgap_target=rgap,
+                save_skims=save_skims_now,
+                select_links=sl_query,
+                fixed_cost_field=gc_field,
+                fixed_cost_multiplier=gc_mult,
+                vot=gc_vot,
+                bpr_parameters=cfg_bpr,
+                multi_class=cfg_multi,
+                graph=cached_graph,
+                cores=cores,
+            )
+            if skims is not None and outer_it == 1:
+                skim_path = output_dir / "skims.aem"
+                try:
+                    skims.export(str(skim_path))
+                except Exception:
+                    pass
+
+            vol_col = _detect_volume_col(vol_df)
+            class_tot_cols = [
+                c for c in vol_df.columns
+                if c.endswith("_tot") and c not in ("PCE_tot", "Preload_tot")
+                and vol_df[c].sum() > 0
+            ]
+            if len(class_tot_cols) > 1:
+                vol_df["total_vehicles_tot"] = vol_df[class_tot_cols].sum(axis=1)
+                vol_col = "total_vehicles_tot"
+
+            total_vol = float(vol_df[vol_col].sum()) if vol_col else 0.0
+            print(f"  Assigned volume: {total_vol:,.0f}  (col={vol_col})")
+
+            # --- 2) Match ALL pentlogram counts to links ---
+            links_with_vol = links_gdf.copy()
+            if vol_col and "link_id" in vol_df.columns:
+                links_with_vol = links_with_vol.merge(
+                    vol_df[["link_id", vol_col]], on="link_id", how="left",
+                )
+
+            matched = match_counts_to_links(
+                pent, links_with_vol, buffer_m=buffer_m,
+                direction_aware=direction_aware,
+                conflict_resolution=conflict_res,
+                aggregate_corridor=agg_corridor,
+                vol_col=vol_col,
+            )
+
+            # Build persistent exclusion set on first iteration
+            if outer_it == 1:
+                if "_excluded" in matched.columns and "objectid" in matched.columns:
+                    excl_ids = set(matched.loc[matched["_excluded"], "objectid"].dropna().astype(int))
+                    if excl_ids:
+                        n_before = len(pent)
+                        pent = pent[~pent["objectid"].isin(excl_ids)].copy()
+                        print(f"  Pre-filter: removed {n_before - len(pent)} excluded stations")
+                _export_matching_diagnostics(
+                    matched,
+                    "_corridor_volume" if "_corridor_volume" in matched.columns else vol_col,
+                    obs_col, output_dir,
+                )
+
+            compare_col = "_corridor_volume" if "_corridor_volume" in matched.columns else vol_col
+
+            # --- 3) Extract valid count posts for objective function ---
+            valid = matched.dropna(subset=[compare_col, obs_col])
+            valid = valid[valid[obs_col] > 0].copy()
+            if "_excluded" in valid.columns:
+                valid = valid[~valid["_excluded"]].copy()
+
+            if valid.empty:
+                print("  WARNING: no valid matched counts — cannot compute gradient")
+                continue
+
+            mod_all = valid[compare_col].values.astype(np.float64)
+            obs_all = valid[obs_col].values.astype(np.float64)
+            w_all = _compute_count_weights(obs_all, method=weight_method)
+
+            Z_current = _odme_objective(mod_all, obs_all, w_all)
+
+            # Compute standard metrics for reporting
+            stats = compute_stats(mod_all, obs_all, daily_capacity_factor=daily_cap_factor)
+            geh5 = float(stats.get("geh_lt5_pct", 0))
+            r2 = stats.get("r2")
+            slope = stats.get("slope")
+            pct_rmse = stats.get("pct_rmse")
+            bias_pct = stats.get("bias_pct")
+
+            # Track best state — restore at the end for guaranteed best output
+            if Z_current < best_Z:
+                best_Z = Z_current
+                best_demand = mat.matrix[core_name][:, :].copy()
+                best_iteration = outer_it
+
+            # Adaptive damping: if Z increased, reduce global damping
+            if outer_it > 1 and Z_current > prev_Z:
+                effective_global_damping = max(effective_global_damping * 0.7, 0.05)
+                print(f"  WARNING: Z increased — reducing global_damping to {effective_global_damping:.3f}")
+
+            print(f"  Z={Z_current:,.1f}  (prev={prev_Z:,.1f}  delta={Z_current - prev_Z:+,.1f})")
+            print(f"  R²={r2}  slope={slope}  %RMSE={pct_rmse}  bias={bias_pct}%")
+            print(f"  GEH<5: {geh5:.1f}%  n_counts={len(valid)}")
+
+            # Evaluate screenlines for reporting
+            sl_results: Dict[str, Any] = {}
+            max_sl_pct_dev: float = 0.0
+            if screenlines and vol_col:
+                sl_res = evaluate_all_screenlines(
+                    screenlines, vol_df, matched, vol_col, obs_col, links_gdf,
+                )
+                for sn, sr in sl_res.items():
+                    sl_results[sn] = sr.to_dict()
+                    if sr.observed_total > 0 and np.isfinite(sr.ratio):
+                        dev = abs(sr.ratio - 1.0) * 100.0
+                        max_sl_pct_dev = max(max_sl_pct_dev, dev)
+                    print(f"  SL '{sn}': mod={sr.modeled_total:,.0f} "
+                          f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f} GEH={sr.geh:.1f}")
+
+            # Record iteration history
+            iter_record = {
+                "iteration": outer_it,
+                "demand_total": round(total_demand, 0),
+                "assigned_total": round(total_vol, 0),
+                "Z_objective": round(Z_current, 1),
+                **stats,
+                "max_screenline_pct_dev": round(max_sl_pct_dev, 1),
+                "n_count_posts": len(valid),
+            }
+            history.append(iter_record)
+
+            # --- 4) Convergence check ---
+            if outer_it > 1:
+                rel_change = abs(Z_current - prev_Z) / max(prev_Z, 1.0)
+                if rel_change < conv_tol:
+                    print(f"  CONVERGED: |delta Z|/Z = {rel_change:.6f} < {conv_tol}")
+                    break
+
+            # Stall detection: if best Z hasn't improved in 4 outer iterations
+            if outer_it - best_iteration >= 4:
+                print(f"  STALLED: no Z improvement since iteration {best_iteration}")
+                break
+
+            # Also check daily convergence criteria
+            cur_r2 = float(stats.get("r2") or 0.0)
+            cur_slope = float(stats.get("slope") or 0.0)
+            cur_prmse = float(stats.get("pct_rmse") or 999.0)
+            cur_bias = abs(float(stats.get("bias_pct") or 999.0))
+            daily_r2_target = float(daily_conv.get("r2_target", 0.80))
+            daily_slope_range = daily_conv.get("slope_range", [0.85, 1.15])
+            daily_pct_rmse_max = float(daily_conv.get("pct_rmse_max", 35.0))
+            daily_bias_max = float(daily_conv.get("bias_abs_max_pct", 15.0))
+            daily_sl_max_dev = float(daily_conv.get("screenline_max_pct_deviation", 15.0))
+
+            daily_ok = (
+                cur_r2 >= daily_r2_target
+                and float(daily_slope_range[0]) <= cur_slope <= float(daily_slope_range[1])
+                and cur_prmse <= daily_pct_rmse_max
+                and cur_bias <= daily_bias_max
+                and (max_sl_pct_dev <= daily_sl_max_dev if sl_results else True)
+            )
+            if daily_ok:
+                print(f"  CONVERGED: all daily criteria met")
+                break
+
+            prev_Z = Z_current
+
+            # --- 5) Spiess gradient step: per-screenline multiplicative update ---
+            # The Spiess relative gradient update applied per screenline:
+            #   g_i *= 1 + damping * (ratio_sl - 1) * p_i(sl)
+            # where p_i(sl) = sl_od[i] / demand[i] is the fraction of OD pair
+            # i that routes through screenline sl.  This multiplicative form
+            # preserves zeros and moves OD cells proportionally to their
+            # contribution to each screenline's flow.
+            #
+            # With N overlapping screenlines, damping = 1/sqrt(N) prevents
+            # double-correction while remaining responsive.
+            data = mat.matrix[core_name]
+            demand = data[:, :].copy().astype(np.float64)
+            n_sl_used = 0
+
+            if sl_matrices:
+                n_sl_active = sum(
+                    1 for sn in sl_matrices
+                    if _sr_val(sl_results.get(sn, {}), "observed_total") > 0
+                    and _sr_val(sl_results.get(sn, {}), "modeled_total") > 0
+                )
+                sl_damping = 1.0 / max(np.sqrt(n_sl_active), 1.0)
+
+                for gd_it in range(1, gd_inner + 1):
+                    corrections_applied = []
+                    for sl_name, sl_od_raw in sl_matrices.items():
+                        obs_sl = _sr_val(sl_results.get(sl_name, {}), "observed_total")
+                        mod_sl = _sr_val(sl_results.get(sl_name, {}), "modeled_total")
+                        if obs_sl <= 0 or mod_sl <= 0:
+                            continue
+                        ratio = obs_sl / mod_sl
+                        # Skip extreme ratios (connectivity issue, not demand)
+                        if ratio > 5.0 or ratio < 0.2:
+                            continue
+
+                        sl_od = np.asarray(sl_od_raw, dtype=np.float64).reshape(demand.shape)
+                        proportion = np.where(
+                            demand > 0,
+                            np.clip(sl_od / np.maximum(demand, 1e-9), 0.0, 1.0),
+                            0.0,
+                        )
+
+                        # Multiplicative Spiess update
+                        adjustment = 1.0 + sl_damping * (ratio - 1.0) * proportion
+                        np.clip(adjustment, 0.5, 2.0, out=adjustment)
+                        demand *= adjustment
+                        corrections_applied.append((sl_name, round(ratio, 3)))
+
+                    if gd_it == 1:
+                        n_sl_used = len(corrections_applied)
+
+                    # Elasticity: clip to [seed/max_dev, seed*max_dev]
+                    np.clip(demand, seed_lower, seed_upper, out=demand)
+                    np.maximum(demand, 0.0, out=demand)
+
+                    print(f"    GD inner {gd_it}: {len(corrections_applied)} SLs applied, "
+                          f"demand_total={demand.sum():,.0f}")
+
+                if corrections_applied:
+                    print(f"  Screenline ratios: "
+                          f"{', '.join(f'{n}={r}' for n, r in corrections_applied)}")
+
+            # --- 6) Global residual correction from ALL count posts ---
+            # After the select-link gradient step, compute aggregate bias
+            # from ALL 2000+ matched count posts and apply a damped
+            # uniform correction.  Stratified (per-road-class) correction
+            # was tested but is counterproductive: it cuts through-traffic
+            # uniformly when some corridors need more and others less.
+            # The screenline gradient handles the directional component;
+            # the global scalar handles only the aggregate level.
+            if len(valid) > 0 and total_vol > 0:
+                sum_obs = float(obs_all.sum())
+                sum_mod = float(mod_all.sum())
+                if sum_mod > 0 and sum_obs > 0:
+                    global_ratio = sum_obs / sum_mod
+                    global_factor = 1.0 + effective_global_damping * (global_ratio - 1.0)
+                    global_factor = float(np.clip(global_factor, 0.8, 1.25))
+
+                    if abs(global_factor - 1.0) > 0.003:
+                        demand *= global_factor
+                        np.clip(demand, seed_lower, seed_upper, out=demand)
+                        np.maximum(demand, 0.0, out=demand)
+                        print(f"  Global residual: obs/mod={global_ratio:.3f} "
+                              f"→ factor={global_factor:.4f}  "
+                              f"demand={demand.sum():,.0f}")
+
+            # --- 7) Gateway calibration — per-gateway OD scaling ---
+            if ctx.gw_cal_enabled and vol_col:
+                gw_modeled = _compute_gateway_modeled_volumes(
+                    vol_df, screenlines, vol_col,
+                )
+                gw_corrections = _apply_gateway_calibration(
+                    demand,
+                    ctx.gw_zone_map,
+                    ctx.gw_observed,
+                    gw_modeled,
+                    damping=ctx.gw_cal_damping,
+                    min_factor=ctx.gw_cal_min_factor,
+                    max_factor=ctx.gw_cal_max_factor,
+                    seed_lower=seed_lower,
+                    seed_upper=seed_upper,
+                )
+                if gw_corrections:
+                    print(f"  Gateway calibration ({len(gw_corrections)}):")
+                    for gc_line in gw_corrections:
+                        print(f"    {gc_line}")
+
+            # --- 8) Write updated demand back to matrix ---
+            data[:, :] = demand
+            mat.save()
+            print(f"  Matrix saved. Total demand: {demand.sum():,.0f}")
+
+    finally:
+        ctx.best_Z = best_Z
+        ctx.best_demand = best_demand
+        ctx.best_iteration = best_iteration
+        ctx.restore_best_and_close()
+
+    # --- Save calibration report ---
+    report = {
+        "method": "odme_spiess_gradient",
+        "iterations": len(history),
+        "converged": len(history) > 0 and (
+            (len(history) >= 2 and abs(history[-1].get("Z_objective", 0) - history[-2].get("Z_objective", 1)) / max(abs(history[-2].get("Z_objective", 1)), 1) < conv_tol)
+            or _check_final_convergence(history, "daily", 85.0, daily_conv)
+        ),
+        "history": history,
+        "final": history[-1] if history else {},
+        "config": {
+            "max_outer_iterations": max_outer,
+            "gradient_descent_iterations": gd_inner,
+            "max_deviation": max_deviation,
+            "weight_function": weight_method,
+            "convergence_tol": conv_tol,
+            "global_residual_damping": global_residual_damping,
+            "algorithm": algorithm,
+            "count_target": count_target,
+            "obs_col": obs_col,
+            "aggregate_corridor": agg_corridor,
+        },
+        "screenlines": sl_results,
+    }
+    report_path = output_dir / "calibration_report.json"
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"\nODME report: {report_path}")
+
+    if history:
+        z_start = history[0].get("Z_objective", 0)
+        z_end = best_Z if best_Z < float("inf") else history[-1].get("Z_objective", 0)
+        print(f"  Z: {z_start:,.1f} → {z_end:,.1f}  "
+              f"(reduction: {(1 - z_end / max(z_start, 1)) * 100:.1f}%)  "
+              f"best at iteration {best_iteration}")
+
+    # Save final assignment results
+    if history:
+        out_path = output_dir / "assignment_results.parquet"
+        vol_df.to_parquet(str(out_path), index=False)
+        print(f"  Final assignment: {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Legacy iterative calibration
 # ---------------------------------------------------------------------------
 
 def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     """FSM iterative calibration: assign → compare → scale → repeat."""
-    cfg = load_config(config_path)
-    project_dir = Path(cfg["project_path"])
-    demand_cfg = cfg.get("demand") or {}
-    calib_cfg = cfg.get("calibration") or {}
-    matrix_path = Path(demand_cfg.get("matrix_path", "data/demand/od_matrix.aem"))
-    output_dir = Path(demand_cfg.get("output_dir", "outputs/baseline/demand"))
-    _ensure_dir(output_dir)
+    ctx = _CalibrationContext(config_path)
+    cfg = ctx.cfg
+    calib_cfg = ctx.calib_cfg
 
-    # Assignment params
-    algorithm = str(calib_cfg.get("algorithm", "bfw"))
-    max_iter_assign = int(calib_cfg.get("max_iter", 100))
-    rgap = float(calib_cfg.get("rgap_target", 0.001))
-    core_name = str(calib_cfg.get("core_name", "wd_daily"))
-    buffer_m = float(calib_cfg.get("match_buffer_m", 50.0))
-    direction_aware = bool(calib_cfg.get("match_direction_aware", True))
-    conflict_res = str(calib_cfg.get("match_conflict_resolution", "nearest"))
-    agg_corridor = bool(calib_cfg.get("aggregate_corridor", True))
+    # Aliases for loop body backward compat
+    mat = ctx.mat
+    project = ctx.project
+    cached_graph = ctx.cached_graph
+    links_gdf = ctx.links_gdf
+    pent = ctx.pent
+    sl_query = ctx.sl_query
+    screenlines = ctx.screenlines
+    output_dir = ctx.output_dir
+    project_dir = ctx.project_dir
+    matrix_path = ctx.matrix_path
+    core_name = ctx.core_name
+    algorithm = ctx.algorithm
+    max_iter_assign = ctx.max_iter_assign
+    rgap = ctx.rgap
+    gc_field = ctx.gc_field
+    gc_mult = ctx.gc_mult
+    gc_vot = ctx.gc_vot
+    cfg_bpr = ctx.cfg_bpr
+    cfg_multi = ctx.cfg_multi
+    daily_cap_factor = ctx.daily_cap_factor
+    cores = ctx.cores
+    buffer_m = ctx.buffer_m
+    direction_aware = ctx.direction_aware
+    conflict_res = ctx.conflict_res
+    agg_corridor = ctx.agg_corridor
+    obs_col = ctx.obs_col
+    count_target = ctx.count_target
+    daily_conv = ctx.daily_conv
+    seed_lower = ctx.seed_lower
+    seed_upper = ctx.seed_upper
 
-    # Iteration params
+    model_time_period = str(calib_cfg.get("model_time_period", "daily"))
+
     max_iterations = int(calib_cfg.get("max_iterations", 10))
     conv_cfg = calib_cfg.get("convergence") or {}
     geh_target = float(conv_cfg.get("geh_lt5_target_pct", 85.0))
     min_improvement = float(conv_cfg.get("min_improvement_pct", 1.0))
+
+    daily_r2_target = float(daily_conv.get("r2_target", 0.80))
+    daily_slope_range = daily_conv.get("slope_range", [0.85, 1.15])
+    daily_slope_lo = float(daily_slope_range[0])
+    daily_slope_hi = float(daily_slope_range[1])
+    daily_pct_rmse_max = float(daily_conv.get("pct_rmse_max", 35.0))
+    daily_sl_max_dev = float(daily_conv.get("screenline_max_pct_deviation", 15.0))
+    daily_bias_max = float(daily_conv.get("bias_abs_max_pct", 15.0))
+
     scale_cfg = calib_cfg.get("scaling") or {}
     scale_method = str(scale_cfg.get("method", "sector"))
     scale_enabled = bool(scale_cfg.get("enabled", True))
@@ -1471,70 +2307,36 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     q_obj_patience = int(quality_cfg.get("objective_patience", 3))
     q_obj_weights = quality_cfg.get("objective_weights") or {}
     w_rho = float(q_obj_weights.get("spearman", 120.0))
+    w_r2 = float(q_obj_weights.get("r2", 80.0))
+    w_slope = float(q_obj_weights.get("slope_penalty", 50.0))
     w_geh = float(q_obj_weights.get("geh_lt5", 1.8))
     w_wmape = float(q_obj_weights.get("wmape_pct", 1.0))
     w_bias = float(q_obj_weights.get("class_bias_max_abs_pct", 0.35))
     w_rmse = float(q_obj_weights.get("pct_rmse", 0.35))
 
-    count_target = str(calib_cfg.get("count_target", "total"))
-    obs_col = "observed_car" if count_target == "car_only" else "observed_total"
-
     print("=== FSM ITERATIVE CALIBRATION ===")
-    print(f"  max_iterations={max_iterations}, target GEH<5 >= {geh_target}%")
+    print(f"  model_time_period={model_time_period}, max_iterations={max_iterations}")
+    if model_time_period == "daily":
+        print(f"  Daily convergence: R²>={daily_r2_target}, slope∈[{daily_slope_lo},{daily_slope_hi}], "
+              f"%RMSE<={daily_pct_rmse_max}, SL_dev<={daily_sl_max_dev}%, |bias|<={daily_bias_max}%")
+        print(f"  (GEH<5 >= {geh_target}% kept as diagnostic; daily_capacity_factor={daily_cap_factor})")
+    else:
+        print(f"  Hourly convergence: target GEH<5 >= {geh_target}%")
     print(f"  scaling: enabled={scale_enabled}, method={scale_method}, damping={damping}")
     print(f"  count_target: {count_target} (comparing against '{obs_col}')")
 
-    # Pre-flight
-    fix_node_ids(project_dir)
+    from sim.screenlines import evaluate_all_screenlines
 
-    if not matrix_path.exists():
-        raise FileNotFoundError(f"OD matrix not found: {matrix_path}")
-
-    # Keep a backup of the original (pre-calibration) matrix and optionally
-    # restore it at the start of each run so batch / tuning experiments are not
-    # chained through a repeatedly scaled matrix file.
-    backup = matrix_path.with_suffix(".aem.orig")
-    if not backup.exists():
-        shutil.copy2(matrix_path, backup)
-    reset_matrix = bool(calib_cfg.get("reset_matrix_before_run", True))
-    if reset_matrix and backup.exists():
-        shutil.copy2(backup, matrix_path)
-        print("  Restored OD matrix from .aem.orig (reset_matrix_before_run=true)")
-
-    # Load calibration counts once
-    pent = load_pentlogram(cfg)
-    validate_geometries_or_fail(pent, name="pentlogram", expected_epsg=5514)
-    links_gdf = _load_network_links(project_dir)
-    print(f"  Pentlogram: {len(pent)} observed segments")
-
-    # Load screenlines (for select-link OD correction and evaluation)
-    from sim.screenlines import load_screenlines, resolve_screenline_links, evaluate_all_screenlines
-    sl_path = str(calib_cfg.get("screenlines_path", "config/screenlines.yaml"))
-    screenlines = load_screenlines(sl_path)
-    sl_query: Optional[Dict[str, list]] = None
-    if screenlines:
-        sl_query = {}
-        for sl in screenlines:
-            resolved = sl.links or resolve_screenline_links(sl, links_gdf)
-            if resolved:
-                sl.links = resolved
-                sl_query[sl.name] = [(lid, d) for lid, d in resolved]
-        print(f"  Screenlines: {len(screenlines)} defined, {len(sl_query)} with links")
-
-    # Load matrix (stays open across iterations)
-    mat = AequilibraeMatrix()
-    mat.load(str(matrix_path))
-    mat.computational_view([core_name])
-
-    project = Project()
-    project.open(str(project_dir))
-
-    history: List[Dict[str, Any]] = []
+    history = ctx.history
     prev_geh5 = 0.0
     mq: Dict[str, Any] = {}
     last_extended: Dict[str, Any] = {}
     obj_best = float("-inf")
     obj_non_improve = 0
+    best_Z = float("inf")
+    best_demand: Optional[np.ndarray] = None
+    best_iteration = 0
+    prev_Z = float("inf")
 
     try:
         for it in range(1, max_iterations + 1):
@@ -1544,7 +2346,6 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             total_demand = float(mat.matrix_view.sum())
             print(f"  Demand total: {total_demand:,.0f}")
             save_skims_now = bool(calib_cfg.get("save_skims", False)) and it == 1
-            use_select_link = scale_method == "select_link" and sl_query
             vol_df, skims, sl_matrices = execute_assignment(
                 project,
                 mat,
@@ -1552,19 +2353,60 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 max_iter=max_iter_assign,
                 rgap_target=rgap,
                 save_skims=save_skims_now,
-                select_links=sl_query if use_select_link else None,
+                select_links=sl_query,
+                fixed_cost_field=gc_field,
+                fixed_cost_multiplier=gc_mult,
+                vot=gc_vot,
+                bpr_parameters=cfg_bpr,
+                multi_class=cfg_multi,
+                graph=cached_graph,
+                cores=cores,
             )
             if skims is not None:
                 skim_path = output_dir / "skims.aem"
                 try:
                     skims.export(str(skim_path))
                     print(f"  Skims saved: {skim_path}")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    import warnings as _w
+                    _w.warn(f"Skim export failed ({skim_path}): {exc}", RuntimeWarning, stacklevel=1)
 
             vol_col = _detect_volume_col(vol_df)
+
+            # Multi-class fix: sum per-class vehicle volumes into a single
+            # column so calibration compares TOTAL vehicles against observed
+            # counts, not just the first class (which misses through traffic).
+            class_tot_cols = [
+                c for c in vol_df.columns
+                if c.endswith("_tot") and c not in ("PCE_tot", "Preload_tot")
+                and vol_df[c].sum() > 0
+            ]
+            if len(class_tot_cols) > 1:
+                vol_df["total_vehicles_tot"] = vol_df[class_tot_cols].sum(axis=1)
+                vol_col = "total_vehicles_tot"
+
             total_vol = float(vol_df[vol_col].sum()) if vol_col else 0.0
             print(f"  Assigned volume: {total_vol:,.0f}  (col={vol_col})")
+            if total_vol > 0 and total_demand > 0:
+                print(f"  Route amplification: {total_vol / total_demand:.1f} links/trip")
+
+            if it == 1:
+                try:
+                    bkdn = compute_class_volume_breakdown(vol_df, links_gdf)
+                    if bkdn:
+                        print("  Volume breakdown by road class / traffic class:")
+                        for col_name, by_rc in bkdn.items():
+                            if col_name.startswith("_"):
+                                continue
+                            for rc in ("motorway", "trunk", "primary", "secondary", "tertiary", "other"):
+                                info = by_rc.get(rc)
+                                if info:
+                                    print(f"    {col_name:20s}  {rc:12s}  vol={info['total_volume']:>12,.0f}  links={info['n_links']}")
+                        shares = bkdn.get("_class_shares", {})
+                        for rc, detail in shares.items():
+                            print(f"    {rc} class shares: {detail['shares']}")
+                except Exception as ex:
+                    print(f"  WARNING: volume breakdown failed: {ex}")
 
             # 2) Match to pentlogram
             links_with_vol = links_gdf.copy()
@@ -1578,6 +2420,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 direction_aware=direction_aware,
                 conflict_resolution=conflict_res,
                 aggregate_corridor=agg_corridor,
+                vol_col=vol_col,
             )
             vc = vol_col if vol_col and vol_col in matched.columns else next(
                 (c for c in matched.columns if vol_col and vol_col in c), None
@@ -1588,7 +2431,12 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             if vc and compare_col and compare_col in matched.columns:
                 valid = matched.dropna(subset=[compare_col, obs_col])
                 valid = valid[valid[obs_col] > 0].copy()
-                stats = compute_stats(valid[compare_col].values, valid[obs_col].values)
+                if "_excluded" in valid.columns:
+                    valid = valid[~valid["_excluded"]].copy()
+                stats = compute_stats(
+                    valid[compare_col].values, valid[obs_col].values,
+                    daily_capacity_factor=daily_cap_factor,
+                )
             else:
                 valid = pd.DataFrame()
                 stats = {"n": 0}
@@ -1596,7 +2444,55 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             geh5 = float(stats.get("geh_lt5_pct", 0))
             geh10 = float(stats.get("geh_lt10_pct", 0))
             r2 = stats.get("r2")
-            print(f"  GEH<5: {geh5:.1f}%  GEH<10: {geh10:.1f}%  R²: {r2}")
+            slope = stats.get("slope")
+            pct_rmse = stats.get("pct_rmse")
+            bias_pct = stats.get("bias_pct")
+            daily_geh_adj = stats.get("daily_geh_lt_adj_pct", 0)
+
+            # Track weighted objective Z for best-state restoration
+            Z_current = float("inf")
+            if not valid.empty and compare_col in valid.columns:
+                _mod = valid[compare_col].values.astype(np.float64)
+                _obs = valid[obs_col].values.astype(np.float64)
+                _w = _compute_count_weights(_obs)
+                Z_current = _odme_objective(_mod, _obs, _w)
+                if Z_current < best_Z:
+                    best_Z = Z_current
+                    best_demand = mat.matrix[core_name][:, :].copy()
+                    best_iteration = it
+
+            print(f"  R²={r2}  slope={slope}  %RMSE={pct_rmse}  bias={bias_pct}%")
+            print(f"  GEH<5: {geh5:.1f}%  GEH<10: {geh10:.1f}%  "
+                  f"daily-adj GEH<{stats.get('daily_geh_threshold', 5):.0f}: {daily_geh_adj:.1f}%")
+            print(f"  Z={Z_current:,.0f}  (best={best_Z:,.0f} at it={best_iteration})")
+
+            if not valid.empty and "link_id" in valid.columns and "direction" in links_gdf.columns:
+                _dir_lookup = links_gdf[["link_id", "direction"]].drop_duplicates("link_id")
+                _dir_lookup = _dir_lookup.rename(columns={"direction": "_link_dir"})
+                vdir = valid.merge(_dir_lookup, on="link_id", how="left")
+                for dval, label in [(0, "bidir"), (1, "oneway")]:
+                    mask = vdir["_link_dir"] == dval if dval == 0 else vdir["_link_dir"] != 0
+                    sub = vdir.loc[mask]
+                    if len(sub) >= 2:
+                        s_stats = compute_stats(
+                            sub[compare_col].values, sub[obs_col].values,
+                            daily_capacity_factor=daily_cap_factor,
+                        )
+                        print(f"    {label} (n={len(sub)}): slope={s_stats.get('slope')}  "
+                              f"bias={s_stats.get('bias_pct')}%  R²={s_stats.get('r2')}")
+
+            if it == 1 and not valid.empty and "link_type" in valid.columns:
+                _rc = valid["link_type"].map(_coarse_road_class)
+                for rc in ("motorway", "trunk", "primary", "secondary", "tertiary", "other"):
+                    rc_rows = valid[_rc == rc]
+                    if len(rc_rows) < 2:
+                        continue
+                    _m = rc_rows[compare_col].values.astype(float)
+                    _o = rc_rows[obs_col].values.astype(float)
+                    _ratio = float(_m.sum() / max(_o.sum(), 1))
+                    print(f"    {rc:12s} (n={len(rc_rows):4d}): "
+                          f"sum_mod={_m.sum():>12,.0f}  sum_obs={_o.sum():>12,.0f}  "
+                          f"ratio={_ratio:.3f}")
 
             last_extended = {}
             if not valid.empty and compare_col and compare_col in valid.columns:
@@ -1614,39 +2510,89 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                       f"{mq['n_link_conflicts']} conflicts, "
                       f"mean_dist={mq['mean_match_distance_m']}m")
 
+                # Build persistent exclusion set from iteration-1 matching
+                # so that bad stations (e.g. 9k service road matched to 62k
+                # trunk) never influence OD scaling in subsequent iterations.
+                if "_excluded" in matched.columns and "objectid" in matched.columns:
+                    excl_ids = set(matched.loc[matched["_excluded"], "objectid"].dropna().astype(int))
+                    if excl_ids:
+                        n_before = len(pent)
+                        pent = pent[~pent["objectid"].isin(excl_ids)].copy()
+                        print(f"  Pre-filter: removed {n_before - len(pent)} excluded stations "
+                              f"from pentlogram ({len(pent)} remaining)")
+
                 # Export matching diagnostics CSV
                 _export_matching_diagnostics(matched, compare_col, obs_col, output_dir)
 
+                # Top links by absolute bias (motorway + trunk only)
+                if compare_col and compare_col in valid.columns and "link_type" in valid.columns:
+                    try:
+                        diag = valid[[compare_col, obs_col, "link_type"]].copy()
+                        diag["_bias"] = diag[compare_col] - diag[obs_col]
+                        diag["_road_class"] = diag["link_type"].map(_coarse_road_class)
+                        for rc in ("motorway", "trunk"):
+                            rc_rows = diag[diag["_road_class"] == rc].copy()
+                            if rc_rows.empty:
+                                continue
+                            worst = rc_rows.reindex(rc_rows["_bias"].abs().nlargest(5).index)
+                            print(f"  Top-5 {rc} links by |bias|:")
+                            for _, row in worst.iterrows():
+                                print(f"    mod={row[compare_col]:>8,.0f}  obs={row[obs_col]:>8,.0f}  "
+                                      f"bias={row['_bias']:>+8,.0f}  type={row['link_type']}")
+                    except Exception:
+                        pass
+
             # Evaluate screenlines
             sl_results: Dict[str, Any] = {}
+            max_sl_pct_dev: float = 0.0
             if screenlines and vol_col:
                 sl_res = evaluate_all_screenlines(
                     screenlines, vol_df, matched, vol_col, obs_col, links_gdf,
                 )
                 for sn, sr in sl_res.items():
                     sl_results[sn] = sr.to_dict()
+                    if sr.observed_total > 0 and np.isfinite(sr.ratio):
+                        dev = abs(sr.ratio - 1.0) * 100.0
+                        max_sl_pct_dev = max(max_sl_pct_dev, dev)
                     if it == 1 or it == max_iterations:
                         print(f"  Screenline '{sn}': mod={sr.modeled_total:,.0f} "
                               f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f} GEH={sr.geh:.1f}")
+                if sl_results:
+                    print(f"  Screenline max %deviation: {max_sl_pct_dev:.1f}%")
 
             iter_record = {
                 "iteration": it,
                 "demand_total": round(total_demand, 0),
                 "assigned_total": round(total_vol, 0),
                 **stats,
+                "max_screenline_pct_dev": round(max_sl_pct_dev, 1),
             }
             if last_extended:
                 iter_record["wmape_pct"] = last_extended.get("wmape_pct")
                 iter_record["class_bias_max_abs_pct"] = last_extended.get("class_bias_max_abs_pct")
                 iter_record["spearman_rho"] = last_extended.get("spearman_rho")
+
+            # Quality objective (higher is better) — daily models weight R²,
+            # slope, and %RMSE; hourly models lean on GEH.
             if last_extended:
-                # ObjB-like quality objective (higher is better), used only for
-                # anti-degradation early stopping.
                 try:
                     rho = float(last_extended.get("spearman_rho") or 0.0)
                     wmape = float(last_extended.get("wmape_pct") or 0.0)
                     bias_abs = float(last_extended.get("class_bias_max_abs_pct") or 0.0)
-                    obj_q = (w_rho * rho) + (w_geh * geh5) - (w_wmape * wmape) - (w_bias * bias_abs) - (w_rmse * float(stats.get("pct_rmse", 0.0)))
+                    cur_r2 = float(stats.get("r2") or 0.0)
+                    cur_slope = float(stats.get("slope") or 1.0)
+                    slope_dev = abs(cur_slope - 1.0)
+                    cur_pct_rmse = float(stats.get("pct_rmse") or 0.0)
+
+                    obj_q = (
+                        w_rho * rho
+                        + w_r2 * cur_r2
+                        - w_slope * slope_dev
+                        + w_geh * geh5
+                        - w_wmape * wmape
+                        - w_bias * bias_abs
+                        - w_rmse * cur_pct_rmse
+                    )
                     iter_record["quality_objective"] = round(obj_q, 4)
                     if obj_q > obj_best + 1e-9:
                         obj_best = obj_q
@@ -1657,100 +2603,140 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     pass
             history.append(iter_record)
 
-            # 4) Convergence check
-            if geh5 >= geh_target:
-                print(f"  CONVERGED: GEH<5 = {geh5:.1f}% >= target {geh_target}%")
+            # 4) Convergence check — daily vs hourly criteria
+            converged = False
+            if model_time_period == "daily":
+                cur_r2 = float(stats.get("r2") or 0.0)
+                cur_slope = float(stats.get("slope") or 0.0)
+                cur_prmse = float(stats.get("pct_rmse") or 999.0)
+                cur_bias = abs(float(stats.get("bias_pct") or 999.0))
+                checks = {
+                    f"R²>={daily_r2_target}": cur_r2 >= daily_r2_target,
+                    f"slope∈[{daily_slope_lo},{daily_slope_hi}]": daily_slope_lo <= cur_slope <= daily_slope_hi,
+                    f"%RMSE<={daily_pct_rmse_max}": cur_prmse <= daily_pct_rmse_max,
+                    f"|bias|<={daily_bias_max}%": cur_bias <= daily_bias_max,
+                }
+                if sl_results:
+                    checks[f"SL_dev<={daily_sl_max_dev}%"] = max_sl_pct_dev <= daily_sl_max_dev
+
+                passed = [k for k, v in checks.items() if v]
+                failed = [k for k, v in checks.items() if not v]
+                print(f"  Daily convergence: {len(passed)}/{len(checks)} criteria met")
+                if failed:
+                    print(f"    PASS: {', '.join(passed) if passed else 'none'}")
+                    print(f"    FAIL: {', '.join(failed)}")
+
+                if all(checks.values()):
+                    print(f"  CONVERGED (daily): all criteria met")
+                    converged = True
+            else:
+                if geh5 >= geh_target:
+                    print(f"  CONVERGED: GEH<5 = {geh5:.1f}% >= target {geh_target}%")
+                    converged = True
+
+            if converged:
                 break
 
-            improvement = geh5 - prev_geh5
-            if it > 1 and improvement < min_improvement:
-                print(f"  STALLED: improvement {improvement:.2f}% < {min_improvement}%")
+            # Stall detection: Z-based (primary) + quality-objective (secondary)
+            if it - best_iteration >= q_obj_patience + 1:
+                print(f"  Z-STALL: no Z improvement since iteration {best_iteration}")
                 break
-
-            # Quality-gate anti-degradation stop: prevent long drift when objective
-            # worsens repeatedly even if GEH progress is noisy.
-            if q_obj_patience > 0 and obj_non_improve >= q_obj_patience:
-                print(f"  QUALITY STOP: objective non-improving for {obj_non_improve} iterations")
-                break
+            if model_time_period == "daily":
+                if q_obj_patience > 0 and obj_non_improve >= q_obj_patience:
+                    print(f"  QUALITY STOP: objective non-improving for "
+                          f"{obj_non_improve} iterations")
+                    break
+            else:
+                improvement = geh5 - prev_geh5
+                if it > 1 and improvement < min_improvement:
+                    print(f"  STALLED: GEH improvement {improvement:.2f}% "
+                          f"< {min_improvement}%")
+                    break
+                if q_obj_patience > 0 and obj_non_improve >= q_obj_patience:
+                    print(f"  QUALITY STOP: objective non-improving for "
+                          f"{obj_non_improve} iterations")
+                    break
 
             prev_geh5 = geh5
 
-            # 5) Scale OD matrix (use compare_col -- corridor volume when available)
-            if (
-                scale_enabled
-                and not valid.empty
-                and compare_col
-                and total_vol > 0
-            ):
-                d_damping, d_min_factor, d_max_factor = _estimate_data_driven_scaling_params(
-                    valid,
-                    compare_col,
-                    obs_col=obs_col,
-                    default_damping=damping,
-                    default_min_factor=min_factor,
-                    default_max_factor=max_factor,
-                    enable=adaptive_scaling,
-                    policy=scale_cfg.get("adaptive_policy"),
-                )
-                if scale_method == "global":
-                    factor = _compute_global_factor(
-                        valid, compare_col, damping=d_damping,
-                        min_factor=d_min_factor, max_factor=d_max_factor,
-                        obs_col=obs_col,
+            # 5) Spiess-style OD update: screenline corrections + global residual + elasticity clip
+            if scale_enabled and not valid.empty and compare_col and total_vol > 0:
+                data = mat.matrix[core_name]
+                demand = data[:, :].copy().astype(np.float64)
+
+                # (a) Screenline Spiess corrections
+                if sl_matrices and sl_results:
+                    n_sl_active = sum(
+                        1 for sn in sl_matrices
+                        if _sr_val(sl_results.get(sn, {}), "observed_total") > 0
+                        and _sr_val(sl_results.get(sn, {}), "modeled_total") > 0
                     )
-                    print(f"  Global scaling factor: {factor:.3f}")
-                    scale_matrix(mat, core_name, factor)
-                elif scale_method == "select_link" and sl_matrices:
-                    corrections = _apply_select_link_od_correction(
-                        mat, core_name, sl_matrices, sl_results,
-                        damping=d_damping, min_factor=d_min_factor, max_factor=d_max_factor,
-                    )
-                    if corrections:
-                        print(f"  Select-link corrections: {corrections}")
-                    else:
-                        print("  Select-link: no corrections applied, falling back to global")
-                        factor = _compute_global_factor(
-                            valid, compare_col, damping=d_damping,
-                            min_factor=d_min_factor, max_factor=d_max_factor,
-                            obs_col=obs_col,
+                    sl_damp = 1.0 / max(np.sqrt(n_sl_active), 1.0)
+                    corrections_log = []
+
+                    for sl_name, sl_od_raw in sl_matrices.items():
+                        obs_sl = _sr_val(sl_results.get(sl_name, {}), "observed_total")
+                        mod_sl = _sr_val(sl_results.get(sl_name, {}), "modeled_total")
+                        if obs_sl <= 0 or mod_sl <= 0:
+                            continue
+                        ratio = obs_sl / mod_sl
+                        if ratio > 5.0 or ratio < 0.2:
+                            continue
+
+                        sl_od = np.asarray(sl_od_raw, dtype=np.float64).reshape(demand.shape)
+                        proportion = np.where(
+                            demand > 0,
+                            np.clip(sl_od / np.maximum(demand, 1e-9), 0.0, 1.0),
+                            0.0,
                         )
-                        scale_matrix(mat, core_name, factor)
-                elif scale_method in {"sector", "sector_od"}:
-                    # Class-aware / segment-aware correction: apply OD-sector pair factors
-                    # instead of collapsing per-class ratios to a single global multiplier.
-                    _do_sector_od_scaling(
-                        mat, core_name, valid, compare_col,
-                        links_gdf=links_gdf,
-                        project_dir=project_dir,
-                        damping=d_damping, min_factor=d_min_factor,
-                        max_factor=d_max_factor, obs_col=obs_col,
-                        sector_cfg=scale_cfg.get("sectors"),
+                        adjustment = 1.0 + sl_damp * (ratio - 1.0) * proportion
+                        np.clip(adjustment, 0.5, 2.0, out=adjustment)
+                        demand *= adjustment
+                        corrections_log.append(f"{sl_name}={ratio:.2f}")
+
+                    if corrections_log:
+                        print(f"  Spiess SL corrections ({len(corrections_log)}): "
+                              f"{', '.join(corrections_log)}")
+
+                # (b) Global residual correction from all count posts
+                sum_obs = float(valid[obs_col].sum())
+                sum_mod = float(valid[compare_col].sum())
+                if sum_mod > 0 and sum_obs > 0:
+                    global_ratio = sum_obs / sum_mod
+                    global_factor = 1.0 + damping * (global_ratio - 1.0)
+                    global_factor = float(np.clip(global_factor, 0.8, 1.25))
+                    if abs(global_factor - 1.0) > 0.003:
+                        demand *= global_factor
+                        print(f"  Global residual: obs/mod={global_ratio:.3f} "
+                              f"→ factor={global_factor:.4f}")
+
+                # (c) Gateway calibration — per-gateway OD scaling
+                if ctx.gw_cal_enabled and vol_col:
+                    gw_modeled = _compute_gateway_modeled_volumes(
+                        vol_df, screenlines, vol_col,
                     )
-                elif scale_method == "sector_legacy":
-                    factors = _compute_sector_factors(
-                        valid, compare_col, damping=d_damping,
-                        min_factor=d_min_factor, max_factor=d_max_factor,
-                        obs_col=obs_col,
+                    gw_corrections = _apply_gateway_calibration(
+                        demand,
+                        ctx.gw_zone_map,
+                        ctx.gw_observed,
+                        gw_modeled,
+                        damping=ctx.gw_cal_damping,
+                        min_factor=ctx.gw_cal_min_factor,
+                        max_factor=ctx.gw_cal_max_factor,
+                        seed_lower=seed_lower,
+                        seed_upper=seed_upper,
                     )
-                    if factors:
-                        obs_weights = {}
-                        for lt in factors:
-                            sub = valid[valid["link_type"] == lt]
-                            obs_weights[lt] = float(sub[obs_col].sum())
-                        total_w = sum(obs_weights.values())
-                        wavg = sum(f * obs_weights.get(k, 0) for k, f in factors.items()) / max(total_w, 1e-9)
-                        print(f"  Sector factors ({len(factors)}): weighted_avg={wavg:.3f}  {factors}")
-                        scale_matrix(mat, core_name, factors, weights=obs_weights)
-                    else:
-                        print("  No sector factors computed — skipping scaling")
-                else:
-                    print(f"  Unknown scale_method='{scale_method}', falling back to global")
-                    factor = _compute_global_factor(
-                        valid, compare_col, damping=d_damping,
-                        min_factor=d_min_factor, max_factor=d_max_factor,
-                        obs_col=obs_col,
-                    )
-                    scale_matrix(mat, core_name, factor)
+                    if gw_corrections:
+                        print(f"  Gateway calibration ({len(gw_corrections)}):")
+                        for gc_line in gw_corrections:
+                            print(f"    {gc_line}")
+
+                # (d) Elasticity clip
+                np.clip(demand, seed_lower, seed_upper, out=demand)
+                np.maximum(demand, 0.0, out=demand)
+                data[:, :] = demand
+                print(f"  Demand after update: {demand.sum():,.0f}")
+
             elif not scale_enabled:
                 print("  Scaling disabled (principle: frozen / diagnostic run)")
             else:
@@ -1760,8 +2746,10 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             mat.save()
 
     finally:
-        mat.close()
-        project.close()
+        ctx.best_Z = best_Z
+        ctx.best_demand = best_demand
+        ctx.best_iteration = best_iteration
+        ctx.restore_best_and_close()
 
     # Per-period validation (uses daily observed × period shares)
     period_stats: Dict[str, Any] = {}
@@ -1772,7 +2760,6 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             profile = load_profile(cfg)
             period_shares = get_demand_period_shares(profile)
             cal_periods = period_cfg.get("periods", ["am", "pm", "daily"])
-            dir_ratios = period_cfg.get("directional_ratios", {})
 
             print("\n=== PER-PERIOD VALIDATION ===")
 
@@ -1801,6 +2788,12 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                         algorithm=algorithm,
                         max_iter=max_iter_assign,
                         rgap_target=rgap,
+                        fixed_cost_field=gc_field,
+                        fixed_cost_multiplier=gc_mult,
+                        vot=gc_vot,
+                        bpr_parameters=cfg_bpr,
+                        multi_class=cfg_multi,
+                        cores=cores,
                     )
 
                     vc_p = _detect_volume_col(vol_df_p)
@@ -1809,7 +2802,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
 
                     lv = links_gdf.copy()
                     lv = lv.merge(vol_df_p[["link_id", vc_p]], on="link_id", how="left")
-                    m_p = match_counts_to_links(pent, lv, buffer_m=buffer_m)
+                    m_p = match_counts_to_links(pent, lv, buffer_m=buffer_m, vol_col=vc_p)
 
                     obs_period_col = f"_obs_{period}"
                     if period == "daily":
@@ -1819,11 +2812,17 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
 
                     vp = m_p.dropna(subset=[vc_p, obs_period_col])
                     vp = vp[vp[obs_period_col] > 0].copy()
+                    if "_excluded" in vp.columns:
+                        vp = vp[~vp["_excluded"]].copy()
                     if len(vp) > 0:
-                        ps = compute_stats(vp[vc_p].values, vp[obs_period_col].values)
+                        p_dcf = daily_cap_factor if period == "daily" else 1.0
+                        ps = compute_stats(
+                            vp[vc_p].values, vp[obs_period_col].values,
+                            daily_capacity_factor=p_dcf,
+                        )
                         period_stats[period] = ps
-                        print(f"    GEH<5: {ps.get('geh_lt5_pct', 0):.1f}%  "
-                              f"R²: {ps.get('r2')}  n={ps.get('n')}")
+                        print(f"    R²={ps.get('r2')}  slope={ps.get('slope')}  "
+                              f"%RMSE={ps.get('pct_rmse')}  n={ps.get('n')}")
                     else:
                         print(f"    No valid matched volumes for {period}")
             finally:
@@ -1835,12 +2834,16 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     # Save calibration report
     report = {
         "iterations": len(history),
-        "converged": history[-1].get("geh_lt5_pct", 0) >= geh_target if history else False,
+        "model_time_period": model_time_period,
+        "converged": _check_final_convergence(history, model_time_period, geh_target, daily_conv),
         "history": history,
         "final": history[-1] if history else {},
         "config": {
             "max_iterations": max_iterations,
+            "model_time_period": model_time_period,
+            "daily_capacity_factor": daily_cap_factor,
             "geh_target": geh_target,
+            "daily_convergence": daily_conv if model_time_period == "daily" else None,
             "scale_method": scale_method,
             "scale_enabled": scale_enabled,
             "damping": damping,
@@ -1857,6 +2860,8 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             "objective_patience": q_obj_patience,
             "objective_weights": {
                 "spearman": w_rho,
+                "r2": w_r2,
+                "slope_penalty": w_slope,
                 "geh_lt5": w_geh,
                 "wmape_pct": w_wmape,
                 "class_bias_max_abs_pct": w_bias,
@@ -1892,98 +2897,177 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Independent validation (CSD2020)
+# Independent validation (CSD)
 # ---------------------------------------------------------------------------
+
+_CSD_COMPATIBLE_LINK_TYPES: dict = {
+    "motorway": {"motorway", "motorway_link"},
+    "trunk": {"trunk", "trunk_link", "primary", "primary_link"},
+    "secondary": {"secondary", "secondary_link", "primary", "primary_link", "trunk", "trunk_link"},
+    "tertiary": {"tertiary", "tertiary_link", "secondary", "secondary_link", "unclassified", "residential"},
+}
+
+_MIN_VOL_FOR_CSD_LW = 100  # boundary links with < 100 veh/day are artifacts
+
 
 def match_csd_to_links(
     csd: pd.DataFrame,
     links_gdf: gpd.GeoDataFrame,
-    metric_epsg: int = 5514,
 ) -> pd.DataFrame:
-    """Coarse road-class comparison only (no spatial join).
+    """Per-road matching via ``osm_ref`` ↔ CSD ``sil``.
 
-    For each CSD coarse class, compares mean car AADT over **CSD counting sections**
-    to mean assigned volume over **all model links** whose OSM ``link_type`` maps to
-    that class. These are different statistical populations (sampled official sections
-    vs full OSM graph), so secondary/tertiary gaps are often large even when the model
-    is reasonable—use pentlogram / screenline blocks for observation-matched metrics.
+    For each CSD road number (e.g. D1, 52, 152), finds all model links
+    whose ``osm_ref`` contains that road number (splitting composite
+    refs like ``"D1;50"`` on ``";"``) and computes a length-weighted
+    mean model volume, compared against the CSD section-averaged AADT.
+
+    Links with near-zero volume (< 100 veh/day) are excluded from the
+    length-weighted mean to avoid dilution by boundary artifacts.
+    Link types are filtered to be compatible with the CSD road class.
     """
-    _ = metric_epsg  # reserved for a future spatial match implementation
     csd = csd.copy()
-    if "sil" in csd.columns:
-        csd["road_class"] = csd["sil"].apply(_classify_csd_road)
+    if "sil" not in csd.columns or "osm_ref" not in links_gdf.columns:
+        return pd.DataFrame()
+
+    for col in ("o", "sv", "tv"):
+        if col in csd.columns:
+            csd[col] = pd.to_numeric(csd[col], errors="coerce").fillna(0)
+
+    csd["road_class"] = csd["sil"].apply(_classify_csd_road)
+    csd_sil = csd["sil"].str.strip()
+
+    vol_cols = [
+        c for c in links_gdf.columns
+        if c.endswith("_tot") and c not in ("PCE_tot", "Preload_tot")
+    ]
+    tot_col = None
+    if "total_vehicles_tot" in vol_cols:
+        tot_col = "total_vehicles_tot"
     else:
-        csd["road_class"] = "other"
+        for vc in vol_cols:
+            if links_gdf[vc].sum() > 0:
+                tot_col = vc
+                break
+    if tot_col is None:
+        return pd.DataFrame()
 
-    model_class_map = {}
-    if "link_type" in links_gdf.columns:
-        for lt in links_gdf["link_type"].dropna().unique():
-            lt_str = str(lt).lower()
-            for rc in ("motorway", "trunk", "primary", "secondary", "tertiary"):
-                if rc in lt_str:
-                    model_class_map[str(lt)] = rc
-                    break
+    links_work = links_gdf.copy()
+    links_work[tot_col] = pd.to_numeric(links_work[tot_col], errors="coerce").fillna(0)
+    if "distance" in links_work.columns:
+        links_work["distance"] = pd.to_numeric(links_work["distance"], errors="coerce").fillna(0)
 
-    matched_rows = []
-    for rc in csd["road_class"].unique():
-        csd_sub = csd[csd["road_class"] == rc]
-        model_types = [k for k, v in model_class_map.items() if v == rc]
-        if not model_types:
+    raw_refs = links_work["osm_ref"].fillna("").str.strip()
+
+    # Build a reverse index: for each link, explode composite osm_ref
+    # ("D1;50" → ["D1", "50"]) so CSD roads match any component.
+    ref_components = raw_refs.str.split(";").explode().str.strip()
+    ref_components = ref_components[ref_components != ""]
+
+    matched_roads: list = []
+    csd_roads = csd_sil.unique()
+
+    for road in csd_roads:
+        csd_sub = csd[csd_sil == road]
+        if csd_sub.empty:
             continue
-        links_sub = links_gdf[links_gdf["link_type"].isin(model_types)]
-        if links_sub.empty:
+
+        matching_indices = ref_components.index[ref_components == road]
+        if len(matching_indices) == 0:
+            continue
+        model_sub = links_work.loc[matching_indices.unique()]
+
+        csd_mean_sv = float(csd_sub["sv"].mean())
+        csd_mean_o = float(csd_sub["o"].mean())
+        n_csd = len(csd_sub)
+        road_class = csd_sub["road_class"].iloc[0]
+
+        car_links = model_sub
+        if "link_type" in car_links.columns:
+            lt = car_links["link_type"].astype(str)
+            car_links = car_links[~lt.isin(_NON_CAR_LINK_TYPES)]
+            compatible = _CSD_COMPATIBLE_LINK_TYPES.get(road_class)
+            if compatible:
+                car_links = car_links[lt.reindex(car_links.index).isin(compatible)]
+
+        n_model = len(car_links)
+        if n_model == 0:
             continue
 
-        csd_mean_aadt = float(csd_sub["o"].mean()) if "o" in csd_sub.columns else 0
-        csd_med_aadt = float(csd_sub["o"].median()) if "o" in csd_sub.columns else 0
-        csd_total_aadt = float(csd_sub["o"].sum()) if "o" in csd_sub.columns else 0
-        model_mean_vol = 0.0
-        model_median_vol = 0.0
-        model_len_weighted_mean = 0.0
-        model_total_vol = 0.0
-        n_model_car = 0
-        vol_cols = [c for c in links_sub.columns if c.endswith("_tot") and links_sub[c].sum() > 0]
-        if vol_cols:
-            vc = vol_cols[0]
-            lf = _links_for_csd_coarse_class_stats(links_sub, vc)
-            if len(lf) == 0:
-                continue
-            n_model_car = len(lf)
-            model_mean_vol = float(lf[vc].mean())
-            model_median_vol = float(lf[vc].median())
-            model_total_vol = float(lf[vc].sum())
-            if "distance" in lf.columns:
-                dist = pd.to_numeric(lf["distance"], errors="coerce").fillna(0.0).to_numpy()
-                v = lf[vc].to_numpy()
-                dsum = float(dist.sum())
-                if dsum > 0:
-                    model_len_weighted_mean = float((v * dist).sum() / dsum)
+        active = car_links[car_links[tot_col] >= _MIN_VOL_FOR_CSD_LW]
+        if active.empty:
+            active = car_links
 
-        matched_rows.append({
-            "road_class": rc,
-            "csd_sections": len(csd_sub),
-            "model_links": len(links_sub),
-            "model_links_car_roads": n_model_car,
-            "csd_mean_cars": round(csd_mean_aadt, 0),
-            "csd_median_cars": round(csd_med_aadt, 0),
-            "csd_total_cars": round(csd_total_aadt, 0),
-            "model_mean_vol": round(model_mean_vol, 0),
-            "model_median_vol": round(model_median_vol, 0),
-            "model_len_weighted_mean_vol": round(model_len_weighted_mean, 0),
-            "model_total_vol": round(model_total_vol, 0),
+        vols = active[tot_col].values
+        if "distance" in active.columns:
+            dists = active["distance"].values
+            dsum = float(dists.sum())
+            if dsum > 0:
+                model_lw_mean = float((vols * dists).sum() / dsum)
+            else:
+                model_lw_mean = float(vols.mean())
+        else:
+            model_lw_mean = float(vols.mean())
+
+        geh = float(compute_geh(np.array([model_lw_mean]), np.array([csd_mean_sv]))[0])
+
+        matched_roads.append({
+            "road": road,
+            "road_class": road_class,
+            "csd_sections": n_csd,
+            "model_links": n_model,
+            "csd_mean_sv": round(csd_mean_sv, 0),
+            "csd_mean_o": round(csd_mean_o, 0),
+            "model_lw_mean": round(model_lw_mean, 0),
+            "geh": round(geh, 1),
         })
 
-    return pd.DataFrame(matched_rows)
+    if not matched_roads:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(matched_roads)
+
+    # Summary statistics across matched roads
+    obs = result["csd_mean_sv"].values.astype(float)
+    mod = result["model_lw_mean"].values.astype(float)
+
+    if len(obs) >= 2:
+        mask = (obs > 0) & (mod > 0)
+        if mask.sum() >= 2:
+            o_valid = obs[mask]
+            m_valid = mod[mask]
+            ss_res = float(((m_valid - o_valid) ** 2).sum())
+            ss_tot = float(((o_valid - o_valid.mean()) ** 2).sum())
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+            bias = float((m_valid.sum() - o_valid.sum()) / o_valid.sum() * 100)
+            pct_rmse = float(np.sqrt(((m_valid - o_valid) ** 2).mean()) / o_valid.mean() * 100)
+            result.attrs["summary"] = {
+                "n_roads": int(mask.sum()),
+                "r2": round(r2, 3),
+                "bias_pct": round(bias, 1),
+                "pct_rmse": round(pct_rmse, 1),
+                "mean_geh": round(float(result.loc[mask, "geh"].mean()), 1),
+            }
+
+    return result
+
 
 
 def compute_validation_benchmarks(
     count_stats: Dict[str, Any],
     screenline_results: Dict[str, Any],
     jt_results: List[Dict[str, Any]],
+    *,
+    model_time_period: str = "daily",
+    daily_thresholds: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Check FHWA/Scottish validation benchmarks."""
+    """Check validation benchmarks for the model's time aggregation.
+
+    For daily models: R², slope, %RMSE, bias, screenline deviations.
+    GEH is diagnostic only (FHWA target is for hourly flows).
+    Thresholds default to calibration.convergence.daily if not provided.
+    """
     geh5 = float(count_stats.get("geh_lt5_pct", 0))
-    geh_pass = geh5 >= 85.0
+    geh_pass_hourly = geh5 >= 85.0
 
     jt_pass_count = sum(1 for r in jt_results if r.get("pass", False))
     jt_total = len(jt_results) if jt_results else 0
@@ -1996,19 +3080,61 @@ def compute_validation_benchmarks(
         if ratio is not None:
             sl_max_error = max(sl_max_error, abs(ratio - 1.0) * 100)
 
-    return {
-        "geh_lt5_pct": round(geh5, 1),
-        "geh_benchmark_pass": geh_pass,
+    result: Dict[str, Any] = {
+        "model_time_period": model_time_period,
+        "screenline_max_error_pct": round(sl_max_error, 1),
         "jt_within_tolerance_pct": round(jt_pct, 1) if jt_total > 0 else None,
         "jt_benchmark_pass": jt_pass,
         "jt_routes_checked": jt_total,
-        "screenline_max_error_pct": round(sl_max_error, 1),
-        "overall_pass": geh_pass and (jt_pass is None or jt_pass),
+        # Hourly GEH — always reported; authoritative only for hourly models
+        "geh_lt5_pct": round(geh5, 1),
+        "geh_benchmark_pass_hourly": geh_pass_hourly,
     }
+
+    if model_time_period == "daily":
+        dt = daily_thresholds or {}
+        r2 = float(count_stats.get("r2") or 0.0)
+        slope = float(count_stats.get("slope") or 0.0)
+        prmse = float(count_stats.get("pct_rmse") or 999.0)
+        bias = abs(float(count_stats.get("bias_pct") or 999.0))
+        daily_geh_adj = float(count_stats.get("daily_geh_lt_adj_pct") or 0.0)
+
+        r2_target = float(dt.get("r2_target", 0.80))
+        slope_range = dt.get("slope_range", [0.85, 1.15])
+        prmse_max = float(dt.get("pct_rmse_max", 35.0))
+        bias_max = float(dt.get("bias_abs_max_pct", 15.0))
+        sl_max = float(dt.get("screenline_max_pct_deviation", 15.0))
+
+        r2_pass = r2 >= r2_target
+        slope_pass = slope_range[0] <= slope <= slope_range[1]
+        prmse_pass = prmse <= prmse_max
+        bias_pass = bias <= bias_max
+        sl_pass = sl_max_error <= sl_max
+
+        daily_pass = r2_pass and slope_pass and prmse_pass and bias_pass
+        result.update({
+            "daily_r2": round(r2, 4),
+            "daily_r2_pass": r2_pass,
+            "daily_slope": round(slope, 4),
+            "daily_slope_pass": slope_pass,
+            "daily_pct_rmse": round(prmse, 1),
+            "daily_pct_rmse_pass": prmse_pass,
+            "daily_bias_abs_pct": round(bias, 2),
+            "daily_bias_pass": bias_pass,
+            "daily_screenline_pass": sl_pass,
+            "daily_geh_lt_adj_pct": round(daily_geh_adj, 1),
+            "daily_overall_pass": daily_pass and (jt_pass is None or jt_pass),
+            "overall_pass": daily_pass and (jt_pass is None or jt_pass),
+            "note": "GEH<5 target applies to hourly flows; daily model uses R²/slope/%RMSE/bias",
+        })
+    else:
+        result["overall_pass"] = geh_pass_hourly and (jt_pass is None or jt_pass)
+
+    return result
 
 
 def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
-    """Comprehensive independent validation against CSD2020 + screenlines + journey times."""
+    """Comprehensive independent validation against CSD + screenlines + journey times."""
     cfg = load_config(config_path)
     project_dir = Path(cfg["project_path"])
     demand_cfg = cfg.get("demand") or {}
@@ -2025,7 +3151,23 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
             f"No assignment results at {results_path}. Run 'calibrate' or 'assign' first."
         )
     vol_df = pd.read_parquet(str(results_path))
-    vol_col = _detect_volume_col(vol_df)
+
+    # Use total_vehicles_tot if the calibration loop already created it;
+    # otherwise sum per-class columns (excluding any pre-existing total).
+    if "total_vehicles_tot" in vol_df.columns and vol_df["total_vehicles_tot"].sum() > 0:
+        vol_col = "total_vehicles_tot"
+    else:
+        vol_col = _detect_volume_col(vol_df)
+        class_tot_cols = [
+            c for c in vol_df.columns
+            if c.endswith("_tot")
+            and c not in ("PCE_tot", "Preload_tot", "total_vehicles_tot")
+            and vol_df[c].sum() > 0
+        ]
+        if len(class_tot_cols) > 1:
+            vol_df["total_vehicles_tot"] = vol_df[class_tot_cols].sum(axis=1)
+            vol_col = "total_vehicles_tot"
+
     print(f"  Loaded assignment: {len(vol_df)} links, vol_col={vol_col}")
 
     links_gdf = _load_network_links(project_dir)
@@ -2035,77 +3177,84 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
     count_target = str(calib_cfg.get("count_target", "total"))
     obs_col = "observed_car" if count_target == "car_only" else "observed_total"
 
-    report: Dict[str, Any] = {}
+    assign_cfg = cfg.get("assignment") or {}
+    bpr_cfg = assign_cfg.get("bpr") or {}
+    daily_cap_factor = resolve_daily_cap_factor_default(bpr_cfg)
+    model_time_period = str(calib_cfg.get("model_time_period", "daily"))
+
+    report: Dict[str, Any] = {"model_time_period": model_time_period}
 
     # 1) Pentlogram (reference -- same data as calibration)
-    print("\n1) Pentlogram comparison (reference) ...")
+    print(f"\n1) Pentlogram comparison (reference, time_period={model_time_period}) ...")
     pent_stats: Dict[str, Any] = {"n": 0}
     try:
         pent = load_pentlogram(cfg)
-        validate_geometries_or_fail(pent, name="pentlogram", expected_epsg=5514)
+        validate_geometries_or_fail(
+            pent, name="pentlogram", expected_epsg=get_metric_epsg(cfg),
+        )
         agg_corr = bool(calib_cfg.get("aggregate_corridor", True))
         matched = match_counts_to_links(pent, links_gdf, buffer_m=buffer_m,
-                                         aggregate_corridor=agg_corr)
+                                         aggregate_corridor=agg_corr,
+                                         vol_col=vol_col)
         vc = vol_col if vol_col and vol_col in matched.columns else None
         compare_vc = "_corridor_volume" if "_corridor_volume" in matched.columns else vc
         if compare_vc and compare_vc in matched.columns:
             valid = matched.dropna(subset=[compare_vc, obs_col])
             valid = valid[valid[obs_col] > 0]
-            pent_stats = compute_stats(valid[compare_vc].values, valid[obs_col].values)
+            if "_excluded" in valid.columns:
+                valid = valid[~valid["_excluded"]].copy()
+            pent_stats = compute_stats(
+                valid[compare_vc].values, valid[obs_col].values,
+                daily_capacity_factor=daily_cap_factor,
+            )
             report["pentlogram"] = {"matched": int(len(valid)), **pent_stats}
-            print(f"  Matched: {len(valid)}  GEH<5: {pent_stats.get('geh_lt5_pct')}%  "
-                  f"R²: {pent_stats.get('r2')}")
+            print(f"  Matched: {len(valid)}  R²={pent_stats.get('r2')}  "
+                  f"slope={pent_stats.get('slope')}  %RMSE={pent_stats.get('pct_rmse')}  "
+                  f"bias={pent_stats.get('bias_pct')}%")
+            print(f"  GEH<5: {pent_stats.get('geh_lt5_pct')}%  "
+                  f"daily-adj GEH<{pent_stats.get('daily_geh_threshold', 5):.0f}: "
+                  f"{pent_stats.get('daily_geh_lt_adj_pct')}%")
         else:
             print("  No volume column on links")
     except Exception as e:
         print(f"  SKIP: {e}")
 
-    # 2) CSD2020 -- independent link-level validation
-    print("\n2) CSD2020 independent validation ...")
+    # 2) CSD -- independent per-road validation
+    print("\n2) CSD independent validation (per-road matching via osm_ref) ...")
     csd_match_df = pd.DataFrame()
+    csd = None
     try:
-        csd = load_csd2020(cfg)
+        csd = load_csd(cfg)
         csd_agg = aggregate_csd_by_class(csd)
-        report["csd2020_observed"] = csd_agg.to_dict(orient="records")
+        report["csd_observed"] = csd_agg.to_dict(orient="records")
 
         if vol_col and vol_col in links_gdf.columns:
             model_agg = aggregate_model_by_class(links_gdf, vol_col)
-            report["csd2020_modeled"] = model_agg.to_dict(orient="records")
+            report["csd_modeled"] = model_agg.to_dict(orient="records")
 
         csd_match_df = match_csd_to_links(csd, links_gdf)
         if not csd_match_df.empty:
-            report["csd2020_link_matching"] = csd_match_df.to_dict(orient="records")
+            report["csd_link_matching"] = csd_match_df.to_dict(orient="records")
 
-        print(f"  CSD2020 JMK: {len(csd)} sections")
+        print(f"  CSD: {len(csd)} sections")
         for _, r in csd_agg.iterrows():
             print(f"    {r['road_class']:12s}  sections={int(r['sections']):4d}  "
                   f"mean_AADT={r['mean_sv']:>8.0f}  mean_cars={r['mean_o']:>8.0f}")
+
         if not csd_match_df.empty:
-            print(f"  Coarse class comparison (not spatially matched): {len(csd_match_df)} classes")
+            print(f"  Per-road comparison: {len(csd_match_df)} roads matched")
             for _, r in csd_match_df.iterrows():
-                lw = r.get("model_len_weighted_mean_vol", 0) or 0
                 print(
-                    f"    {r['road_class']:12s}  csd_mean={r['csd_mean_cars']:>8.0f}  "
-                    f"csd_med={r.get('csd_median_cars', 0):>8.0f}  "
-                    f"model_mean={r['model_mean_vol']:>8.0f}  "
-                    f"model_med={r.get('model_median_vol', 0):>8.0f}  "
-                    f"model_Lw_mean={lw:>8.0f}"
+                    f"    {r['road']:>8s} ({r['road_class']:>10s})  "
+                    f"csd_sv={r['csd_mean_sv']:>8.0f}  model={r['model_lw_mean']:>8.0f}  "
+                    f"GEH={r['geh']:>5.1f}  sections={r['csd_sections']}  links={r['model_links']}"
                 )
-            print(
-                "  NOTE: CSD columns are mean/median car AADT per official counting section; model columns are"
-            )
-            print(
-                "  over all OSM links in that coarse class (excl. centroid connectors / non-car types)."
-            )
-            print(
-                "  Czech silnice class II/III vs OSM highway=secondary/tertiary often diverge; many local"
-            )
-            print(
-                "  OSM links carry assigned demand without a CSD twin, so means need not align. For fit vs"
-            )
-            print(
-                "  observations use pentlogram (above) and screenlines."
-            )
+            summary = getattr(csd_match_df, "attrs", {}).get("summary")
+            if summary:
+                print(f"  Summary ({summary['n_roads']} roads): "
+                      f"R²={summary['r2']:.3f}  bias={summary['bias_pct']:.1f}%  "
+                      f"%RMSE={summary['pct_rmse']:.1f}  mean_GEH={summary['mean_geh']:.1f}")
+                report["csd_summary"] = summary
     except Exception as e:
         print(f"  SKIP: {e}")
 
@@ -2137,12 +3286,12 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
     jt_results: List[Dict[str, Any]] = []
     speed_comparison: Dict[str, Any] = {}
     try:
-        # Class-level speed comparison from CSD2020
-        if "csd" in dir() and not csd.empty:
-            speed_comparison = compute_class_speed_comparison(links_gdf, csd)
+        # Class-level speed comparison
+        if csd is not None and not csd.empty:
+            speed_comparison = compute_class_speed_comparison(links_gdf)
             report["class_speed_comparison"] = speed_comparison
             if speed_comparison:
-                print("  Speed comparison (model vs CSD2020):")
+                print("  Speed comparison (model vs CSD):")
                 for lt, sc in speed_comparison.items():
                     print(f"    {lt:20s}  model={sc['modeled_kmh']:>5.1f}  "
                           f"ref={sc.get('reference_kmh', sc.get('csd_implied_kmh', 0)):>5.1f}  "
@@ -2177,8 +3326,13 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
         print(f"  SKIP: {e}")
 
     # 5) Benchmark summary
-    print("\n5) FHWA / Scottish benchmarks ...")
-    benchmarks = compute_validation_benchmarks(pent_stats, sl_results, jt_results)
+    print(f"\n5) Validation benchmarks (model_time_period={model_time_period}) ...")
+    daily_conv = _get(cfg, ["calibration", "convergence", "daily"], {})
+    benchmarks = compute_validation_benchmarks(
+        pent_stats, sl_results, jt_results,
+        model_time_period=model_time_period,
+        daily_thresholds=daily_conv,
+    )
     report["benchmarks"] = benchmarks
     qcfg = (calib_cfg.get("quality_gates") or {})
     q_bias_hard = float(qcfg.get("hard_class_bias_max_abs_pct", 90.0))
@@ -2201,8 +3355,21 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
         "warnings": q_warns,
     }
     overall = "PASS" if benchmarks["overall_pass"] else "FAIL"
-    print(f"  GEH<5 >= 85%:  {benchmarks['geh_lt5_pct']:.1f}%  "
-          f"{'PASS' if benchmarks['geh_benchmark_pass'] else 'FAIL'}")
+    if model_time_period == "daily":
+        print(f"  R² >= 0.85:     {benchmarks.get('daily_r2', 0):.4f}  "
+              f"{'PASS' if benchmarks.get('daily_r2_pass') else 'FAIL'}")
+        print(f"  slope [0.9-1.1]: {benchmarks.get('daily_slope', 0):.4f}  "
+              f"{'PASS' if benchmarks.get('daily_slope_pass') else 'FAIL'}")
+        print(f"  %RMSE <= 30%:   {benchmarks.get('daily_pct_rmse', 0):.1f}%  "
+              f"{'PASS' if benchmarks.get('daily_pct_rmse_pass') else 'FAIL'}")
+        print(f"  |bias| <= 10%:  {benchmarks.get('daily_bias_abs_pct', 0):.2f}%  "
+              f"{'PASS' if benchmarks.get('daily_bias_pass') else 'FAIL'}")
+        print(f"  SL dev <= 15%:  {benchmarks.get('screenline_max_error_pct', 0):.1f}%  "
+              f"{'PASS' if benchmarks.get('daily_screenline_pass') else 'FAIL'}")
+        print(f"  (GEH<5: {geh:.1f}% — diagnostic only for daily model)")
+    else:
+        print(f"  GEH<5 >= 85%:  {geh:.1f}%  "
+              f"{'PASS' if benchmarks.get('geh_benchmark_pass_hourly') else 'FAIL'}")
     if benchmarks["jt_benchmark_pass"] is not None:
         print(f"  JT within tol:  {benchmarks['jt_within_tolerance_pct']:.1f}%  "
               f"{'PASS' if benchmarks['jt_benchmark_pass'] else 'FAIL'}")
@@ -2212,3 +3379,101 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
     report_path = output_dir / "validation_report.json"
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\nValidation report: {report_path}")
+
+
+# ---------------------------------------------------------------------------
+# Lightweight diagnostics refresh (no assignment, no calibration)
+# ---------------------------------------------------------------------------
+
+def run_match_diagnostics(config_path: str | Path = "config/sim.yaml") -> None:
+    """Regenerate matching_diagnostics.csv from existing assignment results.
+
+    This is a fast (~seconds) step that re-matches the cleaned pentlogram
+    data against the current assignment results and exports the diagnostics
+    CSV used by the frontend's bias / corridor panels.  It does **not**
+    re-run traffic assignment or OD scaling.
+    """
+    cfg = load_config(config_path)
+    project_dir = Path(cfg["project_path"])
+    demand_cfg = cfg.get("demand") or {}
+    calib_cfg = cfg.get("calibration") or {}
+    output_dir = Path(demand_cfg.get("output_dir", "outputs/baseline/demand"))
+    _ensure_dir(output_dir)
+
+    buffer_m = float(calib_cfg.get("match_buffer_m", 50.0))
+    direction_aware = bool(calib_cfg.get("match_direction_aware", True))
+    conflict_res = str(calib_cfg.get("match_conflict_resolution", "nearest"))
+    agg_corridor = bool(calib_cfg.get("aggregate_corridor", True))
+
+    count_target = str(calib_cfg.get("count_target", "total"))
+    obs_col = "observed_car" if count_target == "car_only" else "observed_total"
+
+    assign_cfg = cfg.get("assignment") or {}
+    bpr_cfg = assign_cfg.get("bpr") or {}
+    daily_cap_factor = resolve_daily_cap_factor_default(bpr_cfg)
+
+    print("=== MATCH DIAGNOSTICS (lightweight refresh) ===")
+
+    results_path = output_dir / "assignment_results.parquet"
+    if not results_path.exists():
+        raise FileNotFoundError(
+            f"No assignment results at {results_path}. Run 'calibrate' or 'assign' first."
+        )
+    vol_df = pd.read_parquet(str(results_path))
+
+    if "total_vehicles_tot" in vol_df.columns and vol_df["total_vehicles_tot"].sum() > 0:
+        vol_col = "total_vehicles_tot"
+    else:
+        vol_col = _detect_volume_col(vol_df)
+        class_tot_cols = [
+            c for c in vol_df.columns
+            if c.endswith("_tot")
+            and c not in ("PCE_tot", "Preload_tot", "total_vehicles_tot")
+            and vol_df[c].sum() > 0
+        ]
+        if len(class_tot_cols) > 1:
+            vol_df["total_vehicles_tot"] = vol_df[class_tot_cols].sum(axis=1)
+            vol_col = "total_vehicles_tot"
+
+    print(f"  Loaded assignment: {len(vol_df)} links, vol_col={vol_col}")
+
+    pent = load_pentlogram(cfg)
+    validate_geometries_or_fail(
+        pent, name="pentlogram", expected_epsg=get_metric_epsg(cfg),
+    )
+    print(f"  Pentlogram: {len(pent)} segments (after cleaning)")
+
+    links_gdf = _load_network_links(project_dir)
+    if vol_col and "link_id" in vol_df.columns:
+        links_gdf = links_gdf.merge(vol_df[["link_id", vol_col]], on="link_id", how="left")
+
+    matched = match_counts_to_links(
+        pent, links_gdf,
+        buffer_m=buffer_m,
+        direction_aware=direction_aware,
+        conflict_resolution=conflict_res,
+        aggregate_corridor=agg_corridor,
+        vol_col=vol_col,
+    )
+
+    compare_col = "_corridor_volume" if "_corridor_volume" in matched.columns else vol_col
+    _export_matching_diagnostics(matched, compare_col, obs_col, output_dir)
+
+    if compare_col and compare_col in matched.columns:
+        valid = matched.dropna(subset=[compare_col, obs_col])
+        valid = valid[valid[obs_col] > 0]
+        if "_excluded" in valid.columns:
+            valid = valid[~valid["_excluded"]].copy()
+        stats = compute_stats(
+            valid[compare_col].values, valid[obs_col].values,
+            daily_capacity_factor=daily_cap_factor,
+        )
+        print(f"  Matched: {len(valid)}  R²={stats.get('r2')}  slope={stats.get('slope')}  "
+              f"%RMSE={stats.get('pct_rmse')}  bias={stats.get('bias_pct')}%")
+        print(f"  GEH<5: {stats.get('geh_lt5_pct')}%")
+
+    mq = match_quality_report(matched)
+    print(f"  Match quality: {mq['n_matched']}/{mq['n_total']} matched, "
+          f"{mq['n_link_conflicts']} conflicts, "
+          f"mean_dist={mq['mean_match_distance_m']}m")
+    print(f"  Done. Diagnostics CSV: {output_dir / 'matching_diagnostics.csv'}")

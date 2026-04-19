@@ -1,0 +1,38 @@
+# Experiment policy for tuning scripts (scripts/systematic_experiment.py, etc.).
+# Moved from sim.yaml to keep the main config lean.
+policy:
+  objective:
+    primary: "ObjB"
+    secondary: "ObjC"
+    legacy: "ObjA"
+    objB_weights:
+      spearman: 120.0
+      r2: 80.0
+      slope_penalty: 50.0
+      geh_lt5: 0.3
+      wmape_pct: 1.0
+      class_bias_max_abs_pct: 0.35
+      pct_rmse: 1.5
+    objC_weights:
+      spearman: 150.0
+      mean_mae_class: 0.12
+      abs_log_sum_ratio: 25.0
+      pct_rmse: 0.25
+    sum_ratio_clip: { min: 0.25, max: 4.0 }
+  guardrails:
+    hard_class_bias_max_abs_pct: 90.0
+    warn_wmape_pct: 47.0
+    warn_geh_lt5_pct: 50.0
+  tuning_ranges:
+    assignment:
+      max_iter: [100, 150, 200]
+      rgap_target: [0.001, 0.002]
+    matching:
+      match_buffer_m: [10.0, 25.0, 45.0]
+    scaling:
+      damping: [0.05, 0.08, 0.15]
+      min_factor: [0.75, 0.9]
+      max_factor: [1.1, 1.25]
+    gateway:
+      damping: [0.08, 0.15]
+    external_daily_trips: [10000, 20000, 30000]

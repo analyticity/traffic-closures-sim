@@ -1,35 +1,137 @@
-# Screenline / cordon / radial definitions for localized calibration.
-#
-# Three specification methods per screenline:
-#   1. Explicit link IDs:  links: [{link_id: 123, direction: 1}, ...]
-#   2. Geometry cut-line:  geometry_wkt: "LINESTRING(...)"  (auto-detects crossing links)
-#   3. Boundary polygon:   boundary_geojson: "path/to/boundary.geojson"  (for cordons)
+# Screenline / cordon definitions for gateway and corridor validation.
 #
 # direction: 1 = a→b only, -1 = b→a only, 0 = both directions summed
 # type: "screenline" | "cordon" | "radial"
 #
-# Example entries (uncomment and fill link_ids from your network):
+# CSD 2025 observed AADT values (cars only, column "O") are noted per
+# screenline.  The automatic evaluation reads observed counts from the
+# pentlogram-matched data — for boundary links outside pentlogram
+# coverage, observed_total will be 0 and the "ratio" field is not
+# meaningful; compare modeled_total against the CSD reference instead.
 #
-# screenlines:
-#   - name: "svratka_bridges"
-#     description: "All bridges crossing Svratka river"
-#     type: "screenline"
-#     links:
-#       - link_id: 12345
-#         direction: 0
-#       - link_id: 12346
-#         direction: 0
-#
-#   - name: "vmo_cordon"
-#     description: "VMO inner ring cordon"
-#     type: "cordon"
-#     boundary_geojson: "config/vmo_boundary.geojson"
-#
-#   - name: "outer_cordon_north"
-#     description: "Northern entry to model area"
-#     type: "radial"
-#     links:
-#       - link_id: 99001
-#         direction: 1
+# Each screenline uses a SINGLE representative link at the cross-section
+# to avoid double-counting traffic on sequential links in the same corridor.
 
-screenlines: []
+screenlines:
+  - name: "D1_west"
+    description: "D1 motorway western model boundary (CSD 6-8670: Devět křížů → Ostrovačice)"
+    type: "radial"
+    observed_aadt_cars: 36985
+    observed_aadt_all: 58191
+    links:
+      # link 116153: 249524→249530, motorway ref=D1, direction=0 (bidir, 1255m)
+      # D1_NW gateway link — the active carriageway; the parallel carriageway
+      # (links 3142/3143/3141...) dead-ends at node 251664 and carries no
+      # westbound through-traffic.
+      - link_id: 116153
+        direction: 0
+
+  - name: "D1_east"
+    description: "D1 motorway eastern model boundary (CSD 6-8810: Holubice → Rousínov)"
+    type: "radial"
+    observed_aadt_cars: 44152
+    observed_aadt_all: 58936
+    links:
+      # link 3660: 20590→20592, motorway ref=D1, direction=0 (bidir)
+      # At the D1_E gateway anchor nodes — captures full corridor cross-section.
+      # Old link 390 was 7 km west past the D1/I50 junction, missing 40k of traffic.
+      - link_id: 3660
+        direction: 0
+
+  - name: "D2_south"
+    description: "D2 motorway southern model boundary (CSD 6-8710: Brno,Chrlice → Blučina)"
+    type: "radial"
+    observed_aadt_cars: 26394
+    observed_aadt_all: 41320
+    links:
+      # link 120221: 19481→336207, motorway ref=D2, direction=0 (bidir)
+      # At the D2_S gateway anchor — captures bidirectional flow.
+      # Old link 495 was one-way (dir=1), measuring only one carriageway.
+      - link_id: 120221
+        direction: 0
+
+  - name: "I43_north"
+    description: "I/43 primary road northern boundary (CSD 6-0359: Kuřim → hr. Brno-venkov/Blansko)"
+    type: "radial"
+    observed_aadt_cars: 20455
+    observed_aadt_all: 24265
+    links:
+      # link 20690: 171958→251868, primary ref=43 (the active I43 corridor link
+      # carrying ~31k veh/day; old link 143363 was bypassed by centroid connectors
+      # attached to both its endpoints)
+      - link_id: 20690
+        direction: 0
+
+  - name: "I52_south"
+    description: "D52 motorway southern model boundary (CSD 6-0216: hr. Brno-město → × s 152)"
+    type: "radial"
+    observed_aadt_cars: 39022
+    observed_aadt_all: 50911
+    links:
+      # D52 has two one-way carriageways; both must be summed for AADT.
+      # link 44451: 61609→401715, motorway ref=D52, dir=1 (~9.8k, carriageway A)
+      - link_id: 44451
+        direction: 0
+      # link 139989: 401713→401712, motorway ref=D52, dir=1 (~8.9k, carriageway B)
+      - link_id: 139989
+        direction: 0
+
+  # --- Secondary / tertiary corridors ---
+  # These give calibration information about non-motorway roads,
+  # preventing the loop from over-optimizing trunk/motorway fit.
+
+  - name: "Koliste_radial"
+    description: "Koliště secondary ring road (inner city, bidirectional)"
+    type: "radial"
+    observed_aadt_cars: 46000
+    links:
+      # link 81811: 116873→12339, secondary 'Koliště', direction=0 (bidir, 20m)
+      - link_id: 81811
+        direction: 0
+
+  - name: "Dornych_radial"
+    description: "Dornych primary corridor (south-east radial)"
+    type: "radial"
+    observed_aadt_cars: 38000
+    links:
+      # link 42986: 20734→46224, primary 'Dornych', direction=0 (bidir, 295m)
+      - link_id: 42986
+        direction: 0
+
+  - name: "Krenova_radial"
+    description: "Křenová tertiary corridor (east-west through centre)"
+    type: "radial"
+    observed_aadt_cars: 22000
+    links:
+      # link 44204: 409070→421703, tertiary 'Křenová', direction=0 (bidir, 93m)
+      - link_id: 44204
+        direction: 0
+
+  # --- Additional corridors for ODME spatial control ---
+
+  - name: "Zabovreska"
+    description: "Žabovřeská trunk corridor (one carriageway, pentlogram)"
+    type: "radial"
+    observed_aadt_cars: 50000
+    links:
+      # link 85543: 225290→10556, trunk 'Žabovřeská', dir=1 (one-way)
+      - link_id: 85543
+        direction: 0
+
+  - name: "Husovicky_tunel"
+    description: "Husovický tunel trunk corridor (one carriageway, pentlogram)"
+    type: "radial"
+    observed_aadt_cars: 22000
+    links:
+      # link 2652: 18009→67806, trunk 'Husovický tunel', dir=1 (one-way)
+      - link_id: 2652
+        direction: 0
+
+  - name: "Kounicova"
+    description: "Kounicova tertiary corridor (inner city, pentlogram)"
+    type: "radial"
+    observed_aadt_cars: 11000
+    links:
+      # link 42808: 23006→166051, tertiary 'Kounicova', dir=0 (bidir)
+      - link_id: 42808
+        direction: 0

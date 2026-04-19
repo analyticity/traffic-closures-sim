@@ -1,7 +1,7 @@
-"""Temporal traffic profiles learned from CSD2020 data.
+"""Temporal traffic profiles learned from CSD traffic census data.
 
 Provides day-type classification, day factors, and period shares
-derived from observed traffic counts — not hardcoded.
+derived from observed traffic counts.
 """
 from __future__ import annotations
 
@@ -10,27 +10,43 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-import numpy as np
 import pandas as pd
 
-from sim.io_project import load_config
+from sim.io_project import load_config, load_locale
 
 # ---------------------------------------------------------------------------
 # Day classification
 # ---------------------------------------------------------------------------
 
-# Czech public holidays (recurring, month-day)
-_HOLIDAYS_MD = [
+# Default holidays (Czech Republic); overridden by config/locale.yaml.
+_DEFAULT_HOLIDAYS_MD = [
     (1, 1), (5, 1), (5, 8), (7, 5), (7, 6),
     (9, 28), (10, 28), (11, 17), (12, 24), (12, 25), (12, 26),
 ]
 
+_holidays_md_cache: list | None = None
 
-def classify_day(d: date | str) -> str:
+
+def _get_holidays(cfg: Dict[str, Any] | None = None) -> list:
+    global _holidays_md_cache
+    if _holidays_md_cache is not None:
+        return _holidays_md_cache
+    if cfg:
+        locale = load_locale(cfg)
+        raw = locale.get("holidays_md")
+        if raw and isinstance(raw, list):
+            _holidays_md_cache = [tuple(pair) for pair in raw]
+            return _holidays_md_cache
+    _holidays_md_cache = _DEFAULT_HOLIDAYS_MD
+    return _holidays_md_cache
+
+
+def classify_day(d: date | str, cfg: Dict[str, Any] | None = None) -> str:
     """Return day type: 'workday', 'saturday', 'sunday', or 'holiday'."""
     if isinstance(d, str):
         d = datetime.strptime(d, "%Y-%m-%d").date()
-    if (d.month, d.day) in _HOLIDAYS_MD:
+    holidays = _get_holidays(cfg)
+    if (d.month, d.day) in holidays:
         return "holiday"
     wd = d.weekday()
     if wd < 5:
@@ -60,6 +76,10 @@ def _classify_csd_road(sil: str) -> str:
 
 
 def learn_day_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute day-type factors and period shares from CSD data.
+
+    Returns a profile dict and saves it to ``temporal_profile.json``.
+    """
     temporal_policy = ((cfg.get("demand") or {}).get("temporal_policy") or {})
     wsplit = temporal_policy.get("weekend_split") or {}
     sat_mul = float(wsplit.get("saturday_multiplier", 1.10))
@@ -69,19 +89,18 @@ def learn_day_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
     fb_day = float(fallback_shares.get("day", 0.785))
     fb_eve = float(fallback_shares.get("evening", 0.137))
     fb_night = float(fallback_shares.get("night", 0.078))
-
-    """Compute day-type factors and period shares from CSD2020.
-
-    Returns a profile dict and saves it to ``temporal_profile.json``.
-    """
     cache_dir = Path(cfg.get("datasets", {}).get("cache_dir", "data/cache"))
     parquet = cache_dir / "v2_csd2025.parquet"
     if not parquet.exists():
-        raise FileNotFoundError(f"CSD2020 parquet not found: {parquet}. Run fetch-data first.")
+        raise FileNotFoundError(f"CSD parquet not found: {parquet}. Run fetch-data first.")
 
     df = pd.read_parquet(str(parquet))
-    if "kk" in df.columns:
-        df = df[df["kk"].astype(str).str.contains("064", na=False)].copy()
+    locale = load_locale(cfg)
+    csd_filter = locale.get("csd_region_filter") or {}
+    filter_col = csd_filter.get("column", "kk")
+    filter_val = str(csd_filter.get("contains", "064"))
+    if filter_col in df.columns:
+        df = df[df[filter_col].astype(str).str.contains(filter_val, na=False)].copy()
 
     num_cols = ["o", "ipd_o", "ivd_o", "sv", "ipd_sv", "ivd_sv",
                 "is_den", "is_ve_er", "is_noc", "sil"]
@@ -146,8 +165,9 @@ def learn_day_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
     evening_share = float((period_df.loc[mask, "is_ve_er"] / total[mask]).mean()) if mask.any() else fb_eve
     night_share = float((period_df.loc[mask, "is_noc"] / total[mask]).mean()) if mask.any() else fb_night
 
+    demand_split = (temporal_policy.get("demand_period_split_from_day") or {})
     profile = {
-        "source": "CSD2020_JMK",
+        "source": "CSD_learned",
         "sections_used": int(len(valid)),
         "day_factors": day_factors,
         "day_factors_by_road_class": by_class,
@@ -155,6 +175,11 @@ def learn_day_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "day": round(day_share, 3),
             "evening": round(evening_share, 3),
             "night": round(night_share, 3),
+        },
+        "demand_period_split_policy": {
+            "am": float(demand_split.get("am", 0.35)),
+            "ip": float(demand_split.get("ip", 0.40)),
+            "pm": float(demand_split.get("pm", 0.25)),
         },
     }
 
@@ -206,8 +231,8 @@ def get_combined_factor(d: date | str, period: str, profile: Dict[str, Any]) -> 
 def get_demand_period_shares(profile: Dict[str, Any]) -> Dict[str, float]:
     """Map demand model periods (am, ip, pm, ev) to shares of daily traffic.
 
-    Derived from CSD2020 day/evening/night breakdown plus typical
-    intra-day distribution for Czech urban networks.
+    Derived from CSD day/evening/night breakdown plus typical
+    intra-day distribution.
     """
     shares = profile.get("day_period_shares", {})
     day_s = float(shares.get("day", 0.785))
@@ -251,14 +276,4 @@ def day_info(d: date | str, profile: Dict[str, Any]) -> Dict[str, Any]:
 def run_learn_profile(config_path: str | Path = "config/sim.yaml") -> None:
     cfg = load_config(config_path)
     print("=== LEARN TEMPORAL PROFILE ===")
-    profile = learn_day_profile(cfg)
-    temporal_policy = ((cfg.get("demand") or {}).get("temporal_policy") or {})
-    split = temporal_policy.get("demand_period_split_from_day") or {}
-    profile["demand_period_split_policy"] = {
-        "am": float(split.get("am", 0.35)),
-        "ip": float(split.get("ip", 0.40)),
-        "pm": float(split.get("pm", 0.25)),
-    }
-    out_dir = Path(cfg.get("demand", {}).get("output_dir", "outputs/baseline/demand"))
-    out_path = out_dir / "temporal_profile.json"
-    out_path.write_text(json.dumps(profile, indent=2, ensure_ascii=False), encoding="utf-8")
+    learn_day_profile(cfg)

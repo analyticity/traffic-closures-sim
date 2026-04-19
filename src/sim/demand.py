@@ -8,7 +8,6 @@ import json
 import re
 import shutil
 import time
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,7 +17,9 @@ import numpy as np
 import pandas as pd
 from aequilibrae.matrix import AequilibraeMatrix
 
-from sim.io_project import load_config
+from sim.io_project import get_metric_epsg, load_config
+from sim._text import norm_name as _norm_name
+from sim._metrics import persons_to_vehicles
 
 
 # ---------------------------------------------------------------------------
@@ -26,23 +27,6 @@ from sim.io_project import load_config
 # ---------------------------------------------------------------------------
 
 _GEO_SUFFIXES = re.compile(r"\s+(u|nad|pod|na|ve|pri|při)\s+\S+$", re.IGNORECASE)
-
-
-def _strip_diacritics(text: str) -> str:
-    return "".join(
-        ch for ch in unicodedata.normalize("NFKD", text)
-        if not unicodedata.combining(ch)
-    )
-
-
-def _norm_name(value: Any) -> str:
-    if value is None:
-        return ""
-    text = str(value).strip()
-    text = _strip_diacritics(text).lower()
-    text = text.replace("–", "-").replace("—", "-")
-    text = re.sub(r"[^\w\s\-]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def _strip_geo_suffix(name_norm: str) -> str:
@@ -247,7 +231,7 @@ def _preflight_external_inputs(
             "Re-run build-zones and build-supernetwork in the same pipeline run."
         )
 
-    if bcfg.external.use_external_external_via_brno:
+    if bcfg.external.use_through_traffic:
         through_path = bcfg.external.through_pairs_path
         if not through_path.exists():
             raise FileNotFoundError(
@@ -468,11 +452,11 @@ class ExternalProcessingCfg:
     use_full_cr_dataset: bool
     use_external_internal: bool
     use_internal_external: bool
-    use_external_external_via_brno: bool
-    drop_external_external_outside_model: bool
+    use_through_traffic: bool
     gateway_lookup_path: Path
     through_pairs_path: Path
     allow_legacy_fallback: bool
+    external_commuting_scale: float
 
 
 @dataclass(frozen=True)
@@ -581,11 +565,11 @@ def _build_cfg(cfg: Dict[str, Any]) -> DemandBuildCfg:
         use_full_cr_dataset=bool(ext_cfg.get("use_full_cr_dataset", False)),
         use_external_internal=bool(ext_cfg.get("use_external_internal", True)),
         use_internal_external=bool(ext_cfg.get("use_internal_external", True)),
-        use_external_external_via_brno=bool(ext_cfg.get("use_external_external_via_brno", True)),
-        drop_external_external_outside_model=bool(ext_cfg.get("drop_external_external_outside_model", True)),
+        use_through_traffic=bool(ext_cfg.get("use_through_traffic", True)),
         gateway_lookup_path=gateway_lookup_path,
         through_pairs_path=through_pairs_path,
         allow_legacy_fallback=bool(_get(demand, ["use_gateway_fallback_in_commuting"], False)),
+        external_commuting_scale=float(ext_cfg.get("external_commuting_scale", 1.0)),
     )
 
     return DemandBuildCfg(
@@ -630,15 +614,55 @@ def _normalize_period_shares(raw: Optional[Dict[str, Any]], periods: List[str]) 
     return {p: v / total for p, v in shares.items()}
 
 
+_LINK_TYPE_WEIGHT_SCALE: Dict[str, float] = {
+    "motorway": 1.0,
+    "motorway_link": 1.0,
+    "trunk": 0.9,
+    "trunk_link": 0.9,
+    "primary": 0.7,
+    "primary_link": 0.7,
+    "secondary": 0.4,
+    "secondary_link": 0.4,
+}
+
+
 def _normalize_named_weights(
     names: List[str],
     raw: Optional[Dict[str, Any]],
+    *,
+    gateway_link_types: Optional[Dict[str, str]] = None,
 ) -> Dict[str, float]:
     if not names:
         return {}
 
     raw = raw or {}
-    vals = {name: max(float(raw.get(name, 0.0)), 0.0) for name in names}
+
+    if not raw and not gateway_link_types:
+        return {name: 1.0 / len(names) for name in names}
+
+    if not raw and gateway_link_types:
+        vals = {
+            name: _LINK_TYPE_WEIGHT_SCALE.get(
+                str(gateway_link_types.get(name, "")), 0.2
+            )
+            for name in names
+        }
+        total = sum(vals.values())
+        if total <= 0:
+            return {name: 1.0 / len(names) for name in names}
+        return {name: v / total for name, v in vals.items()}
+
+    specified = [max(float(v), 0.0) for v in raw.values() if v is not None]
+    default_val = float(np.median(specified)) if specified else 1.0
+
+    def _default_for(name: str) -> float:
+        if gateway_link_types and name in gateway_link_types:
+            lt = str(gateway_link_types[name])
+            scale = _LINK_TYPE_WEIGHT_SCALE.get(lt, 0.2)
+            return default_val * scale
+        return default_val
+
+    vals = {name: max(float(raw.get(name, _default_for(name))), 0.0) for name in names}
     total = sum(vals.values())
 
     if total <= 0:
@@ -744,8 +768,7 @@ def _filter_commuting(df: pd.DataFrame, bcfg: DemandBuildCfg) -> pd.DataFrame:
     if "lokalizace" in df.columns and bcfg.include_lokalizace:
         df = df[df["lokalizace"].astype(str).isin(bcfg.include_lokalizace)].copy()
 
-    # U full-CR datasetu nechceme znovu řezat origin jen na Brno/JMK,
-    # jinak bychom si zničili external-internal vazby.
+    # Skip origin filter for full-CR dataset to preserve external-internal links.
     if not (bcfg.external.enabled and bcfg.external.use_full_cr_dataset):
         df = _apply_origin_filters(df, bcfg.origin_filters)
 
@@ -830,6 +853,7 @@ def _build_external_local_seed(
     *,
     total_daily_trips: float,
     corridor_weights: Optional[Dict[str, Any]] = None,
+    gateway_link_types: Optional[Dict[str, str]] = None,
 ) -> np.ndarray:
     n = len(zone_ids)
     z2i = {int(z): i for i, z in enumerate(zone_ids)}
@@ -858,7 +882,9 @@ def _build_external_local_seed(
     internal_pop = internal_pop / internal_pop.sum()
 
     corridor_names = sorted(gateways.keys())
-    corridor_weights_norm = _normalize_named_weights(corridor_names, corridor_weights)
+    corridor_weights_norm = _normalize_named_weights(
+        corridor_names, corridor_weights, gateway_link_types=gateway_link_types,
+    )
 
     for gateway_name in corridor_names:
         gateway_zones = [(zid, w) for zid, w in gateways[gateway_name] if int(zid) in z2i]
@@ -979,11 +1005,6 @@ def _build_external_through_from_pairs(
     return od
 
 
-def _persons_to_vehicles(persons: float, conv: PurposeConv) -> float:
-    if persons <= 0:
-        return 0.0
-    return persons * conv.trips_per_person * conv.car_share / max(conv.occupancy, 0.01)
-
 
 def _zone_index(zone_ids: np.ndarray) -> Dict[int, int]:
     return {int(z): i for i, z in enumerate(zone_ids)}
@@ -996,7 +1017,6 @@ def _resolve_place_candidates(
     stripped: Dict[str, int],
     groups: Dict[str, List[Tuple[int, float]]],
     external_lookup: Dict[str, List[Tuple[int, float]]],
-    external_lookup_gateway: Dict[str, str],
     gateways: Dict[str, List[Tuple[int, float]]],
     allow_legacy_fallback: bool,
 ) -> Tuple[List[Tuple[int, float]], str, str]:
@@ -1038,20 +1058,17 @@ def _build_od_cores(
     groups: Dict[str, List[Tuple[int, float]]],
     gateways: Dict[str, List[Tuple[int, float]]],
     external_lookup: Dict[str, List[Tuple[int, float]]],
-    external_lookup_gateway: Dict[str, str],
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
     _validate_shares(bcfg.periods, bcfg.shares_work, "weekday.work")
     _validate_shares(bcfg.periods, bcfg.shares_school, "weekday.school")
 
     z2i = _zone_index(zone_ids)
     zset = set(z2i.keys())
+    n = len(zone_ids)
 
     period_cores = [f"wd_{p}" for p in bcfg.periods]
     core_names = period_cores + ["wd_daily"]
-    mats: Dict[str, np.ndarray] = {
-        name: _zero_matrix(len(zone_ids))
-        for name in core_names
-    }
+    mats: Dict[str, np.ndarray] = {name: _zero_matrix(n) for name in core_names}
 
     stats: Dict[str, Any] = {
         "rows_in": int(len(df)),
@@ -1070,94 +1087,133 @@ def _build_od_cores(
     if origin_col is None or dest_col is None:
         raise RuntimeError(f"Expected columns op_obec/doj_obec, got: {list(df.columns)}")
 
-    for _, row in df.iterrows():
-        origin_name = str(row[origin_col]).strip() if pd.notna(row[origin_col]) else ""
-        dest_name = str(row[dest_col]).strip() if pd.notna(row[dest_col]) else ""
+    # -- Phase 1: Pre-cache name resolutions for all unique place names -----
+    origin_names = df[origin_col].fillna("").astype(str).str.strip().values
+    dest_names = df[dest_col].fillna("").astype(str).str.strip().values
 
-        if not origin_name:
+    all_unique_names: set[str] = set(origin_names) | set(dest_names)
+    all_unique_names.discard("")
+
+    resolve_kwargs = dict(
+        primary=primary,
+        stripped=stripped,
+        groups=groups,
+        external_lookup=external_lookup,
+        gateways=gateways,
+        allow_legacy_fallback=bcfg.external.allow_legacy_fallback,
+    )
+    _EMPTY: Tuple[list, str, str] = ([], "missing", "missing")
+    name_cache: Dict[str, Tuple[List[Tuple[int, float]], str, str]] = {}
+    for name in all_unique_names:
+        name_cache[name] = _resolve_place_candidates(name, **resolve_kwargs)
+    print(f"  Pre-cached {len(name_cache)} unique place-name resolutions")
+
+    # -- Phase 2: Vectorize vehicle conversion ------------------------------
+    work_col_name = "dojizdka_prace"
+    school_col_name = "dojizdka_skola"
+    work_raw = (
+        pd.to_numeric(df[work_col_name], errors="coerce").fillna(0.0).values
+        if work_col_name in df.columns else np.zeros(len(df))
+    )
+    school_raw = (
+        pd.to_numeric(df[school_col_name], errors="coerce").fillna(0.0).values
+        if school_col_name in df.columns else np.zeros(len(df))
+    )
+
+    w_conv = persons_to_vehicles(1.0, car_share=bcfg.conv_work.car_share,
+                                occupancy=bcfg.conv_work.occupancy,
+                                trips_per_person=bcfg.conv_work.trips_per_person)
+    s_conv = persons_to_vehicles(1.0, car_share=bcfg.conv_school.car_share,
+                                occupancy=bcfg.conv_school.occupancy,
+                                trips_per_person=bcfg.conv_school.trips_per_person)
+    work_v_all = np.maximum(work_raw, 0.0) * w_conv
+    school_v_all = np.maximum(school_raw, 0.0) * s_conv
+
+    # -- Phase 3: Pre-compute per-period share arrays -----------------------
+    period_list = bcfg.periods
+    n_periods = len(period_list)
+    work_out = np.array([bcfg.shares_work.outbound.get(p, 0.0) for p in period_list])
+    school_out = np.array([bcfg.shares_school.outbound.get(p, 0.0) for p in period_list])
+    work_ret = np.array([bcfg.shares_work.return_.get(p, 0.0) for p in period_list])
+    school_ret = np.array([bcfg.shares_school.return_.get(p, 0.0) for p in period_list])
+
+    mat_arrays = [mats[f"wd_{p}"] for p in period_list]
+
+    # -- Phase 4: Iterate rows using cached arrays --------------------------
+    _MODE_STAT = {"direct": "mapped_direct", "group": "mapped_group",
+                  "lookup": "mapped_external_lookup",
+                  "legacy_fallback": "mapped_external_legacy_fallback"}
+    n_rows = len(df)
+    use_ext_int = bcfg.external.use_external_internal
+    use_int_ext = bcfg.external.use_internal_external
+    only_internal = bcfg.only_internal_pairs
+    ext_comm_scale = bcfg.external.external_commuting_scale
+
+    for idx in range(n_rows):
+        on = origin_names[idx]
+        dn = dest_names[idx]
+
+        if not on:
             stats["missing_origin"] += 1
             continue
-        if not dest_name:
+        if not dn:
             stats["missing_destination"] += 1
             continue
 
-        origin_candidates, origin_mode, origin_kind = _resolve_place_candidates(
-            origin_name,
-            primary=primary,
-            stripped=stripped,
-            groups=groups,
-            external_lookup=external_lookup,
-            external_lookup_gateway=external_lookup_gateway,
-            gateways=gateways,
-            allow_legacy_fallback=bcfg.external.allow_legacy_fallback,
-        )
-        dest_candidates, dest_mode, dest_kind = _resolve_place_candidates(
-            dest_name,
-            primary=primary,
-            stripped=stripped,
-            groups=groups,
-            external_lookup=external_lookup,
-            external_lookup_gateway=external_lookup_gateway,
-            gateways=gateways,
-            allow_legacy_fallback=bcfg.external.allow_legacy_fallback,
-        )
+        o_cands, o_mode, o_kind = name_cache.get(on, _EMPTY)
+        d_cands, d_mode, d_kind = name_cache.get(dn, _EMPTY)
 
-        if not origin_candidates:
+        if not o_cands:
             stats["missing_origin"] += 1
             continue
-        if not dest_candidates:
+        if not d_cands:
             stats["missing_destination"] += 1
             continue
 
-        if origin_kind == "external" and dest_kind == "external":
-            # External->external is handled from through_gateway_pairs.parquet,
-            # not from row-by-row commuting records, to avoid double counting.
+        if o_kind == "external" and d_kind == "external":
             stats["skipped_external_external_rows"] += 1
             continue
 
-        if bcfg.only_internal_pairs and (origin_kind != "internal" or dest_kind != "internal"):
+        if only_internal and (o_kind != "internal" or d_kind != "internal"):
+            continue
+        if o_kind == "external" and d_kind == "internal" and not use_ext_int:
+            continue
+        if o_kind == "internal" and d_kind == "external" and not use_int_ext:
             continue
 
-        if origin_kind == "external" and dest_kind == "internal" and not bcfg.external.use_external_internal:
+        o_stat = _MODE_STAT.get(o_mode)
+        if o_stat:
+            stats[o_stat] += 1
+        d_stat = _MODE_STAT.get(d_mode)
+        if d_stat:
+            stats[d_stat] += 1
+
+        wv = work_v_all[idx]
+        sv = school_v_all[idx]
+        if wv <= 0 and sv <= 0:
             continue
 
-        if origin_kind == "internal" and dest_kind == "external" and not bcfg.external.use_internal_external:
-            continue
+        fwd = wv * work_out + sv * school_out
+        ret = wv * work_ret + sv * school_ret
 
-        for mode in (origin_mode, dest_mode):
-            if mode == "direct":
-                stats["mapped_direct"] += 1
-            elif mode == "group":
-                stats["mapped_group"] += 1
-            elif mode == "lookup":
-                stats["mapped_external_lookup"] += 1
-            elif mode == "legacy_fallback":
-                stats["mapped_external_legacy_fallback"] += 1
+        is_external_pair = (o_kind == "external") or (d_kind == "external")
+        if is_external_pair and ext_comm_scale != 1.0:
+            fwd = fwd * ext_comm_scale
+            ret = ret * ext_comm_scale
 
-        work_v = _persons_to_vehicles(float(row.get("dojizdka_prace", 0)), bcfg.conv_work)
-        school_v = _persons_to_vehicles(float(row.get("dojizdka_skola", 0)), bcfg.conv_school)
-        if work_v <= 0 and school_v <= 0:
-            continue
-
-        for oz, ow in origin_candidates:
+        for oz, ow in o_cands:
             if oz not in zset:
                 continue
             oi = z2i[oz]
-
-            for dz, dw in dest_candidates:
+            for dz, dw in d_cands:
                 if dz not in zset:
                     continue
                 di = z2i[dz]
-                factor = float(ow) * float(dw)
+                f = float(ow) * float(dw)
 
-                for period, share in bcfg.shares_work.outbound.items():
-                    mats[f"wd_{period}"][oi, di] += work_v * share * factor
-                for period, share in bcfg.shares_school.outbound.items():
-                    mats[f"wd_{period}"][oi, di] += school_v * share * factor
-                for period, share in bcfg.shares_work.return_.items():
-                    mats[f"wd_{period}"][di, oi] += work_v * share * factor
-                for period, share in bcfg.shares_school.return_.items():
-                    mats[f"wd_{period}"][di, oi] += school_v * share * factor
+                for pi in range(n_periods):
+                    mat_arrays[pi][oi, di] += fwd[pi] * f
+                    mat_arrays[pi][di, oi] += ret[pi] * f
 
                 stats["pairs_used"] += 1
 
@@ -1206,7 +1262,7 @@ def _write_aem(
     except Exception:
         pass
 
-    mat.index[:] = index_ids.astype(np.int32)
+    mat.index[:] = index_ids.astype(np.int64)
     for core_name in core_names:
         mat.matrix[core_name][:, :] = cores[core_name]
 
@@ -1371,9 +1427,8 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
     _mark("preflight_external_inputs")
 
     external_lookup: Dict[str, List[Tuple[int, float]]] = {}
-    external_lookup_gateway: Dict[str, str] = {}
     if bcfg.external.enabled:
-        external_lookup, external_lookup_gateway = _load_external_gateway_lookup(
+        external_lookup, _ = _load_external_gateway_lookup(
             bcfg.external.gateway_lookup_path,
             gateways,
         )
@@ -1392,7 +1447,6 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
         groups=groups,
         gateways=gateways,
         external_lookup=external_lookup,
-        external_lookup_gateway=external_lookup_gateway,
     )
     _mark("build_commuting_cores")
 
@@ -1416,7 +1470,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
             beta=float(other_cfg.get("beta", other_defaults.get("beta", 0.00015))),
             centroids_gdf=zones_gdf,
             excluded_zone_ids=external_zone_ids,
-            metric_epsg=int(cfg.get("crs_epsg", 5514)),
+            metric_epsg=get_metric_epsg(cfg),
         )
         print(f"  'other' daily total: {float(other_daily.sum()):,.0f}")
     else:
@@ -1432,12 +1486,22 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
         and float(external_local_cfg.get("total_daily_trips", 0.0)) > 0
     ):
         print("Building residual synthetic external-local trips (gateway ↔ internal) ...")
+        gw_link_types: Optional[Dict[str, str]] = None
+        zoning_out = Path(cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones"))
+        gw_diag_path = zoning_out / "gateway_diagnostics.csv"
+        if gw_diag_path.exists():
+            _gd = pd.read_csv(gw_diag_path)
+            if "gateway_name" in _gd.columns:
+                lt_col = "predominant_link_type" if "predominant_link_type" in _gd.columns else "link_type"
+                if lt_col in _gd.columns:
+                    gw_link_types = dict(zip(_gd["gateway_name"].astype(str), _gd[lt_col].astype(str)))
         external_local_daily = _build_external_local_seed(
             zone_ids,
             gateways,
             zone_population,
             total_daily_trips=float(external_local_cfg.get("total_daily_trips", 0.0)),
             corridor_weights=external_local_cfg.get("corridor_weights", {}) or {},
+            gateway_link_types=gw_link_types,
         )
         print(f"  'external_local' daily total: {float(external_local_daily.sum()):,.0f}")
     else:
@@ -1446,7 +1510,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
 
     # --- Data-driven external_through from coarse supernetwork ---
     data_driven_through_daily = _zero_matrix(n_zones)
-    if bcfg.external.enabled and bcfg.external.use_external_external_via_brno:
+    if bcfg.external.enabled and bcfg.external.use_through_traffic:
         through_pairs_df = _load_through_gateway_pairs(bcfg.external.through_pairs_path)
         if not through_pairs_df.empty:
             print("Building data-driven external-through trips from supernetwork gateway pairs ...")
@@ -1455,6 +1519,12 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
                 gateways,
                 through_pairs_df,
             )
+            through_scale = float(
+                _get(cfg, ["demand", "sldb", "external_processing", "through_traffic_scale"], 1.0) or 1.0
+            )
+            if through_scale != 1.0:
+                data_driven_through_daily *= through_scale
+                print(f"  Applied through_traffic_scale={through_scale:.2f}")
             print(f"  'external_through_data' daily total: {float(data_driven_through_daily.sum()):,.0f}")
     _mark("build_external_through_data")
 
@@ -1521,6 +1591,9 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
     all_cores["wd_daily_external_through_residual"] = residual_external_through_daily.copy()
     all_cores["wd_daily_external_through"] = external_through_daily.copy()
     all_cores["wd_daily_external"] = external_local_daily + external_through_daily
+    all_cores["wd_daily_local"] = (
+        all_cores["wd_daily_commuting"] + other_daily + external_local_daily
+    )
 
     # Final combined cores used by the rest of the pipeline
     for period in bcfg.periods:
@@ -1665,7 +1738,7 @@ def assert_build_demand_prerequisites(cfg: dict) -> None:
         raise FileNotFoundError(
             f"build-demand: missing external gateway lookup {gw}. Run build-supernetwork first."
         )
-    if ext.get("use_external_external_via_brno", True) and not tp.exists():
+    if ext.get("use_through_traffic", True) and not tp.exists():
         raise FileNotFoundError(
             f"build-demand: missing through gateway pairs {tp}. Run build-supernetwork first."
         )

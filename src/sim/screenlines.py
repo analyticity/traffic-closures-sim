@@ -7,7 +7,6 @@ Supports three specification methods:
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,7 +16,7 @@ import pandas as pd
 import geopandas as gpd
 import yaml
 
-from sim.calibration import compute_geh
+from sim._metrics import compute_geh
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +31,8 @@ class ScreenlineDef:
     links: List[Tuple[int, int]] = field(default_factory=list)
     geometry_wkt: Optional[str] = None
     boundary_geojson: Optional[str] = None
+    observed_aadt_cars: Optional[float] = None
+    observed_aadt_all: Optional[float] = None
 
 
 @dataclass
@@ -43,6 +44,7 @@ class ScreenlineResult:
     ratio: float
     geh: float
     n_links: int
+    obs_source: str = "pentlogram"
     per_link: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -54,6 +56,7 @@ class ScreenlineResult:
             "ratio": round(self.ratio, 3) if np.isfinite(self.ratio) else None,
             "geh": round(self.geh, 2) if np.isfinite(self.geh) else None,
             "n_links": self.n_links,
+            "obs_source": self.obs_source,
             "per_link": self.per_link,
         }
 
@@ -87,6 +90,9 @@ def load_screenlines(config_path: str | Path) -> List[ScreenlineDef]:
                 if lid > 0:
                     links.append((lid, d))
 
+        obs_cars = e.get("observed_aadt_cars")
+        obs_all = e.get("observed_aadt_all")
+
         result.append(ScreenlineDef(
             name=name,
             description=str(e.get("description", "")),
@@ -94,6 +100,8 @@ def load_screenlines(config_path: str | Path) -> List[ScreenlineDef]:
             links=links,
             geometry_wkt=e.get("geometry_wkt"),
             boundary_geojson=e.get("boundary_geojson"),
+            observed_aadt_cars=float(obs_cars) if obs_cars is not None else None,
+            observed_aadt_all=float(obs_all) if obs_all is not None else None,
         ))
     return result
 
@@ -116,7 +124,6 @@ def resolve_screenline_links(
         return sl.links
 
     from shapely import wkt
-    from shapely.geometry import shape
 
     if links_gdf.crs is not None and links_gdf.crs.to_epsg() != metric_epsg:
         lm = links_gdf.to_crs(epsg=metric_epsg)
@@ -219,6 +226,12 @@ def evaluate_screenline(
             "observed": round(ov, 0),
         })
 
+    # Use CSD AADT from config when pentlogram gives no observed data
+    obs_source = "pentlogram"
+    if obs_total <= 0 and sl.observed_aadt_cars is not None and sl.observed_aadt_cars > 0:
+        obs_total = sl.observed_aadt_cars
+        obs_source = "csd_config"
+
     ratio = mod_total / max(obs_total, 1.0)
     geh_arr = compute_geh(
         np.array([mod_total], dtype=float),
@@ -234,6 +247,7 @@ def evaluate_screenline(
         ratio=ratio,
         geh=geh_val,
         n_links=len(resolved),
+        obs_source=obs_source,
         per_link=per_link,
     )
 

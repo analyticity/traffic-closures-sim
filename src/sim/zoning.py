@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 from aequilibrae import Project
 from shapely.affinity import translate
-from shapely.geometry import LineString, MultiPoint, Point, Polygon, box
+from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import nearest_points
 
 from sim.io_project import load_config
@@ -96,14 +96,17 @@ def _pick_nodes_near_boundary(
     *,
     max_nodes: int,
     min_node_sep_m: float = 25.0,
+    scc_nodes: Optional[set] = None,
 ) -> List[int]:
     rows = []
     for nid in node_ids:
         geom = node_geom.get(int(nid))
         if geom is None:
             continue
+        in_scc = 0 if (scc_nodes is not None and int(nid) in scc_nodes) else 1
         rows.append({
             "node_id": int(nid),
+            "in_scc_sort": in_scc,
             "dist_boundary": float(geom.distance(boundary)),
             "road_weight": float(node_weight.get(int(nid), 0.0)),
             "geometry": geom,
@@ -113,8 +116,8 @@ def _pick_nodes_near_boundary(
         return []
 
     df = pd.DataFrame(rows).sort_values(
-        ["dist_boundary", "road_weight"],
-        ascending=[True, False],
+        ["in_scc_sort", "dist_boundary", "road_weight"],
+        ascending=[True, True, False],
     )
 
     chosen: List[int] = []
@@ -137,6 +140,24 @@ def _pick_nodes_near_boundary(
     return chosen
 
 
+_MERGE_CLASS_GROUPS: Dict[str, str] = {
+    "motorway": "A",
+    "motorway_link": "A",
+    "trunk": "A",
+    "trunk_link": "A",
+    "primary": "B",
+    "primary_link": "B",
+    "secondary": "C",
+    "secondary_link": "C",
+    "tertiary": "C",
+    "tertiary_link": "C",
+}
+
+
+def _merge_class_group(link_type: str) -> str:
+    return _MERGE_CLASS_GROUPS.get(str(link_type), "C")
+
+
 def _merge_gateway_candidates_on_boundary(
     gateway_targets: Dict[str, List[int]],
     gateway_meta: Dict[str, Dict[str, Any]],
@@ -146,6 +167,7 @@ def _merge_gateway_candidates_on_boundary(
     *,
     merge_distance_m: float,
     nodes_per_gateway: int,
+    scc_nodes: Optional[set] = None,
 ) -> Tuple[Dict[str, List[int]], Dict[str, Dict[str, Any]]]:
     if len(gateway_meta) <= 1:
         return gateway_targets, gateway_meta
@@ -177,62 +199,74 @@ def _merge_gateway_candidates_on_boundary(
         names = cl["gateway_name"].tolist()
         metas = [gateway_meta[n] for n in names]
 
-        rep = sorted(
-            metas,
-            key=lambda m: (
-                int(m.get("whitelist_priority", 9999)),
-                float(m.get("dist_boundary_m", 1e9)),
-                -float(_ROAD_CLASS_WEIGHT.get(str(m.get("link_type", "")), 0.0)),
-            ),
-        )[0]
+        # Sub-partition by road class group so that different road classes
+        # are never merged together even when spatially close.
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for meta_item in metas:
+            lt = str(meta_item.get("predominant_link_type", "") or meta_item.get("link_type", ""))
+            grp = _merge_class_group(lt)
+            groups.setdefault(grp, []).append(meta_item)
 
-        cluster_boundary_pos = _circular_mean_ring_pos(
-            [float(m.get("boundary_pos", 0.0)) for m in metas],
-            ring_length,
-        )
-        cluster_boundary_pt = boundary.interpolate(cluster_boundary_pos)
+        for _grp_key, grp_metas in groups.items():
+            grp_names = [m["gateway_name"] for m in grp_metas]
 
-        union_nodes: List[int] = []
-        for m in metas:
-            for nid in m.get("target_node_ids", []):
-                nid = int(nid)
-                if nid in node_geom and nid not in union_nodes:
-                    union_nodes.append(nid)
+            rep = sorted(
+                grp_metas,
+                key=lambda m: (
+                    int(m.get("whitelist_priority", 9999)),
+                    float(m.get("dist_boundary_m", 1e9)),
+                    -float(_ROAD_CLASS_WEIGHT.get(str(m.get("link_type", "")), 0.0)),
+                ),
+            )[0]
 
-        chosen = _pick_nodes_near_boundary(
-            union_nodes,
-            node_geom,
-            boundary,
-            node_weight,
-            max_nodes=int(nodes_per_gateway),
-            min_node_sep_m=25.0,
-        )
+            cluster_boundary_pos = _circular_mean_ring_pos(
+                [float(m.get("boundary_pos", 0.0)) for m in grp_metas],
+                ring_length,
+            )
+            cluster_boundary_pt = boundary.interpolate(cluster_boundary_pos)
 
-        if not chosen:
-            anchor_id = int(rep["anchor_node_id"])
-            chosen = [anchor_id] if anchor_id in node_geom else []
+            union_nodes: List[int] = []
+            for m in grp_metas:
+                for nid in m.get("target_node_ids", []):
+                    nid = int(nid)
+                    if nid in node_geom and nid not in union_nodes:
+                        union_nodes.append(nid)
 
-        if not chosen:
-            continue
+            chosen = _pick_nodes_near_boundary(
+                union_nodes,
+                node_geom,
+                boundary,
+                node_weight,
+                max_nodes=int(nodes_per_gateway),
+                min_node_sep_m=25.0,
+                scc_nodes=scc_nodes,
+            )
 
-        anchor_id = int(chosen[0])
-        anchor_geom = node_geom[anchor_id]
+            if not chosen:
+                anchor_id = int(rep["anchor_node_id"])
+                chosen = [anchor_id] if anchor_id in node_geom else []
 
-        new_meta = dict(rep)
-        new_meta["target_node_ids"] = chosen
-        new_meta["anchor_node_id"] = int(anchor_id)
-        new_meta["anchor_x"] = float(anchor_geom.x)
-        new_meta["anchor_y"] = float(anchor_geom.y)
-        new_meta["boundary_x"] = float(cluster_boundary_pt.x)
-        new_meta["boundary_y"] = float(cluster_boundary_pt.y)
-        new_meta["boundary_pos"] = float(cluster_boundary_pos)
-        new_meta["merged_from"] = "|".join(names)
+            if not chosen:
+                continue
 
-        merged_targets[new_meta["gateway_name"]] = chosen
-        merged_meta[new_meta["gateway_name"]] = new_meta
+            anchor_id = int(chosen[0])
+            anchor_geom = node_geom[anchor_id]
 
-        if len(names) > 1:
-            print(f"  merged boundary-near gateways {names} -> {new_meta['gateway_name']}")
+            new_meta = dict(rep)
+            new_meta["target_node_ids"] = chosen
+            new_meta["anchor_node_id"] = int(anchor_id)
+            new_meta["anchor_x"] = float(anchor_geom.x)
+            new_meta["anchor_y"] = float(anchor_geom.y)
+            new_meta["boundary_x"] = float(cluster_boundary_pt.x)
+            new_meta["boundary_y"] = float(cluster_boundary_pt.y)
+            new_meta["boundary_pos"] = float(cluster_boundary_pos)
+            new_meta["merged_from"] = "|".join(grp_names)
+
+            merged_targets[new_meta["gateway_name"]] = chosen
+            merged_meta[new_meta["gateway_name"]] = new_meta
+
+            if len(grp_names) > 1:
+                print(f"  merged boundary-near gateways {grp_names} -> {new_meta['gateway_name']} (class group {_grp_key})")
 
     return merged_targets, merged_meta
 
@@ -296,7 +330,7 @@ def _force_to_target_crs(
     return gdf
 
 
-def _oriented_square_from_points(
+def _axis_aligned_square_from_points(
     xs: np.ndarray,
     ys: np.ndarray,
     *,
@@ -304,81 +338,34 @@ def _oriented_square_from_points(
     pad_ratio: float = 0.005,
     make_square: bool = True,
 ) -> Polygon:
-    if xs.size < 3:
-        return box(float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
+    """Axis-aligned bounding square/rectangle from point cloud with quantile trim."""
+    if xs.size == 0:
+        raise ValueError("Empty point array for AOI computation")
 
-    q = float(quantile)
-    q = max(0.0, min(q, 0.49))
+    q = float(max(0.0, min(float(quantile), 0.49)))
 
-    x_lo, x_hi = np.quantile(xs, [q, 1.0 - q])
-    y_lo, y_hi = np.quantile(ys, [q, 1.0 - q])
-    mask = (xs >= x_lo) & (xs <= x_hi) & (ys >= y_lo) & (ys <= y_hi)
+    x_lo, x_hi = float(np.quantile(xs, q)), float(np.quantile(xs, 1.0 - q))
+    y_lo, y_hi = float(np.quantile(ys, q)), float(np.quantile(ys, 1.0 - q))
 
-    pts = np.column_stack([xs, ys])
-    pts_core = pts[mask] if mask.sum() >= 50 else pts
-
-    hull = MultiPoint(pts_core).convex_hull
-    mrr = hull.minimum_rotated_rectangle
-
-    coords = list(mrr.exterior.coords)
-    best_dx, best_dy, best_len2 = 1.0, 0.0, -1.0
-    for i in range(4):
-        x1, y1 = coords[i]
-        x2, y2 = coords[i + 1]
-        dx, dy = (x2 - x1), (y2 - y1)
-        l2 = dx * dx + dy * dy
-        if l2 > best_len2:
-            best_len2 = l2
-            best_dx, best_dy = dx, dy
-
-    angle = float(np.arctan2(best_dy, best_dx))
-
-    cx, cy = pts_core.mean(axis=0)
-    c = float(np.cos(-angle))
-    s = float(np.sin(-angle))
-
-    dx = pts[:, 0] - cx
-    dy = pts[:, 1] - cy
-    u = c * dx - s * dy
-    v = s * dx + c * dy
-
-    u_lo, u_hi = np.quantile(u, [q, 1.0 - q])
-    v_lo, v_hi = np.quantile(v, [q, 1.0 - q])
-
-    w = float(u_hi - u_lo)
-    h = float(v_hi - v_lo)
+    w = x_hi - x_lo
+    h = y_hi - y_lo
     px = max(w * float(pad_ratio), 0.0)
     py = max(h * float(pad_ratio), 0.0)
 
-    u_lo -= px
-    u_hi += px
-    v_lo -= py
-    v_hi += py
+    x_lo -= px
+    x_hi += px
+    y_lo -= py
+    y_hi += py
 
     if make_square:
-        side = max(float(u_hi - u_lo), float(v_hi - v_lo))
-        cu = 0.5 * (u_lo + u_hi)
-        cv = 0.5 * (v_lo + v_hi)
+        side = max(x_hi - x_lo, y_hi - y_lo)
+        cx = 0.5 * (x_lo + x_hi)
+        cy = 0.5 * (y_lo + y_hi)
         half = 0.5 * side
-        u_lo, u_hi = cu - half, cu + half
-        v_lo, v_hi = cv - half, cv + half
+        x_lo, x_hi = cx - half, cx + half
+        y_lo, y_hi = cy - half, cy + half
 
-    corners_uv = np.array([
-        [u_lo, v_lo],
-        [u_hi, v_lo],
-        [u_hi, v_hi],
-        [u_lo, v_hi],
-    ])
-
-    c2 = float(np.cos(angle))
-    s2 = float(np.sin(angle))
-    corners_xy = []
-    for uu, vv in corners_uv:
-        x = cx + (c2 * uu - s2 * vv)
-        y = cy + (s2 * uu + c2 * vv)
-        corners_xy.append((x, y))
-
-    return Polygon(corners_xy)
+    return box(x_lo, y_lo, x_hi, y_hi)
 
 
 def _safe_line_midpoint(geom: Any) -> Point:
@@ -397,25 +384,6 @@ def _safe_line_midpoint(geom: Any) -> Point:
         except Exception:
             return Point(0, 0)
 
-
-def _first_number(value: Any, default: float = 0.0) -> float:
-    if value is None:
-        return default
-    if isinstance(value, (int, float, np.integer, np.floating)):
-        try:
-            return float(value)
-        except Exception:
-            return default
-    if isinstance(value, (list, tuple)) and value:
-        return _first_number(value[0], default=default)
-    text = str(value).strip()
-    m = re.search(r"[-+]?\d+(?:\.\d+)?", text)
-    if not m:
-        return default
-    try:
-        return float(m.group(0))
-    except Exception:
-        return default
 
 
 def _bearing_deg(cx: float, cy: float, x: float, y: float) -> float:
@@ -529,7 +497,7 @@ def build_model_area(
     shift_x_m: float = 0.0,
     shift_y_m: float = 0.0,
 ) -> Any:
-    print("Zoning: building model area (ORIENTED square of largest component)...")
+    print("Zoning: building model area (WGS84-aligned bbox of largest component)...")
 
     links = project.network.links.data
     nodes = project.network.nodes.data
@@ -586,16 +554,39 @@ def build_model_area(
     comp_set = set(largest_comp)
     core_nodes = nodes_gdf[nodes_gdf["node_id"].astype(int).isin(comp_set)].copy()
 
-    xs = core_nodes.geometry.x.to_numpy(dtype=float)
-    ys = core_nodes.geometry.y.to_numpy(dtype=float)
+    _HIGHWAY_ONLY_TYPES = {
+        "motorway", "motorway_link", "trunk", "trunk_link",
+        "primary", "primary_link",
+    }
+    if "link_type" in links_gdf.columns:
+        local_links = links_gdf[
+            ~links_gdf["link_type"].astype(str).str.strip().str.lower().isin(_HIGHWAY_ONLY_TYPES)
+        ]
+        node_has_local = set(local_links["a_node"].astype(int)) | set(local_links["b_node"].astype(int))
+        urban_mask = core_nodes["node_id"].astype(int).isin(node_has_local)
+        n_excluded = int((~urban_mask).sum())
+        if urban_mask.sum() > 100:
+            core_nodes = core_nodes[urban_mask].copy()
+            print(f"  AOI point cloud: excluded {n_excluded} highway-only nodes")
 
-    aoi = _oriented_square_from_points(
-        xs,
-        ys,
+    # Build bbox in WGS84 so it matches the network pipeline's coordinate frame,
+    # then reproject back to target_epsg.  This avoids the ~30° rotation that
+    # Krovak (EPSG:5514) introduces relative to geographic north.
+    core_wgs84 = core_nodes.to_crs(epsg=4326)
+    lons = core_wgs84.geometry.x.to_numpy(dtype=float)
+    lats = core_wgs84.geometry.y.to_numpy(dtype=float)
+
+    aoi_wgs84 = _axis_aligned_square_from_points(
+        lons,
+        lats,
         quantile=float(quantile),
         pad_ratio=float(pad_ratio),
-        make_square=True,
+        make_square=False,
     )
+
+    aoi_gdf = gpd.GeoDataFrame({"geometry": [aoi_wgs84]}, crs="EPSG:4326")
+    aoi_gdf = aoi_gdf.to_crs(epsg=target_epsg)
+    aoi = aoi_gdf.geometry.iloc[0]
 
     if float(extra_margin_m) > 0.0:
         aoi = aoi.buffer(float(extra_margin_m), join_style=2)
@@ -605,7 +596,8 @@ def build_model_area(
 
     bminx, bminy, bmaxx, bmaxy = map(float, aoi.bounds)
     print(
-        f"✓ AOI ORIENTED (EPSG:{target_epsg}) core_nodes={len(core_nodes)} "
+        f"✓ AOI WGS84-aligned (reprojected to EPSG:{target_epsg}) "
+        f"core_nodes={len(core_nodes)} "
         f"q={float(quantile)} pad={float(pad_ratio)} "
         f"extra_margin_m={float(extra_margin_m)} "
         f"shift=({float(shift_x_m)}, {float(shift_y_m)}): "
@@ -714,21 +706,26 @@ _ROAD_CLASS_WEIGHT = {
     "motorway": 5.0,
     "motorway_link": 4.0,
     "trunk": 4.0,
-    "trunk_link": 3.0,
+    "trunk_link": 3.5,
     "primary": 3.0,
     "primary_link": 2.5,
     "secondary": 2.0,
-    "secondary_link": 1.5,
+    "secondary_link": 1.8,
     "tertiary": 1.5,
     "tertiary_link": 1.2,
     "unclassified": 0.8,
-    "residential": 0.5,
-    "living_street": 0.3,
-    "road": 0.5,
+    "road": 0.7,
+    "residential": 0.6,
+    "service": 0.2,
+    "living_street": 0.05,
 }
 
 
-def _eligible_road_nodes(project: Project) -> Tuple[set[int], Dict[int, float]]:
+def _eligible_road_nodes(
+    project: Project,
+    *,
+    use_directed_scc: bool = True,
+) -> Tuple[set[int], Dict[int, float]]:
     import networkx as nx
 
     links = project.network.links.data.copy()
@@ -745,45 +742,44 @@ def _eligible_road_nodes(project: Project) -> Tuple[set[int], Dict[int, float]]:
     if car.empty:
         return set(), {}
 
-    G = nx.Graph()
+    G_undir = nx.Graph()
+    G_dir = nx.DiGraph()
     for _, r in car.iterrows():
         a = int(r["a_node"])
         b = int(r["b_node"])
-        G.add_edge(a, b)
+        d = int(r.get("direction", 0) or 0)
+        G_undir.add_edge(a, b)
+        if d >= 0:
+            G_dir.add_edge(a, b)
+        if d <= 0:
+            G_dir.add_edge(b, a)
 
-    if G.number_of_nodes() == 0:
+    if G_undir.number_of_nodes() == 0:
         return set(), {}
 
-    largest_component = max(nx.connected_components(G), key=len)
-    largest_component = set(int(x) for x in largest_component)
+    largest_undirected = max(nx.connected_components(G_undir), key=len)
+    keep_nodes = set(int(x) for x in largest_undirected)
+
+    if use_directed_scc and G_dir.number_of_nodes() > 0:
+        largest_scc = max(nx.strongly_connected_components(G_dir), key=len)
+        scc_nodes = set(int(x) for x in largest_scc)
+        n_removed = len(keep_nodes - scc_nodes)
+        if n_removed > 0:
+            print(
+                f"  Directed SCC filter: removed {n_removed} nodes reachable "
+                f"only one-way (SCC={len(scc_nodes)}, undirected={len(keep_nodes)})"
+            )
+        keep_nodes = keep_nodes & scc_nodes
 
     car = car[
-        car["a_node"].astype(int).isin(largest_component)
-        & car["b_node"].astype(int).isin(largest_component)
+        car["a_node"].astype(int).isin(keep_nodes)
+        & car["b_node"].astype(int).isin(keep_nodes)
     ].copy()
-
-    road_class_weight = {
-        "motorway": 8.0,
-        "motorway_link": 7.0,
-        "trunk": 7.0,
-        "trunk_link": 6.0,
-        "primary": 4.0,
-        "primary_link": 3.5,
-        "secondary": 2.0,
-        "secondary_link": 1.8,
-        "tertiary": 1.2,
-        "tertiary_link": 1.0,
-        "unclassified": 0.7,
-        "road": 0.7,
-        "residential": 0.4,
-        "service": 0.2,
-        "living_street": 0.05,
-    }
 
     node_weight: Dict[int, float] = {}
     for _, r in car.iterrows():
         lt = str(r.get("link_type", "")).strip()
-        w = float(road_class_weight.get(lt, 0.5))
+        w = float(_ROAD_CLASS_WEIGHT.get(lt, 0.5))
         a = int(r["a_node"])
         b = int(r["b_node"])
         node_weight[a] = max(node_weight.get(a, 0.0), w)
@@ -825,6 +821,93 @@ def _cluster_positions_on_ring(df: pd.DataFrame, pos_col: str, threshold_m: floa
     return [df.loc[c].copy() for c in clusters]
 
 
+def _auto_discover_boundary_roads(
+    project: Project,
+    target_epsg: int,
+    model_area: Any,
+    existing_refs: set[str],
+    *,
+    boundary_buffer_m: float = 600.0,
+    min_link_types: Optional[List[str]] = None,
+    min_lanes: int = 1,
+) -> List[Dict[str, Any]]:
+    """Find named roads crossing the model boundary not already in the whitelist.
+
+    Scans all links within *boundary_buffer_m* of the AOI boundary, groups
+    them by ``osm_ref``, and returns road refs that:
+      - have at least *min_lanes* lanes,
+      - are of a sufficiently high road class (*min_link_types*),
+      - are not already covered by *existing_refs*.
+
+    Returns a list of whitelist-spec dicts compatible with the main gateway
+    selection function, sorted by road-class weight (highest first).
+    """
+    if min_link_types is None:
+        min_link_types = [
+            "motorway", "motorway_link", "trunk", "trunk_link",
+            "primary", "primary_link", "secondary", "secondary_link",
+        ]
+
+    allowed = {str(x).strip() for x in min_link_types}
+    links_gdf = _network_ref(project, "links", target_epsg).copy()
+    if links_gdf.empty:
+        return []
+
+    links_gdf = links_gdf[
+        links_gdf["modes"].astype(str).str.contains("c", na=False)
+        & (links_gdf["link_type"].astype(str) != "centroid_connector")
+    ].copy()
+
+    boundary = model_area.boundary
+    links_gdf["_dist_boundary"] = links_gdf.geometry.distance(boundary)
+    near = links_gdf[links_gdf["_dist_boundary"] <= float(boundary_buffer_m)].copy()
+    near = near[near["link_type"].astype(str).isin(allowed)].copy()
+
+    if near.empty:
+        return []
+
+    has_ref = near[near["osm_ref"].notna() & (near["osm_ref"].astype(str).str.strip() != "")].copy()
+    if has_ref.empty:
+        return []
+
+    existing_norms = {_norm_text(r) for r in existing_refs}
+
+    results: List[Dict[str, Any]] = []
+    for ref_val, group in has_ref.groupby("osm_ref"):
+        ref_str = str(ref_val).strip()
+        if not ref_str:
+            continue
+        ref_norm = _norm_text(ref_str)
+        if ref_norm in existing_norms:
+            continue
+        parts = ref_str.split(";")
+        if any(_norm_text(p) in existing_norms for p in parts):
+            continue
+
+        best_type = group["link_type"].map(_ROAD_CLASS_WEIGHT).max()
+        max_lanes = 1
+        for col in ("lanes_ab", "lanes_ba"):
+            if col in group.columns:
+                v = pd.to_numeric(group[col], errors="coerce").max()
+                if pd.notna(v):
+                    max_lanes = max(max_lanes, int(v))
+
+        if max_lanes < min_lanes:
+            continue
+
+        results.append({
+            "raw": ref_str,
+            "norm": ref_norm,
+            "slug": _slug_token(ref_str),
+            "_class_weight": float(best_type) if pd.notna(best_type) else 0.0,
+            "_n_boundary_links": len(group),
+        })
+
+    results.sort(key=lambda r: (-r["_class_weight"], -r["_n_boundary_links"]))
+
+    return results
+
+
 def _select_gateway_target_nodes_boundary_whitelist(
     project: Project,
     target_epsg: int,
@@ -835,7 +918,7 @@ def _select_gateway_target_nodes_boundary_whitelist(
     boundary_buffer_m: float = 600.0,
     min_gateway_separation_m: float = 1800.0,
     allowed_link_types: Optional[List[str]] = None,
-    merge_boundary_near_candidates: bool = False,
+    max_anchor_distance_m: float = 2000.0,
 ) -> Tuple[
     Dict[str, List[int]],
     Dict[str, Dict[str, Any]],
@@ -849,20 +932,31 @@ def _select_gateway_target_nodes_boundary_whitelist(
             if t:
                 vals.add(t)
                 if t.startswith("I") and t[1:].isdigit():
-                    vals.add(t[1:])
+                    num = t[1:]
+                    vals.add(num)
+                    vals.add("D" + num)
+                elif t.startswith("D") and t[1:].isdigit():
+                    num = t[1:]
+                    vals.add(num)
+                    vals.add("I" + num)
         return vals
 
     def _match_ref_variants(row: pd.Series, variants: set[str]) -> int:
         for col in ("osm_ref_norm", "osm_ref", "ref"):
-            if col in row and pd.notna(row.get(col)):
-                rv = _norm_text(row.get(col))
+            if col not in row or pd.isna(row.get(col)):
+                continue
+            raw_val = str(row.get(col))
+            parts = raw_val.split(";") if ";" in raw_val else [raw_val]
+            for part in parts:
+                rv = _norm_text(part)
                 if rv in variants:
                     return 1
-                if rv.startswith("I") and rv[1:].isdigit() and rv[1:] in variants:
+                if rv.startswith(("I", "D")) and rv[1:].isdigit() and rv[1:] in variants:
                     return 1
         return 0
 
-    road_nids, node_weight = _eligible_road_nodes(project)
+    road_nids, node_weight = _eligible_road_nodes(project, use_directed_scc=False)
+    scc_nids, _ = _eligible_road_nodes(project, use_directed_scc=True)
     if not road_nids:
         empty_lines = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
         empty_points = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
@@ -999,11 +1093,38 @@ def _select_gateway_target_nodes_boundary_whitelist(
                 node_weight,
                 max_nodes=int(nodes_per_gateway),
                 min_node_sep_m=25.0,
+                scc_nodes=scc_nids,
             )
+
+            if len(chosen) < nodes_per_gateway and len(target_pool) < len(local_nodes):
+                chosen = _pick_nodes_near_boundary(
+                    local_nodes,
+                    node_geom,
+                    boundary,
+                    node_weight,
+                    max_nodes=int(nodes_per_gateway),
+                    min_node_sep_m=25.0,
+                    scc_nodes=scc_nids,
+                )
 
             if not chosen:
                 print(f"  [warn] token {token_raw} cluster {cl_i}: no chosen boundary nodes")
                 continue
+
+            non_scc = [n for n in chosen if n not in scc_nids]
+            if non_scc:
+                print(
+                    f"  [warn] token {token_raw} cluster {cl_i}: "
+                    f"{len(non_scc)} of {len(chosen)} target node(s) outside directed SCC: {non_scc}"
+                )
+
+            if len(chosen) < nodes_per_gateway:
+                print(
+                    f"  [warn] token {token_raw} cluster {cl_i}: only {len(chosen)} of "
+                    f"{nodes_per_gateway} target nodes found (pool={len(target_pool)} nodes, "
+                    f"boundary_buffer={boundary_buffer_m:.0f} m). "
+                    f"Consider increasing boundary_buffer_m or adding manual gateway nodes."
+                )
 
             anchor_id = int(chosen[0])
             anchor_geom = node_geom[anchor_id]
@@ -1045,6 +1166,24 @@ def _select_gateway_target_nodes_boundary_whitelist(
                 or ""
             )
 
+            dist_to_boundary = float(anchor_geom.distance(boundary))
+            if dist_to_boundary > max_anchor_distance_m:
+                print(
+                    f"  [skip] {gw_name}: anchor {dist_to_boundary:.0f}m from boundary "
+                    f"> max {max_anchor_distance_m:.0f}m"
+                )
+                continue
+
+            best_link_type = str(best_link.get("link_type", "") or "")
+            predominant_type = (
+                cl["link_type"]
+                .astype(str)
+                .mode()
+                .iloc[0]
+                if "link_type" in cl.columns and not cl.empty
+                else best_link_type
+            )
+
             gateway_targets[gw_name] = chosen
             gateway_meta[gw_name] = {
                 "gateway_name": gw_name,
@@ -1062,9 +1201,11 @@ def _select_gateway_target_nodes_boundary_whitelist(
                 "target_node_ids": chosen,
                 "matched_ref": matched_ref,
                 "matched_name": matched_name,
-                "link_type": str(best_link.get("link_type", "") or ""),
+                "link_type": best_link_type,
+                "predominant_link_type": predominant_type,
+                "auto_discovered": bool(spec.get("auto_discovered", False)),
                 "boundary_angle": float(cluster_angle),
-                "dist_boundary_m": float(anchor_geom.distance(boundary)),
+                "dist_boundary_m": dist_to_boundary,
                 "merged_from": "",
             }
 
@@ -1094,18 +1235,21 @@ def _select_gateway_target_nodes_boundary_whitelist(
                     "geometry": node_geom[int(nid)],
                 })
 
-    if merge_boundary_near_candidates:
-        gateway_targets, gateway_meta = _merge_gateway_candidates_on_boundary(
-            gateway_targets=gateway_targets,
-            gateway_meta=gateway_meta,
-            node_geom=node_geom,
-            node_weight=node_weight,
-            model_area=model_area,
-            merge_distance_m=float(min_gateway_separation_m),
-            nodes_per_gateway=int(nodes_per_gateway),
-        )
-    else:
-        print("  boundary-near merge disabled by config")
+    n_before_merge = len(gateway_meta)
+    gateway_targets, gateway_meta = _merge_gateway_candidates_on_boundary(
+        gateway_targets=gateway_targets,
+        gateway_meta=gateway_meta,
+        node_geom=node_geom,
+        node_weight=node_weight,
+        model_area=model_area,
+        merge_distance_m=float(min_gateway_separation_m),
+        nodes_per_gateway=int(nodes_per_gateway),
+        scc_nodes=scc_nids,
+    )
+    n_merged = n_before_merge - len(gateway_meta)
+    if n_merged > 0:
+        print(f"  cross-token dedup: merged {n_merged} co-located gateway(s) "
+              f"({n_before_merge} -> {len(gateway_meta)})")
 
     debug_corridors_gdf = (
         gpd.GeoDataFrame(pd.concat(debug_corridor_parts, ignore_index=True), crs=links_gdf.crs)
@@ -1371,7 +1515,7 @@ def export_map_png(
     ax.set_ylim(miny, maxy)
     ax.set_aspect("equal", adjustable="box")
     ax.set_title(
-        f"Network + TAZ zones ({len(zones)}) + AOI (oriented){title_suffix}",
+        f"Network + TAZ zones ({len(zones)}) + AOI{title_suffix}",
         fontsize=16,
         fontweight="bold",
         pad=20,
@@ -1501,12 +1645,17 @@ def create_centroid_connectors(
     gateway_targets: Optional[Dict[str, List[int]]] = None,
     external_speed_kmh: Optional[float] = None,
     external_access_penalty_s: Optional[float] = None,
+    internal_exclude_road_types: Optional[List[str]] = None,
 ) -> Dict[int, int]:
     """
     For external zones:
     - centroid is placed outside model according to stored centroid_x / centroid_y
     - if that still collides, it is moved only further OUT along the same outward axis
     - connectors go directly to the configured gateway target nodes
+
+    internal_exclude_road_types: road types that should NOT be connector targets
+    for internal zones (e.g. ["motorway", "motorway_link"]).  A node is excluded
+    only when ALL its incident non-connector links are of an excluded type.
     """
     print("\n=== CREATE centroid connectors ===")
 
@@ -1515,7 +1664,7 @@ def create_centroid_connectors(
     if "geometry" not in nodes.columns or len(nodes) == 0:
         raise RuntimeError("Network nodes missing geometry/empty")
 
-    road_nids, node_weight = _eligible_road_nodes(project)
+    road_nids, node_weight = _eligible_road_nodes(project, use_directed_scc=True)
     existing_nids = set(int(x) for x in nodes["node_id"].values)
 
     nodes_gdf = gpd.GeoDataFrame(nodes, geometry="geometry", crs=getattr(nodes, "crs", None))
@@ -1531,6 +1680,37 @@ def create_centroid_connectors(
         f"  Eligible road-network nodes: {len(eligible)} (from {len(nodes_gdf)} total, "
         f"excluded {len(nodes_gdf) - len(eligible)} non-car types)"
     )
+
+    gw_road_nids_scc, gw_node_weight_scc = _eligible_road_nodes(project, use_directed_scc=True)
+    gw_road_nids_all, gw_node_weight_all = _eligible_road_nodes(project, use_directed_scc=False)
+    gateway_eligible_scc = nodes_gdf[nodes_gdf["node_id"].isin(gw_road_nids_scc)].copy()
+    gateway_eligible_scc["road_weight"] = gateway_eligible_scc["node_id"].map(gw_node_weight_scc).fillna(0.5)
+    gateway_eligible_fallback = nodes_gdf[nodes_gdf["node_id"].isin(gw_road_nids_all)].copy()
+    gateway_eligible_fallback["road_weight"] = gateway_eligible_fallback["node_id"].map(gw_node_weight_all).fillna(0.5)
+    gateway_eligible = gateway_eligible_scc
+
+    internal_eligible = eligible
+    excl_types = set(internal_exclude_road_types or [])
+    if excl_types:
+        node_road_types: Dict[int, set] = {}
+        links_data = project.network.links.data
+        for _, r in links_data.iterrows():
+            lt = str(r.get("link_type", "")).strip()
+            if lt == "centroid_connector" or not lt:
+                continue
+            for nid in (int(r["a_node"]), int(r["b_node"])):
+                node_road_types.setdefault(nid, set()).add(lt)
+
+        motorway_only_nodes = {
+            nid for nid, types in node_road_types.items()
+            if types and types <= excl_types
+        }
+        internal_eligible = eligible[~eligible["node_id"].astype(int).isin(motorway_only_nodes)].copy()
+        n_excluded = len(eligible) - len(internal_eligible)
+        print(
+            f"  Internal connector pool: {len(internal_eligible)} nodes "
+            f"(excluded {n_excluded} motorway-only nodes for internal zones)"
+        )
 
     occupied_points = list(nodes_gdf.geometry.dropna())
 
@@ -1618,12 +1798,22 @@ def create_centroid_connectors(
 
         if is_external and gateway_name in gateway_targets:
             target_ids = [int(x) for x in gateway_targets[gateway_name]]
-            cand = eligible[eligible["node_id"].astype(int).isin(target_ids)].copy()
+            cand = gateway_eligible[gateway_eligible["node_id"].astype(int).isin(target_ids)].copy()
+            if cand.empty:
+                cand = gateway_eligible_fallback[
+                    gateway_eligible_fallback["node_id"].astype(int).isin(target_ids)
+                ].copy()
+                if not cand.empty:
+                    print(
+                        f"  [warn] gateway {gateway_name}: no SCC targets, "
+                        f"falling back to non-SCC pool ({len(cand)} nodes)"
+                    )
             cand["dist"] = cand.geometry.distance(centroid_pt)
             cand = cand.sort_values(["dist", "road_weight"], ascending=[True, False]).head(len(target_ids))
         else:
+            pool = internal_eligible if not is_external else eligible
             cand = _select_diverse_connectors(
-                eligible,
+                pool,
                 centroid_pt,
                 max_connectors,
                 max_distance_m,
@@ -1685,30 +1875,59 @@ def export_connector_diagnostics(
     zone_to_centroid: Dict[int, int],
     output_dir: Path,
 ) -> None:
+    import networkx as nx
+
     db = str(project.project_base_path) + "/project_database.sqlite"
     conn = sqlite3.connect(db)
     rows = conn.execute(
         "SELECT link_id, a_node, b_node, distance, speed_ab, travel_time_ab "
         "FROM links WHERE link_type='centroid_connector'"
     ).fetchall()
+
+    road_link_types: Dict[int, str] = {}
+    for nid, lt in conn.execute(
+        "SELECT a_node, link_type FROM links WHERE link_type != 'centroid_connector' "
+        "UNION ALL "
+        "SELECT b_node, link_type FROM links WHERE link_type != 'centroid_connector'"
+    ).fetchall():
+        prev = road_link_types.get(int(nid), "")
+        road_link_types[int(nid)] = _pick_best_road_type(prev, str(lt or ""))
+
+    # Build directed SCC for road-node membership check
+    dir_edges = conn.execute(
+        "SELECT a_node, b_node, direction FROM links WHERE link_type != 'centroid_connector'"
+    ).fetchall()
     conn.close()
+
+    G_dir = nx.DiGraph()
+    for a, b, direction in dir_edges:
+        d = int(direction or 0)
+        if d >= 0:
+            G_dir.add_edge(int(a), int(b))
+        if d <= 0:
+            G_dir.add_edge(int(b), int(a))
+    largest_scc: set = set()
+    if G_dir.number_of_nodes() > 0:
+        largest_scc = max(nx.strongly_connected_components(G_dir), key=len)
 
     centroid_to_zone = {v: k for k, v in zone_to_centroid.items()}
     records = []
     for lid, a, b, dist, speed, tt in rows:
         zid = centroid_to_zone.get(a, centroid_to_zone.get(b))
-        road_node = b if a in centroid_to_zone.values() else a
+        road_node = b if a in centroid_to_zone else a
         travel_km = (dist or 0) / 1000.0
         penalty_s = (tt or 0) - (travel_km / max(speed or 30, 1) * 3600) if tt and speed else 0
         records.append({
             "zone_id": zid,
-            "centroid_node": a,
+            "centroid_node": a if a in centroid_to_zone else b,
             "road_node": road_node,
             "link_id": lid,
             "distance_m": round(dist or 0, 1),
             "speed_kmh": speed,
             "travel_time_s": round(tt or 0, 1),
             "access_penalty_s": round(max(penalty_s, 0), 1),
+            "road_link_type": road_link_types.get(int(road_node), ""),
+            "in_directed_scc": int(road_node) in largest_scc,
         })
 
     if records:
@@ -1716,7 +1935,137 @@ def export_connector_diagnostics(
         output_dir.mkdir(parents=True, exist_ok=True)
         out = output_dir / "connector_diagnostics.csv"
         df.to_csv(out, index=False)
-        print(f"  Connector diagnostics: {out} ({len(df)} connectors)")
+
+        gw_mask = df["zone_id"].astype(int) >= 8_000_000_000
+        if gw_mask.any():
+            gw = df[gw_mask]
+            n_scc = int(gw["in_directed_scc"].sum())
+            n_total = len(gw)
+            print(f"  Connector diagnostics: {out} ({len(df)} connectors)")
+            print(f"  Gateway SCC status: {n_scc}/{n_total} connectors target SCC nodes")
+        else:
+            print(f"  Connector diagnostics: {out} ({len(df)} connectors)")
+
+
+def _pick_best_road_type(a: str, b: str) -> str:
+    """Return the higher-class road type between two candidates."""
+    if not a:
+        return b
+    if not b:
+        return a
+    order = [
+        "motorway", "motorway_link", "trunk", "trunk_link",
+        "primary", "primary_link", "secondary", "secondary_link",
+        "tertiary", "tertiary_link", "unclassified", "residential",
+        "living_street", "service",
+    ]
+    ra = order.index(a) if a in order else len(order)
+    rb = order.index(b) if b in order else len(order)
+    return a if ra <= rb else b
+
+
+def validate_connectors(
+    project: Project,
+    zone_to_centroid: Dict[int, int],
+    output_dir: Path,
+    *,
+    min_connectors: int = 2,
+    warn_min_distance_m: float = 1500.0,
+) -> Dict[str, Any]:
+    """Post-connector validation: check counts, distances, road types, SCC membership."""
+    import networkx as nx
+
+    db = str(project.project_base_path) + "/project_database.sqlite"
+    conn = sqlite3.connect(db)
+
+    connector_rows = conn.execute(
+        "SELECT link_id, a_node, b_node, distance FROM links WHERE link_type='centroid_connector'"
+    ).fetchall()
+
+    centroid_to_zone = {v: k for k, v in zone_to_centroid.items()}
+
+    zone_connectors: Dict[int, List[Dict[str, Any]]] = {}
+    for lid, a, b, dist in connector_rows:
+        zid = centroid_to_zone.get(a, centroid_to_zone.get(b))
+        if zid is None:
+            continue
+        road_node = b if a in centroid_to_zone else a
+        zone_connectors.setdefault(zid, []).append({
+            "link_id": lid, "road_node": road_node, "distance_m": dist or 0,
+        })
+
+    dir_edges = conn.execute(
+        "SELECT a_node, b_node, direction FROM links WHERE link_type != 'centroid_connector'"
+    ).fetchall()
+    conn.close()
+
+    G = nx.DiGraph()
+    for a, b, direction in dir_edges:
+        d = int(direction or 0)
+        if d >= 0:
+            G.add_edge(int(a), int(b))
+        if d <= 0:
+            G.add_edge(int(b), int(a))
+
+    largest_scc = set()
+    if G.number_of_nodes() > 0:
+        largest_scc = max(nx.strongly_connected_components(G), key=len)
+
+    warnings: List[Dict[str, Any]] = []
+    zone_reports: List[Dict[str, Any]] = []
+
+    for zid in sorted(zone_to_centroid.keys()):
+        conns = zone_connectors.get(zid, [])
+        n_conn = len(conns)
+        dists = [c["distance_m"] for c in conns]
+        min_dist = min(dists) if dists else None
+        max_dist = max(dists) if dists else None
+        road_nodes_outside_scc = [
+            c["road_node"] for c in conns if int(c["road_node"]) not in largest_scc
+        ]
+
+        report: Dict[str, Any] = {
+            "zone_id": zid,
+            "num_connectors": n_conn,
+            "min_distance_m": round(min_dist, 1) if min_dist is not None else None,
+            "max_distance_m": round(max_dist, 1) if max_dist is not None else None,
+            "road_nodes_outside_scc": road_nodes_outside_scc,
+        }
+
+        if n_conn < min_connectors:
+            w = f"zone {zid}: only {n_conn} connector(s) (minimum {min_connectors})"
+            warnings.append({"zone_id": zid, "type": "few_connectors", "detail": w})
+        if min_dist is not None and min_dist > warn_min_distance_m:
+            w = f"zone {zid}: nearest connector is {min_dist:.0f} m away (threshold {warn_min_distance_m:.0f} m)"
+            warnings.append({"zone_id": zid, "type": "far_connectors", "detail": w})
+        if road_nodes_outside_scc:
+            w = f"zone {zid}: {len(road_nodes_outside_scc)} road node(s) outside largest directed SCC"
+            warnings.append({"zone_id": zid, "type": "outside_scc", "detail": w})
+
+        zone_reports.append(report)
+
+    result = {
+        "total_zones": len(zone_to_centroid),
+        "total_connectors": len(connector_rows),
+        "largest_directed_scc_size": len(largest_scc),
+        "warnings_count": len(warnings),
+        "warnings": warnings,
+        "zones": zone_reports,
+    }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out = output_dir / "connector_validation.json"
+    out.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    if warnings:
+        print(f"\n  Connector validation: {len(warnings)} warning(s):")
+        for w in warnings:
+            print(f"    [WARN] {w['detail']}")
+    else:
+        print(f"\n  Connector validation: all {len(zone_to_centroid)} zones OK")
+    print(f"  Validation report: {out}")
+
+    return result
 
 
 def export_gateway_diagnostics(
@@ -1744,6 +2093,8 @@ def export_gateway_diagnostics(
             "matched_ref": meta.get("matched_ref"),
             "matched_name": meta.get("matched_name"),
             "link_type": meta.get("link_type"),
+            "predominant_link_type": meta.get("predominant_link_type", meta.get("link_type")),
+            "auto_discovered": meta.get("auto_discovered", False),
             "boundary_angle": meta.get("boundary_angle"),
             "dist_boundary_m": meta.get("dist_boundary_m"),
             "target_node_ids": ",".join(str(x) for x in meta.get("target_node_ids", [])),
@@ -1789,6 +2140,8 @@ def export_gateway_seed_lookup(
             "matched_ref": str(meta.get("matched_ref", "")),
             "matched_name": str(meta.get("matched_name", "")),
             "link_type": str(meta.get("link_type", "")),
+            "predominant_link_type": str(meta.get("predominant_link_type", meta.get("link_type", ""))),
+            "auto_discovered": bool(meta.get("auto_discovered", False)),
             "geometry": Point(float(meta.get("boundary_x", 0.0)), float(meta.get("boundary_y", 0.0))),
         })
 
@@ -1841,9 +2194,11 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
     connector_capacity = float(zoning_cfg.get("connector_capacity_vph", 2000.0))
     connector_lanes = int(zoning_cfg.get("connector_lanes", 1))
     connector_penalty = float(zoning_cfg.get("connector_access_penalty_s", 300.0))
+    internal_exclude_road_types = list(
+        zoning_cfg.get("internal_exclude_road_types", ["motorway", "motorway_link"])
+    )
 
     ext_cfg = zoning_cfg.get("external_gateways", {}) or {}
-    merge_boundary_near_candidates = bool(ext_cfg.get("merge_boundary_near_candidates", False))
     export_lookup = bool(ext_cfg.get("export_lookup", False))
     export_lookup_path = _safe_path(ext_cfg.get("export_lookup_path", "data/cache/gateway_lookup_seed.parquet"))
 
@@ -1856,7 +2211,7 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
         model_area = build_model_area(
             project,
             crs_epsg,
-            quantile=float(aoi_cfg.get("quantile", 0.003)),
+            quantile=float(aoi_cfg.get("quantile", 0.01)),
             pad_ratio=float(aoi_cfg.get("pad_ratio", 0.008)),
             extra_margin_m=float(aoi_cfg.get("extra_margin_m", 200.0)),
             shift_x_m=float(aoi_cfg.get("shift_x_m", 0.0)),
@@ -1885,6 +2240,35 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
         if bool(ext_cfg.get("enabled", False)):
             whitelist_specs = _resolve_whitelist(ext_cfg)
 
+            auto_cfg = ext_cfg.get("auto_discover") or {}
+            if bool(auto_cfg.get("enabled", False)):
+                existing_refs = {s["raw"] for s in whitelist_specs}
+                auto_types = auto_cfg.get("link_types", [
+                    "secondary", "secondary_link",
+                ])
+                all_auto_types = list(ext_cfg.get(
+                    "allowed_link_types",
+                    ["motorway", "motorway_link", "trunk", "trunk_link",
+                     "primary", "primary_link"],
+                )) + list(auto_types)
+                discovered = _auto_discover_boundary_roads(
+                    project=project,
+                    target_epsg=crs_epsg,
+                    model_area=model_area,
+                    existing_refs=existing_refs,
+                    boundary_buffer_m=float(ext_cfg.get("boundary_buffer_m", 600.0)) * 1.5,
+                    min_link_types=all_auto_types,
+                    min_lanes=int(auto_cfg.get("min_lanes", 1)),
+                )
+                max_auto = int(auto_cfg.get("max_gateways", 10))
+                discovered = discovered[:max_auto]
+                if discovered:
+                    for d in discovered:
+                        d["auto_discovered"] = True
+                    refs_str = ", ".join(d["raw"] for d in discovered)
+                    print(f"  Auto-discovered {len(discovered)} boundary roads: {refs_str}")
+                    whitelist_specs.extend(discovered)
+
             gateway_targets, gateway_meta, debug_corridors, debug_points = _select_gateway_target_nodes_boundary_whitelist(
                 project=project,
                 target_epsg=crs_epsg,
@@ -1897,7 +2281,7 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
                     "allowed_link_types",
                     ["motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link"],
                 ),
-                merge_boundary_near_candidates=merge_boundary_near_candidates,
+                max_anchor_distance_m=float(ext_cfg.get("max_anchor_distance_m", 2000.0)),
             )
 
             if debug_corridors is not None and not debug_corridors.empty:
@@ -1979,9 +2363,11 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
             gateway_targets=gateway_targets,
             external_speed_kmh=float(ext_cfg.get("external_connector_speed_kmh", 90.0)),
             external_access_penalty_s=float(ext_cfg.get("external_connector_access_penalty_s", 5.0)),
+            internal_exclude_road_types=internal_exclude_road_types,
         )
 
         export_connector_diagnostics(project, zone_to_centroid, output_dir)
+        validate_connectors(project, zone_to_centroid, output_dir)
 
         centroids["centroid_node_id"] = centroids["zone_id"].map(
             lambda z: zone_to_centroid.get(int(z), int(z))
@@ -2005,7 +2391,7 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
             print(f"  population data loaded: {len(pop_map)} zones, total={sum(pop_map.values()):,}")
             print("  external zones exported with population=0")
         else:
-            print(f"  [warn] {pop_path} not found — population not added to centroids")
+            print(f"  [info] {pop_path} not found — population will be added after fetch-data")
 
         output_dir.mkdir(parents=True, exist_ok=True)
         zones.to_file(output_dir / "zones.geojson", driver="GeoJSON")

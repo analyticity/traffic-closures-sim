@@ -6,7 +6,6 @@ import json
 import math
 import re
 import time
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -18,7 +17,9 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import LineString, MultiLineString, Point
 
-from sim.io_project import load_config
+from sim.io_project import get_metric_epsg, load_config
+from sim._text import norm_name as _norm_name
+from sim._metrics import persons_to_vehicles_from_cfg
 
 try:
     import pyogrio
@@ -52,18 +53,6 @@ def _as_path(value: Any) -> Path:
     return value if isinstance(value, Path) else Path(str(value))
 
 
-def _strip_diacritics(text: Any) -> str:
-    return "".join(
-        ch for ch in unicodedata.normalize("NFKD", str(text))
-        if not unicodedata.combining(ch)
-    )
-
-
-def _norm_name(value: Any) -> str:
-    text = _strip_diacritics(value).strip().lower()
-    text = text.replace("–", "-").replace("—", "-")
-    text = re.sub(r"[^\w\s\-/]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def _make_place_key(name_norm: str, district_norm: str = "") -> str:
@@ -71,7 +60,7 @@ def _make_place_key(name_norm: str, district_norm: str = "") -> str:
 
 
 def _norm_obec_code(value: Any) -> str:
-    """Stable municipality id from ČSÚ (op_obec_kod / doj_obec_kod) as string."""
+    """Stable municipality id from CSU (op_obec_kod / doj_obec_kod) as string."""
     if value is None:
         return ""
     if isinstance(value, float) and np.isnan(value):
@@ -141,15 +130,7 @@ def _meters_to_seconds(distance_m: float, speed_kmh: float) -> float:
     return float(distance_m) / max(float(speed_kmh) / 3.6, 0.1)
 
 
-def _persons_to_vehicles(work: float, school: float, cfg_root: Dict[str, Any]) -> float:
-    def conv(persons: float, branch: str) -> float:
-        conv_cfg = _get(cfg_root, "demand", "conversion", branch, default={}) or {}
-        car_share = float(conv_cfg.get("car_share", 0.0))
-        occupancy = max(float(conv_cfg.get("occupancy", 1.0)), 0.01)
-        trips_per_person = float(conv_cfg.get("trips_per_person", 2.0))
-        return max(float(persons), 0.0) * trips_per_person * car_share / occupancy
-
-    return conv(work, "work") + conv(school, "school")
+_persons_to_vehicles = persons_to_vehicles_from_cfg
 
 
 def _iter_lines(geom: Any) -> Iterable[LineString]:
@@ -195,6 +176,7 @@ class SuperCfg:
     unresolved_places_path: Path
     classified_relations_path: Path
     raw_major_roads_cache: Path
+    eligible_gateway_types: Optional[List[str]]
 
 
 def build_cfg(cfg_root: Dict[str, Any]) -> SuperCfg:
@@ -212,7 +194,7 @@ def build_cfg(cfg_root: Dict[str, Any]) -> SuperCfg:
     ).hexdigest()[:12]
 
     return SuperCfg(
-        metric_epsg=int(cfg_root.get("crs_epsg", 5514)),
+        metric_epsg=get_metric_epsg(cfg_root),
         output_dir=output_dir,
         cache_dir=cache_dir,
         pbf_path=_as_path(sn.get("pbf_path", "data/sources/osm/czech-republic-latest.osm.pbf")),
@@ -243,6 +225,7 @@ def build_cfg(cfg_root: Dict[str, Any]) -> SuperCfg:
         unresolved_places_path=cache_dir / "unresolved_external_places.parquet",
         classified_relations_path=cache_dir / "classified_external_relations.parquet",
         raw_major_roads_cache=cache_dir / f"major_roads_raw_{hw_sig}.parquet",
+        eligible_gateway_types=sn.get("eligible_gateway_types", None),
     )
 
 
@@ -266,7 +249,7 @@ def load_internal_zone_names(path: Path) -> set[str]:
     if "name" not in gdf.columns:
         return set()
     internal = gdf[gdf.get("is_external", 0).fillna(0).astype(int) == 0]
-    return {_norm_name(v) for v in internal["name"].dropna().astype(str)}
+    return {_norm_name(v, keep_slash=True) for v in internal["name"].dropna().astype(str)}
 
 
 def load_gateways(cfg: SuperCfg) -> gpd.GeoDataFrame:
@@ -276,7 +259,7 @@ def load_gateways(cfg: SuperCfg) -> gpd.GeoDataFrame:
             gdf = gdf.set_crs(epsg=cfg.metric_epsg, allow_override=True)
         elif gdf.crs.to_epsg() != cfg.metric_epsg:
             gdf = gdf.to_crs(epsg=cfg.metric_epsg)
-        return gdf[[c for c in gdf.columns if c in {"gateway_name", "geometry"} or c not in set()]].copy()
+        return gdf.copy()
 
     if cfg.gateway_diagnostics_path.exists():
         df = pd.read_csv(cfg.gateway_diagnostics_path)
@@ -671,13 +654,8 @@ def snap_points_to_graph(G: nx.DiGraph, points: gpd.GeoDataFrame, label_col: str
 def is_contractible(G: nx.DiGraph, node: int, protected: set[int], degree_threshold: int) -> bool:
     if node in protected or not G.has_node(node):
         return False
-    # Avoid repeated expensive to_undirected() graph-view construction.
-    # For a DiGraph without parallel edges, undirected degree equals unique neighbor count.
     neighbors = (set(G.predecessors(node)) | set(G.successors(node))) - {node}
-    undirected_degree = len(neighbors)
-    if undirected_degree != 2:
-        return False
-    return undirected_degree <= degree_threshold
+    return len(neighbors) == 2 and 2 <= degree_threshold
 
 
 def contract_graph(G_in: nx.DiGraph, protected: set[int], degree_threshold: int) -> nx.DiGraph:
@@ -855,17 +833,6 @@ def build_gateway_lookup(
     return out
 
 
-def shortest_path_cost(G: nx.DiGraph, source: int, target: int, cache: Dict[Tuple[int, int], float]) -> float:
-    key = (int(source), int(target))
-    if key in cache:
-        return cache[key]
-    try:
-        value = float(nx.shortest_path_length(G, source=source, target=target, weight="travel_time_s"))
-    except Exception:
-        value = float("nan")
-    cache[key] = value
-    return value
-
 
 def shortest_path_cost_batched(
     G: nx.DiGraph,
@@ -974,7 +941,7 @@ def classify_relations(
             "gateway_in": None,
             "gateway_out": None,
             "direct_cost_s": None,
-            "via_brno_cost_s": None,
+            "via_model_cost_s": None,
             "detour_ratio": None,
             "extra_minutes": None,
             "rejection_reason": None,
@@ -1048,7 +1015,7 @@ def classify_relations(
         )
 
         rec["direct_cost_s"] = direct_cost if np.isfinite(direct_cost) else None
-        rec["via_brno_cost_s"] = via_cost if np.isfinite(via_cost) else None
+        rec["via_model_cost_s"] = via_cost if np.isfinite(via_cost) else None
         if np.isfinite(direct_cost) and np.isfinite(via_cost) and direct_cost > 0:
             rec["detour_ratio"] = via_cost / direct_cost
             extra_minutes = (via_cost - direct_cost) / 60.0
@@ -1126,7 +1093,27 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
     _ensure_dir(cfg.cache_dir)
 
     model_area = load_model_area(cfg.model_area_path, cfg.metric_epsg)
-    gateways = load_gateways(cfg)
+    gateways_all = load_gateways(cfg)
+
+    if cfg.eligible_gateway_types and "link_type" in gateways_all.columns:
+        eligible_set = {t.strip() for t in cfg.eligible_gateway_types}
+        type_col = "predominant_link_type" if "predominant_link_type" in gateways_all.columns else "link_type"
+        type_ok = gateways_all[type_col].astype(str).isin(eligible_set)
+        if type_col != "link_type":
+            type_ok = type_ok | gateways_all["link_type"].astype(str).isin(eligible_set)
+        # Whitelist (non-auto-discovered) gateways are always kept regardless
+        # of road class — the user explicitly declared them as important.
+        is_whitelist = ~gateways_all["auto_discovered"].astype(bool) if "auto_discovered" in gateways_all.columns else pd.Series(True, index=gateways_all.index)
+        mask = type_ok | is_whitelist
+        dropped = gateways_all[~mask]["gateway_name"].tolist()
+        gateways = gateways_all[mask].copy()
+        if dropped:
+            print(f"  Supernetwork: filtered auto-discovered gateways by eligible types {sorted(eligible_set)}")
+            print(f"    Kept {len(gateways)}: {sorted(gateways['gateway_name'].tolist())}")
+            print(f"    Dropped {len(dropped)} auto-discovered: {dropped}")
+    else:
+        gateways = gateways_all
+
     internal_zone_names = load_internal_zone_names(cfg.zones_path)
     profile["phases_s"]["load_core_inputs"] = round(time.perf_counter() - phase_t, 3)
 
@@ -1205,10 +1192,8 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
     unique_unit_nodes = int(units_join["graph_node"].nunique()) if not units_join.empty else 0
     if len(units_join) > 100 and unique_unit_nodes <= 1:
         raise RuntimeError(
-            "Invalid supernetwork cache detected: all external units snapped to a single graph node. "
-            "Remove stale cache files in data/cache/supernetwork "
-            "(national_nodes.parquet, national_edges.parquet, major_roads_raw.parquet) "
-            "and rerun build-supernetwork."
+            "Invalid supernetwork cache: all external units snapped to a single graph node. "
+            f"Remove stale cache files in {cfg.cache_dir} and rerun build-supernetwork."
         )
 
     unit_lookup = units_join[
@@ -1293,6 +1278,47 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
     plot_overview(edges_metric, model_area, gateways_join.to_crs(epsg=cfg.metric_epsg), units_join.to_crs(epsg=cfg.metric_epsg), plot_png)
     profile["phases_s"]["write_geo_outputs_and_plot"] = round(time.perf_counter() - phase_t, 3)
 
+    # --- Gateway health diagnostics ---
+    gw_health: List[Dict[str, Any]] = []
+    gw_health_warnings: List[str] = []
+    gw_graph_nodes: Dict[str, int] = {}
+    for _, gw in gateways_join.iterrows():
+        name = str(gw["gateway_name"])
+        graph_node = int(gw["graph_node"]) if pd.notna(gw.get("graph_node")) else None
+        snap_dist = float(gw["snap_distance_m"]) if pd.notna(gw.get("snap_distance_m")) else None
+        inb = inbound_by_gw.get(name, 0.0)
+        outb = outbound_by_gw.get(name, 0.0)
+        total_traffic = inb + outb
+
+        issues: List[str] = []
+        if total_traffic == 0:
+            issues.append("zero_traffic")
+        if snap_dist is not None and snap_dist > 500.0:
+            issues.append(f"large_snap_distance_{snap_dist:.0f}m")
+        if graph_node is not None:
+            if graph_node in gw_graph_nodes.values():
+                dup_name = [k for k, v in gw_graph_nodes.items() if v == graph_node][0]
+                issues.append(f"shares_graph_node_with_{dup_name}")
+            gw_graph_nodes[name] = graph_node
+
+        entry = {
+            "gateway_name": name,
+            "graph_node": graph_node,
+            "snap_distance_m": round(snap_dist, 1) if snap_dist is not None else None,
+            "inbound_vehicles_daily": round(inb, 1),
+            "outbound_vehicles_daily": round(outb, 1),
+            "total_vehicles_daily": round(total_traffic, 1),
+            "issues": issues,
+        }
+        gw_health.append(entry)
+        if issues:
+            gw_health_warnings.append(f"{name}: {', '.join(issues)}")
+
+    if gw_health_warnings:
+        print("\nGateway health warnings:")
+        for w in gw_health_warnings:
+            print(f"  [WARN] {w}")
+
     summary = {
         "gateway_count": int(len(gateways_join)),
         "resolved_external_units": int(len(units_join)),
@@ -1307,6 +1333,8 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
         "gateway_inbound_vehicles_daily": inbound_by_gw,
         "gateway_outbound_vehicles_daily": outbound_by_gw,
         "through_gateway_pairs_detail": through_by_pair,
+        "gateway_health": gw_health,
+        "gateway_health_warnings": gw_health_warnings,
         "graph_nodes": int(len(nodes_metric)),
         "graph_edges": int(len(edges_metric)),
         "profiling": profile,

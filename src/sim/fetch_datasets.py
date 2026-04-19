@@ -6,7 +6,6 @@ import json
 import re
 import sys
 import time
-import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
@@ -27,7 +26,8 @@ if __name__ == "__main__":
     if _src_dir.exists() and str(_src_dir) not in sys.path:
         sys.path.insert(0, str(_src_dir))
 
-from sim.io_project import load_config
+from sim.io_project import get_metric_epsg, load_config
+from sim._text import strip_diacritics as _strip_diacritics, norm_col as _norm_col
 
 
 # ---------------------------------------------------------------------------
@@ -45,19 +45,6 @@ def _now_iso() -> str:
 def _slug(s: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "_", str(s).strip().lower())
     return re.sub(r"_+", "_", s).strip("_")
-
-
-def _strip_diacritics(text: Any) -> str:
-    return "".join(
-        ch for ch in unicodedata.normalize("NFKD", str(text))
-        if not unicodedata.combining(ch)
-    )
-
-
-def _norm_col(name: Any) -> str:
-    text = _strip_diacritics(name).strip().lower().replace(" ", "_")
-    text = re.sub(r"[^a-z0-9_]+", "_", text)
-    return re.sub(r"_+", "_", text).strip("_")
 
 
 def _find_col(df: pd.DataFrame, wanted: str) -> Optional[str]:
@@ -430,6 +417,7 @@ def preprocess_grouped_points_zip_to_centroids(
                 if tmp_path.exists():
                     tmp_path.unlink()
 
+    frames = [f for f in frames if not f.empty and not f.isna().all(axis=None)]
     df = pd.concat(frames, ignore_index=True)
     return _build_grouped_point_centroids_from_df(
         df,
@@ -562,36 +550,15 @@ def preprocess_csd_xlsx(xlsx_path: Path, out_parquet: Path) -> Dict[str, Any]:
     )
 
 
-_MC_TO_KU: Dict[str, List[str]] = {
-    "Brno-střed": ["Město Brno", "Staré Brno", "Veveří", "Pisárky", "Stránice", "Zábrdovice", "Trnitá", "Štýřice"],
-    "Brno-Žabovřesky": ["Žabovřesky"],
-    "Brno-Královo Pole": ["Královo Pole", "Ponava", "Sadová"],
-    "Brno-sever": ["Husovice", "Černá Pole", "Lesná", "Soběšice"],
-    "Brno-Židenice": ["Židenice"],
-    "Brno-Černovice": ["Černovice"],
-    "Brno-jih": ["Komárov", "Horní Heršpice", "Dolní Heršpice", "Přízřenice"],
-    "Brno-Bohunice": ["Bohunice"],
-    "Brno-Starý Lískovec": ["Starý Lískovec"],
-    "Brno-Nový Lískovec": ["Nový Lískovec"],
-    "Brno-Kohoutovice": ["Kohoutovice"],
-    "Brno-Jundrov": ["Jundrov"],
-    "Brno-Bystrc": ["Bystrc"],
-    "Brno-Kníničky": ["Kníničky"],
-    "Brno-Komín": ["Komín"],
-    "Brno-Medlánky": ["Medlánky"],
-    "Brno-Řečkovice a Mokrá Hora": ["Řečkovice", "Mokrá Hora"],
-    "Brno-Maloměřice a Obřany": ["Maloměřice", "Obřany"],
-    "Brno-Líšeň": ["Líšeň"],
-    "Brno-Slatina": ["Slatina"],
-    "Brno-Tuřany": ["Tuřany", "Brněnské Ivanovice", "Holásky", "Dvorska"],
-    "Brno-Chrlice": ["Chrlice"],
-    "Brno-Bosonohy": ["Bosonohy"],
-    "Brno-Ivanovice": ["Ivanovice"],
-    "Brno-Žebětín": ["Žebětín"],
-    "Brno-Jehnice": ["Jehnice"],
-    "Brno-Útěchov": ["Útěchov u Brna"],
-    "Brno-Ořešín": ["Ořešín"],
-}
+def _load_mc_to_ku(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, List[str]]:
+    """Load municipal-part → cadastral-unit mapping from locale config."""
+    if cfg:
+        from sim.io_project import load_locale
+        locale = load_locale(cfg)
+        mapping = locale.get("municipal_parts_to_cadastral")
+        if mapping and isinstance(mapping, dict):
+            return mapping
+    return {}
 
 
 def preprocess_population_sldb2021(
@@ -601,13 +568,12 @@ def preprocess_population_sldb2021(
     *,
     delimiter: str = "auto",
     encoding: str = "auto",
+    cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     import difflib
 
     def norm(text: Any) -> str:
-        t = unicodedata.normalize("NFKD", str(text).strip())
-        t = "".join(ch for ch in t if not unicodedata.combining(ch))
-        return t.lower().strip()
+        return _strip_diacritics(text).lower().strip()
 
     df = _read_csv_flexible(csv_path, delimiter=delimiter, encoding=encoding)
 
@@ -641,7 +607,13 @@ def preprocess_population_sldb2021(
     total["hodnota"] = pd.to_numeric(total["hodnota"], errors="coerce").fillna(0).astype(int)
     total["nazev"] = total["uzemi_txt"].astype(str).str.strip()
 
-    brno_mc = total[(pd.to_numeric(total["uzemi_cis"], errors="coerce") == 44) & total["nazev"].str.startswith("Brno", na=False)]
+    place_name = (cfg or {}).get("osm", {}).get("place_name", "")
+    city_prefix = place_name.split(",")[0].strip() if place_name else ""
+    mc_filter = (
+        (pd.to_numeric(total["uzemi_cis"], errors="coerce") == 44)
+        & (total["nazev"].str.startswith(city_prefix, na=False) if city_prefix else False)
+    )
+    brno_mc = total[mc_filter]
     mc_pop = {str(r["nazev"]).strip(): int(r["hodnota"]) for _, r in brno_mc.iterrows()}
 
     obce = total[pd.to_numeric(total["uzemi_cis"], errors="coerce") == 43][["uzemi_kod", "nazev", "hodnota"]].copy()
@@ -659,9 +631,10 @@ def preprocess_population_sldb2021(
         return {"parquet": str(out_parquet), "zones_total": len(result), "matched": 0, "total_population": int(result["population"].sum())}
 
     zones = gpd.read_file(zones_geojson)
-    ku_to_mc = {norm(ku): mc for mc, ku_list in _MC_TO_KU.items() for ku in ku_list}
+    mc_to_ku = _load_mc_to_ku(cfg)
+    ku_to_mc = {norm(ku): mc for mc, ku_list in mc_to_ku.items() for ku in ku_list}
 
-    zones_m = zones.to_crs(epsg=5514)
+    zones_m = zones.to_crs(epsg=get_metric_epsg(cfg or {}))
     zone_area = {int(r["zone_id"]): r.geometry.area for _, r in zones_m.iterrows()}
 
     mc_zone_ids: Dict[str, List[int]] = {}
@@ -712,8 +685,9 @@ def preprocess_population_sldb2021(
             original = obec_norm[close[0]]
             result_rows.append({"zone_id": zid, "zone_name": zname, "population": obec_pop[original], "match": f"fuzzy:{original}"})
         else:
-            avg = int(mc_pop.get("Brno-střed", 70000) / 8)
-            result_rows.append({"zone_id": zid, "zone_name": zname, "population": avg, "match": "default_avg"})
+            all_pops = [v for v in {**mc_pop, **obec_pop}.values() if v > 0]
+            avg = int(sorted(all_pops)[len(all_pops) // 2]) if all_pops else 1000
+            result_rows.append({"zone_id": zid, "zone_name": zname, "population": avg, "match": "default_median"})
 
     result = _coerce_object_columns_for_parquet(pd.DataFrame(result_rows))
     _ensure_dir(out_parquet.parent)
@@ -813,10 +787,172 @@ def arcgis_query_geojson(
         if not feats:
             break
         offset += len(feats)
-        if not exceeded:
+        # GeoJSON format omits exceededTransferLimit; fall back to
+        # checking whether we got a full page of results.
+        if not exceeded and len(feats) < page_size:
             break
 
     return {"type": "FeatureCollection", "features": all_features}
+
+
+def _postprocess_pentlogram(
+    gdf: "gpd.GeoDataFrame",
+    cfg: Dict[str, Any],
+    source_cfg: Dict[str, Any],
+) -> Optional["gpd.GeoDataFrame"]:
+    """Compute observed volumes and run spatial outlier filtering.
+
+    Returns a cleaned GeoDataFrame ready for diagnostics, or None on error.
+    """
+    try:
+        import numpy as np
+
+        units_cfg = (source_cfg.get("units") or {})
+        car_mult = float(units_cfg.get("car_24_multiplier", 1000))
+
+        work = gdf.copy()
+        for col in ("car_24", "truc_24"):
+            if col in work.columns:
+                work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0)
+
+        total_vehicles = work.get("car_24", 0) * car_mult
+        truck_pct = work.get("truc_24", 0).clip(0, 100)
+        work["observed_car"] = total_vehicles
+        work["observed_truck"] = total_vehicles * truck_pct / 100.0
+        work["observed_total"] = total_vehicles
+
+        work = work[work["observed_total"] > 0].copy()
+
+        out_epsg = int((source_cfg.get("output") or {}).get(
+            "out_epsg", get_metric_epsg(cfg)))
+
+        from sim.calibration import _flag_neighbor_outliers
+        work = _flag_neighbor_outliers(work, metric_epsg=out_epsg)
+        return work
+    except Exception as exc:
+        print(f"  WARNING: pentlogram post-processing failed: {exc}")
+        return None
+
+
+_NDIC_FULL_CLOSURE_KEYWORDS = (
+    "uzavřen", "uzavírk", "neprůjezd", "uzavrena", "uzavirka",
+    "úplná uzavírka", "úplná uzavěrka",
+)
+
+_NDIC_SEVERITY_KEYWORDS: Dict[str, str] = {
+    "úplná uzavírka": "full",
+    "uzavření": "full",
+    "uzavřen": "full",
+    "neprůjezdnost": "full",
+    "částečná uzavírka": "lane_reduction",
+    "omezení provozu": "lane_reduction",
+    "omezení": "lane_reduction",
+    "snížení rychlosti": "speed_limit",
+}
+
+
+def _infer_ndic_severity(row: Dict[str, Any]) -> str:
+    """Infer closure severity from NDIC event/class description fields."""
+    texts = []
+    for key in ("event_popis1", "event_popis2", "event_popis3",
+                "trida_popis1", "trida_popis2", "trida_popis3",
+                "txt", "otxt", "txpl_text"):
+        v = row.get(key)
+        if v and str(v).strip():
+            texts.append(str(v).strip().lower())
+    combined = " ".join(texts)
+
+    for keyword, severity in _NDIC_SEVERITY_KEYWORDS.items():
+        if keyword.lower() in combined:
+            return severity
+
+    for kw in _NDIC_FULL_CLOSURE_KEYWORDS:
+        if kw.lower() in combined:
+            return "full"
+
+    return "lane_reduction"
+
+
+def _parse_ndic_date(raw: str) -> str:
+    """Convert NDIC date ``DD.MM.YYYY HH:MM`` → ``YYYY-MM-DD``."""
+    raw = str(raw).strip()
+    if not raw:
+        return ""
+    try:
+        parts = raw.split(" ")[0].split(".")
+        if len(parts) == 3:
+            return f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+    except Exception:
+        pass
+    return raw[:10]
+
+
+def _postprocess_ndic_closures(
+    gdf: "gpd.GeoDataFrame",
+    cfg: Dict[str, Any],
+    source_cfg: Dict[str, Any],
+) -> Optional["gpd.GeoDataFrame"]:
+    """Transform NDIC closure point data into a standardized format.
+
+    Adds ``severity``, ``road_ref``, ``start``, ``end`` columns.
+    Clips to the model AOI and converts coordinates to WGS84.
+    Returns a GeoDataFrame with closure attributes, or None on error.
+    """
+    try:
+        if gdf.empty:
+            print("  NDIC closures: no features returned")
+            return None
+
+        work = gdf.copy()
+
+        bbox = _load_aoi_bbox_wgs84(cfg)
+        if bbox is not None:
+            before = len(work)
+            work_wgs = work.to_crs(epsg=4326) if (work.crs and work.crs.to_epsg() != 4326) else work
+            w, s, e, n = bbox
+            margin = 0.02
+            mask = (
+                (work_wgs.geometry.x >= w - margin) & (work_wgs.geometry.x <= e + margin) &
+                (work_wgs.geometry.y >= s - margin) & (work_wgs.geometry.y <= n + margin)
+            )
+            work = work[mask.values].copy()
+            print(f"  NDIC closures: {before} nationwide → {len(work)} in model area")
+
+        if work.empty:
+            print("  NDIC closures: no features in model area")
+            return None
+
+        work["severity"] = work.apply(
+            lambda r: _infer_ndic_severity(r.to_dict()), axis=1,
+        )
+
+        if "cislo_silnice" in work.columns:
+            work["road_ref"] = work["cislo_silnice"].fillna("").astype(str).str.strip()
+        else:
+            work["road_ref"] = ""
+
+        for src_col, dst_col in [("zacatek", "start"), ("konec", "end")]:
+            if src_col in work.columns:
+                work[dst_col] = work[src_col].fillna("").astype(str).apply(_parse_ndic_date)
+            else:
+                work[dst_col] = ""
+
+        work_wgs = work.to_crs(epsg=4326) if (work.crs and work.crs.to_epsg() != 4326) else work
+        work["lon"] = work_wgs.geometry.x.values
+        work["lat"] = work_wgs.geometry.y.values
+
+        full_count = int((work["severity"] == "full").sum())
+        partial_count = int((work["severity"] == "lane_reduction").sum())
+        speed_count = int((work["severity"] == "speed_limit").sum())
+        print(f"  NDIC closures: {len(work)} events in model area "
+              f"({full_count} full, {partial_count} lane_reduction, {speed_count} speed_limit)")
+
+        return work
+    except Exception as exc:
+        print(f"  WARNING: NDIC closure post-processing failed: {exc}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def fetch_arcgis_feature_service(
@@ -834,24 +970,27 @@ def fetch_arcgis_feature_service(
     service_url = source_cfg["service_url"]
     layer_id = int(source_cfg["layer_id"])
     out_path = Path(source_cfg["out_path"])
-    out_epsg = int((source_cfg.get("output") or {}).get("out_epsg", cfg.get("crs_epsg", 5514)))
+    out_epsg = int((source_cfg.get("output") or {}).get("out_epsg", get_metric_epsg(cfg)))
 
     query_cfg = source_cfg.get("query") or {}
     bbox = _load_aoi_bbox_wgs84(cfg) if (query_cfg.get("geometry_clip") or {}).get("enabled", False) and (query_cfg.get("geometry_clip") or {}).get("use_aoi", False) else None
 
-    geojson = arcgis_query_geojson(
-        service_url,
-        layer_id,
-        where=str(query_cfg.get("where", "1=1")),
-        out_fields=query_cfg.get("out_fields") or ["*"],
-        bbox_wgs84=bbox,
-        timeout_s=timeout_s,
-        retries=retries,
-        headers=headers,
-    )
-
     _ensure_dir(out_path.parent)
-    if (not out_path.exists()) or force:
+
+    if out_path.exists() and not force:
+        print(f"  Using cached {out_path}")
+    else:
+        src_timeout = int(source_cfg.get("timeout_s", timeout_s))
+        geojson = arcgis_query_geojson(
+            service_url,
+            layer_id,
+            where=str(query_cfg.get("where", "1=1")),
+            out_fields=query_cfg.get("out_fields") or ["*"],
+            bbox_wgs84=bbox,
+            timeout_s=max(timeout_s, src_timeout),
+            retries=retries,
+            headers=headers,
+        )
         out_path.write_text(json.dumps(geojson), encoding="utf-8")
 
     gdf = gpd.read_file(out_path)
@@ -864,7 +1003,189 @@ def fetch_arcgis_feature_service(
     _ensure_dir(cache_dir)
     cache_parquet = cache_dir / f"{_slug(out_path.stem)}.parquet"
     gdf.to_parquet(cache_parquet, index=False)
-    return {"features": int(len(gdf)), "geojson": str(out_path), "parquet": str(cache_parquet), "epsg": out_epsg}
+    info = {"features": int(len(gdf)), "geojson": str(out_path), "parquet": str(cache_parquet), "epsg": out_epsg}
+
+    usage = (source_cfg.get("usage") or {})
+    if usage.get("calibration_target") == "link_counts":
+        cleaned = _postprocess_pentlogram(gdf, cfg, source_cfg)
+        if cleaned is not None:
+            cleaned_path = cache_dir / f"{_slug(out_path.stem)}_cleaned.parquet"
+            cleaned.to_parquet(cleaned_path, index=False)
+            info["cleaned_parquet"] = str(cleaned_path)
+            info["cleaned_features"] = int(len(cleaned))
+            print(f"  Pentlogram cleaned: {len(gdf)} → {len(cleaned)} segments")
+
+    if usage.get("calibration_target") == "baseline_closures":
+        closures_gdf = _postprocess_ndic_closures(gdf, cfg, source_cfg)
+        if closures_gdf is not None:
+            closures_path = cache_dir / "closures_ndic.parquet"
+            closures_gdf = _coerce_object_columns_for_parquet(closures_gdf)
+            closures_gdf.to_parquet(closures_path, index=False)
+            info["closures_parquet"] = str(closures_path)
+            info["closures_count"] = int(len(closures_gdf))
+
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Police CR traffic-info XML -> closures JSON
+# ---------------------------------------------------------------------------
+
+# Event codes that indicate a closure or restriction (not an accident report).
+_CLOSURE_EVENT_CODES = {
+    401, 402, 403, 404, 405,   # road works / construction
+    500, 501, 502, 503, 504,   # lane(s) closed
+    505, 506, 507,             # carriageway closed / blocked
+    508, 509, 510,             # road closed / impassable
+    700, 701, 702, 703, 704,   # maintenance / resurfacing
+    801, 802, 803, 804,        # roadwork signs, temporary signals
+    981, 982, 983,             # obstruction on road
+}
+
+# Codes that imply only a speed or lane restriction, not full closure.
+_LANE_REDUCTION_CODES = {500, 501, 502, 503, 504, 802, 803, 804}
+
+
+def _parse_police_xml_closures(
+    xml_text: str,
+    *,
+    bbox_wgs84: Optional[Tuple[float, float, float, float]] = None,
+) -> List[Dict[str, Any]]:
+    """Parse the Police CR traffic-info XML and extract closure/restriction events."""
+    closures: List[Dict[str, Any]] = []
+    msg_pattern = re.compile(r"<MSG\b.*?</MSG>", re.DOTALL)
+    tsta_pattern = re.compile(r'<TSTA\s+date="([^"]+)"\s+time="([^"]*)"')
+    tsto_pattern = re.compile(r'<TSTO\s+date="([^"]+)"\s+time="([^"]*)"')
+    mtxt_pattern = re.compile(r"<MTXT[^>]*>(.*?)</MTXT>", re.DOTALL)
+    msgid_pattern = re.compile(r'<MSG\s+id="([^"]*)"')
+    sbeg_pattern = re.compile(r'<SBEG\s+x="([^"]+)"\s+y="([^"]+)"')
+    send_pattern = re.compile(r'<SEND\s+x="([^"]+)"\s+y="([^"]+)"')
+    evi_pattern = re.compile(r'<EVI\s+eventcode="(\d+)"')
+
+    for msg_match in msg_pattern.finditer(xml_text):
+        msg = msg_match.group(0)
+
+        codes = {int(c) for c in evi_pattern.findall(msg)}
+        relevant = codes & _CLOSURE_EVENT_CODES
+        if not relevant:
+            continue
+
+        sbeg = sbeg_pattern.search(msg)
+        if not sbeg:
+            continue
+        lon, lat = float(sbeg.group(1)), float(sbeg.group(2))
+
+        if bbox_wgs84:
+            w, s, e, n = bbox_wgs84
+            margin = 0.02
+            if not (w - margin <= lon <= e + margin and s - margin <= lat <= n + margin):
+                continue
+
+        send = send_pattern.search(msg)
+        lon_end = float(send.group(1)) if send else lon
+        lat_end = float(send.group(2)) if send else lat
+
+        tsta = tsta_pattern.search(msg)
+        tsto = tsto_pattern.search(msg)
+        start_date = tsta.group(1) if tsta else None
+        end_date = tsto.group(1) if tsto else None
+
+        mtxt = mtxt_pattern.search(msg)
+        text = mtxt.group(1).strip() if mtxt else ""
+
+        msgid = msgid_pattern.search(msg)
+        msg_id = msgid.group(1) if msgid else ""
+
+        road_ref_match = re.search(r"(?:na silnici|na dálnici|na komunikaci)\s+(\S+)", text)
+        road_ref_d = re.search(r"\b(D\d+)\b", text)
+        road_ref = road_ref_match.group(1) if road_ref_match else (road_ref_d.group(1) if road_ref_d else None)
+
+        muni_match = re.search(r"v obci\s+([^;,]+)", text)
+        municipality = muni_match.group(1).strip() if muni_match else None
+
+        if relevant & _LANE_REDUCTION_CODES and not (relevant - _LANE_REDUCTION_CODES):
+            severity = "lane_reduction"
+        elif any(w in text.lower() for w in ("uzavřen", "uzavírk", "neprůjezd")):
+            severity = "full"
+        else:
+            severity = "lane_reduction"
+
+        closures.append({
+            "id": msg_id,
+            "start": start_date,
+            "end": end_date,
+            "text": text,
+            "lon": lon,
+            "lat": lat,
+            "lon_end": lon_end,
+            "lat_end": lat_end,
+            "severity": severity,
+            "road_ref": road_ref,
+            "municipality": municipality,
+            "event_codes": sorted(relevant),
+        })
+
+    return closures
+
+
+def fetch_police_traffic_xml(
+    cfg: Dict[str, Any],
+    source_cfg: Dict[str, Any],
+    *,
+    timeout_s: int,
+    retries: int,
+    headers: Dict[str, str],
+    force: bool,
+) -> Dict[str, Any]:
+    """Fetch Police CR traffic-info XML, extract closures, write JSON cache."""
+    url = source_cfg.get("url", "http://aplikace.policie.cz/dopravni-informace/GetFile.aspx")
+    out_path = Path(source_cfg["out_path"])
+
+    if out_path.exists() and not force:
+        data = json.loads(out_path.read_text(encoding="utf-8"))
+        return {
+            "status": "cached",
+            "path": str(out_path),
+            "closures": len(data.get("closures", [])),
+        }
+
+    bbox = _load_aoi_bbox_wgs84(cfg)
+
+    last_err: Optional[Exception] = None
+    xml_text: Optional[str] = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(url, timeout=timeout_s, headers=headers, allow_redirects=True)
+            resp.raise_for_status()
+            xml_text = resp.text
+            break
+        except Exception as exc:
+            last_err = exc
+            if attempt < retries:
+                time.sleep(float(attempt))
+
+    if xml_text is None:
+        raise RuntimeError(f"Failed to fetch Police traffic XML from {url}: {last_err}")
+
+    closures = _parse_police_xml_closures(xml_text, bbox_wgs84=bbox)
+
+    result = {
+        "fetched_at": _now_iso(),
+        "source_url": url,
+        "bbox_wgs84": list(bbox) if bbox else None,
+        "total_xml_size": len(xml_text),
+        "closures": closures,
+    }
+
+    _ensure_dir(out_path.parent)
+    out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"  Police closures: {len(closures)} events in model area (from {len(re.findall(r'<MSG ', xml_text))} total)")
+
+    return {
+        "status": "fetched",
+        "path": str(out_path),
+        "closures": len(closures),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +1214,12 @@ def _handle_http_file(
     fmt_cfg = scfg.get("format") or {}
     usage = scfg.get("usage") or {}
     fmt_type = fmt_cfg.get("type")
+    if fmt_type is None:
+        ext = out_path.suffix.lstrip(".").lower()
+        if ext in ("xlsx", "xls"):
+            fmt_type = "xlsx"
+        elif ext == "csv":
+            fmt_type = "csv"
 
     if fmt_type == "xlsx":
         out_parquet = _default_cache_parquet(cache_dir, out_path)
@@ -904,13 +1231,14 @@ def _handle_http_file(
 
     if fmt_type == "csv" and usage.get("socioeconomic") == "population_per_zone":
         zones_path = Path(cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones")) / "zones.geojson"
-        out_parquet = _default_cache_parquet(cache_dir, out_path)
+        out_parquet = cache_dir / "zone_population.parquet"
         info["preprocess"] = preprocess_population_sldb2021(
             out_path,
             out_parquet,
             zones_geojson=zones_path if zones_path.exists() else None,
             delimiter=str(fmt_cfg.get("delimiter", "auto")),
             encoding=str(fmt_cfg.get("encoding", "auto")),
+            cfg=cfg,
         )
     return info
 
@@ -1048,6 +1376,7 @@ def run_fetch_datasets(
         "sources": {},
     }
 
+    errors: list[tuple[str, str]] = []
     selected = set(only) if only else None
     for key, scfg in (ds.get("sources") or {}).items():
         if selected is not None and key not in selected:
@@ -1058,50 +1387,71 @@ def run_fetch_datasets(
         provider = str(scfg.get("provider", "")).strip()
         print(f"[{key}] provider={provider}")
 
-        if provider == "http_file":
-            info = _handle_http_file(
-                cfg,
-                scfg,
-                cache_dir=cache_dir,
-                timeout_s=timeout_s,
-                retries=retries,
-                headers=headers,
-                force=force,
-            )
-        elif provider == "csu_open_data_csv":
-            info = _handle_csu_open_data_csv(
-                scfg,
-                cache_dir=cache_dir,
-                timeout_s=timeout_s,
-                retries=retries,
-                headers=headers,
-                force=force,
-            )
-        elif provider == "atom_file":
-            info = _handle_atom_file(
-                scfg,
-                timeout_s=timeout_s,
-                retries=retries,
-                headers=headers,
-                force=force,
-            )
-        elif provider == "arcgis_feature_service":
-            info = fetch_arcgis_feature_service(
-                cfg,
-                scfg,
-                timeout_s=timeout_s,
-                retries=retries,
-                headers=headers,
-                force=force,
-            )
-        else:
-            raise ValueError(f"Unknown provider '{provider}' for source '{key}'")
+        try:
+            if provider == "http_file":
+                info = _handle_http_file(
+                    cfg,
+                    scfg,
+                    cache_dir=cache_dir,
+                    timeout_s=timeout_s,
+                    retries=retries,
+                    headers=headers,
+                    force=force,
+                )
+            elif provider == "csu_open_data_csv":
+                info = _handle_csu_open_data_csv(
+                    scfg,
+                    cache_dir=cache_dir,
+                    timeout_s=timeout_s,
+                    retries=retries,
+                    headers=headers,
+                    force=force,
+                )
+            elif provider == "atom_file":
+                info = _handle_atom_file(
+                    scfg,
+                    timeout_s=timeout_s,
+                    retries=retries,
+                    headers=headers,
+                    force=force,
+                )
+            elif provider == "arcgis_feature_service":
+                info = fetch_arcgis_feature_service(
+                    cfg,
+                    scfg,
+                    timeout_s=timeout_s,
+                    retries=retries,
+                    headers=headers,
+                    force=force,
+                )
+            elif provider == "police_traffic_xml":
+                info = fetch_police_traffic_xml(
+                    cfg,
+                    scfg,
+                    timeout_s=timeout_s,
+                    retries=retries,
+                    headers=headers,
+                    force=force,
+                )
+            else:
+                raise ValueError(f"Unknown provider '{provider}' for source '{key}'")
+        except Exception as exc:
+            print(f"  [ERROR] {key}: {exc}")
+            errors.append((key, str(exc)))
+            manifest["sources"][key] = {"error": str(exc)}
+            continue
 
         manifest["sources"][key] = info
 
     manifest_path = cache_dir / "datasets_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"✓ Wrote manifest: {manifest_path}")
+
+    if errors:
+        names = ", ".join(k for k, _ in errors)
+        print(f"\n⚠ {len(errors)} source(s) failed: {names}")
+        for k, msg in errors:
+            print(f"  - {k}: {msg}")
 
 
 def main() -> None:

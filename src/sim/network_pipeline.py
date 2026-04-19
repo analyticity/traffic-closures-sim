@@ -18,7 +18,7 @@ from aequilibrae import Project
 from shapely.geometry import box
 
 from sim.aequilibrae_paths import resolve_project_database_path
-from sim.io_project import load_config
+from sim.io_project import get_metric_epsg, load_config
 
 
 def _ensure_dir(path: Path) -> None:
@@ -104,9 +104,6 @@ def _fill_missing_refs_from_named_corridors(
     components_used = 0
 
     for _, group in work.groupby("_name_norm"):
-        if group.empty:
-            continue
-
         by_link = {int(r["link_id"]): r for _, r in group.iterrows()}
         node_to_links: Dict[int, List[int]] = defaultdict(list)
 
@@ -137,8 +134,6 @@ def _fill_missing_refs_from_named_corridors(
                         stack.append(other)
 
             comp = group[group["link_id"].astype(int).isin(component_link_ids)].copy()
-            if comp.empty:
-                continue
 
             known = comp[comp["_ref_norm"] != ""].copy()
             missing = comp[comp["_ref_norm"] == ""].copy()
@@ -331,15 +326,69 @@ def compute_bbox_from_links_raw(project: Project) -> Tuple[float, float, float, 
     return minx, miny, maxx, maxy
 
 
+_CORRIDOR_LINK_TYPES = frozenset({
+    "motorway", "motorway_link", "trunk", "trunk_link",
+    "primary", "primary_link",
+})
+
+
+def _compute_urban_trim_bbox(
+    project: Project,
+    *,
+    pad_ratio: float = 0.02,
+    quantile: float = 0.01,
+) -> Tuple[float, float, float, float]:
+    """
+    Compute the bounding box of the "urban core" -- nodes that touch at least
+    one non-highway/non-primary link.  Long corridor-only segments are excluded
+    so they don't inflate the trim area.  A quantile trim + padding is applied.
+    """
+    import numpy as np
+
+    links = project.network.links.data
+    nodes = project.network.nodes.data
+    links_gdf = gpd.GeoDataFrame(links, geometry="geometry", crs=getattr(links, "crs", None))
+    nodes_gdf = gpd.GeoDataFrame(nodes, geometry="geometry", crs=getattr(nodes, "crs", None))
+
+    if "link_type" in links_gdf.columns:
+        local = links_gdf[
+            ~links_gdf["link_type"].astype(str).str.strip().str.lower().isin(_CORRIDOR_LINK_TYPES)
+        ]
+        urban_ids = set(local["a_node"].astype(int)) | set(local["b_node"].astype(int))
+    else:
+        urban_ids = set(nodes_gdf["node_id"].astype(int))
+
+    urban = nodes_gdf[nodes_gdf["node_id"].astype(int).isin(urban_ids)]
+    if len(urban) < 50:
+        urban = nodes_gdf
+
+    xs = urban.geometry.x.to_numpy(dtype=float)
+    ys = urban.geometry.y.to_numpy(dtype=float)
+
+    if quantile > 0:
+        lx, hx = np.quantile(xs, quantile), np.quantile(xs, 1 - quantile)
+        ly, hy = np.quantile(ys, quantile), np.quantile(ys, 1 - quantile)
+    else:
+        lx, hx = xs.min(), xs.max()
+        ly, hy = ys.min(), ys.max()
+
+    dx = (hx - lx) * pad_ratio
+    dy = (hy - ly) * pad_ratio
+    return (lx - dx, ly - dy, hx + dx, hy + dy)
+
+
 def trim_network_to_bbox_raw(
     project: Project,
     bbox: Tuple[float, float, float, float],
     project_dir: Path,
 ) -> Dict[str, int]:
     """
-    HARD trim in native/raw coordinate space (optional; not used by ``build_network_from_osm``):
-    - keep nodes within bbox
-    - keep links where both endpoints are kept AND link geometry intersects bbox
+    Trim **non-corridor** links to *bbox* (native CRS).
+
+    Corridor links (motorway/trunk/primary) are always kept so that highway
+    corridors extend beyond the urban core to where gateways are placed.
+    Only secondary-and-below suburban links outside the bbox are removed.
+    Orphan nodes no longer referenced by any kept link are cleaned up.
     """
     west, south, east, north = bbox
     rect = box(west, south, east, north)
@@ -361,19 +410,31 @@ def trim_network_to_bbox_raw(
     nodes_gdf = gpd.GeoDataFrame(nodes, geometry="geometry", crs=getattr(nodes, "crs", None))
     links_gdf = gpd.GeoDataFrame(links, geometry="geometry", crs=getattr(links, "crs", None))
 
-    inside_nodes = nodes_gdf.geometry.within(rect)
-    kept_nodes = nodes_gdf.loc[inside_nodes].copy()
-    kept_node_ids = set(kept_nodes["node_id"].astype(int).tolist())
+    inside_node_ids = set(
+        nodes_gdf.loc[nodes_gdf.geometry.within(rect), "node_id"].astype(int)
+    )
 
-    a_inside = links_gdf["a_node"].astype(int).isin(kept_node_ids)
-    b_inside = links_gdf["b_node"].astype(int).isin(kept_node_ids)
-    geom_inside = links_gdf.geometry.intersects(rect)
+    a_in = links_gdf["a_node"].astype(int).isin(inside_node_ids)
+    b_in = links_gdf["b_node"].astype(int).isin(inside_node_ids)
 
-    kept_links = links_gdf.loc[a_inside & b_inside & geom_inside].copy()
-    kept_link_ids = set(kept_links["link_id"].astype(int).tolist())
+    is_corridor = links_gdf["link_type"].astype(str).str.strip().str.lower().isin(
+        _CORRIDOR_LINK_TYPES
+    ) if "link_type" in links_gdf.columns else pd.Series(False, index=links_gdf.index)
 
-    link_ids_to_remove = [int(x) for x in links_gdf["link_id"] if int(x) not in kept_link_ids]
-    node_ids_to_remove = [int(x) for x in nodes_gdf["node_id"] if int(x) not in kept_node_ids]
+    keep_link = is_corridor | (a_in & b_in)
+
+    kept_link_ids = set(links_gdf.loc[keep_link, "link_id"].astype(int))
+    kept_links = links_gdf.loc[keep_link]
+    referenced_node_ids = (
+        set(kept_links["a_node"].astype(int)) | set(kept_links["b_node"].astype(int))
+    )
+
+    link_ids_to_remove = [
+        int(x) for x in links_gdf["link_id"] if int(x) not in kept_link_ids
+    ]
+    node_ids_to_remove = [
+        int(x) for x in nodes_gdf["node_id"] if int(x) not in referenced_node_ids
+    ]
 
     links_deleted = 0
     for link_id in link_ids_to_remove:
@@ -422,6 +483,7 @@ DEFAULT_EXCLUDED_HIGHWAY_LINK_TYPES = frozenset(
         "corridor",
         "platform",
         "proposed",
+        "crossing",
     }
 )
 
@@ -698,19 +760,52 @@ def _choose_best(counter: Counter) -> Optional[str]:
     return counter.most_common(1)[0][0]
 
 
+def _geocode_place(place_name: str) -> "Polygon":
+    """Return the WGS84 boundary polygon for *place_name* via osmnx."""
+    try:
+        import osmnx as ox
+    except ImportError as e:
+        raise RuntimeError("osmnx is required for place buffering: pip install osmnx") from e
+    gdf = ox.geocode_to_gdf(place_name)
+    return gdf.geometry.iloc[0]
+
+
+def _buffer_polygon_km(poly: "Polygon", buffer_km: float, crs_epsg: int) -> "Polygon":
+    """Buffer a WGS84 polygon by *buffer_km* kilometres via a metric CRS round-trip."""
+    from pyproj import Transformer
+    from shapely.ops import transform as shp_transform
+
+    to_metric = Transformer.from_crs("EPSG:4326", f"EPSG:{crs_epsg}", always_xy=True).transform
+    to_wgs84 = Transformer.from_crs(f"EPSG:{crs_epsg}", "EPSG:4326", always_xy=True).transform
+
+    poly_m = shp_transform(to_metric, poly)
+    poly_buf = poly_m.buffer(buffer_km * 1000.0)
+    return shp_transform(to_wgs84, poly_buf)
+
+
+
 def _download_osm_drive_edges(
     *,
     place_name: Optional[str] = None,
     bbox_cfg: Optional[Iterable[float]] = None,
+    polygon: Optional[Any] = None,
 ) -> gpd.GeoDataFrame:
     try:
         import osmnx as ox
     except ImportError as e:
-        raise RuntimeError("Chybí osmnx. Doinstaluj: pip install osmnx") from e
+        raise RuntimeError("Missing osmnx. Install: pip install osmnx") from e
 
     if bbox_cfg:
         west, south, east, north = [float(x) for x in bbox_cfg]
-        polygon = box(west, south, east, north)
+        dl_polygon = box(west, south, east, north)
+        G = ox.graph_from_polygon(
+            dl_polygon,
+            network_type="drive",
+            simplify=False,
+            retain_all=True,
+            truncate_by_edge=True,
+        )
+    elif polygon is not None:
         G = ox.graph_from_polygon(
             polygon,
             network_type="drive",
@@ -727,7 +822,7 @@ def _download_osm_drive_edges(
             truncate_by_edge=True,
         )
     else:
-        raise ValueError("Need either bbox_cfg or place_name to download OSM edges")
+        raise ValueError("Need either bbox_cfg, polygon, or place_name to download OSM edges")
 
     _, edges = ox.graph_to_gdfs(G, nodes=True, edges=True, fill_edge_geometry=True)
     edges = edges.reset_index()
@@ -817,6 +912,7 @@ def enrich_links_from_osm(
     crs_epsg_hint: int,
     place_name: Optional[str] = None,
     bbox_cfg: Optional[Iterable[float]] = None,
+    buffered_polygon: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Enrich AequilibraE links with OSM tags using existing `osm_id` in the links table.
@@ -858,6 +954,7 @@ def enrich_links_from_osm(
     effective_bbox = None
     download_source = None
 
+    enrich_polygon = None
     try:
         effective_bbox = _network_bbox_wgs84_from_project(project, crs_epsg_hint)
         download_source = "project_extent"
@@ -866,6 +963,10 @@ def enrich_links_from_osm(
         if bbox_cfg:
             effective_bbox = tuple(float(x) for x in bbox_cfg)
             download_source = "config_bbox"
+        elif buffered_polygon is not None:
+            effective_bbox = None
+            enrich_polygon = buffered_polygon
+            download_source = "buffered_polygon"
         elif place_name:
             effective_bbox = None
             download_source = "place_name"
@@ -874,12 +975,15 @@ def enrich_links_from_osm(
 
     if effective_bbox is not None:
         print("OSM enrichment bbox (WGS84):", effective_bbox)
+    elif enrich_polygon is not None:
+        print("OSM enrichment area: buffered polygon bounds =", enrich_polygon.bounds)
     else:
         print("OSM enrichment area: place_name =", place_name)
 
     edges = _download_osm_drive_edges(
-        place_name=place_name if effective_bbox is None else None,
+        place_name=place_name if (effective_bbox is None and enrich_polygon is None) else None,
         bbox_cfg=effective_bbox,
+        polygon=enrich_polygon,
     )
     osm_map = _aggregate_osm_edge_attributes(edges)
 
@@ -984,19 +1088,62 @@ def build_network_from_osm(
         outputs_dir = cfg.get("network", {}).get("maps_dir", "outputs/baseline/maps")
 
     project_dir = Path(cfg["project_path"])
-    crs_epsg_hint = int(cfg.get("crs_epsg", 5514))
+    crs_epsg_hint = get_metric_epsg(cfg)
 
     osm_cfg = cfg.get("osm", {}) or {}
     place_name: Optional[str] = osm_cfg.get("place_name")
     bbox_cfg = cfg.get("model_bbox") or osm_cfg.get("bbox")  # [west, south, east, north] in WGS84
+    buffer_km = float(osm_cfg.get("buffer_km", 0))
 
     if not bbox_cfg and not place_name:
         raise ValueError("Missing config model_bbox or osm.place_name in config/sim.yaml")
+
+    # Two bboxes when buffer_km is set:
+    #   model_bbox_polygon  – buffer_km around the city (desired model extent, used for trim)
+    #   buffered_polygon    – buffer_km + margin (larger download area for connectivity)
+    # After download + isolated-component filter we trim back to model_bbox_polygon,
+    # so the network doesn't have long highway tentacles.
+    _CONNECTIVITY_MARGIN_KM = 5.0
+    buffered_polygon = None
+    model_bbox_polygon = None
+    if place_name and buffer_km > 0 and not bbox_cfg:
+        download_km = buffer_km + _CONNECTIVITY_MARGIN_KM
+        print(
+            f"Geocoding '{place_name}' and buffering by {buffer_km} km "
+            f"(+{_CONNECTIVITY_MARGIN_KM} km connectivity margin → {download_km} km download) …"
+        )
+        place_poly = _geocode_place(place_name)
+        model_bbox_polygon = box(*_buffer_polygon_km(place_poly, buffer_km, crs_epsg_hint).bounds)
+        buffered_polygon = box(*_buffer_polygon_km(place_poly, download_km, crs_epsg_hint).bounds)
+        print(f"  model bbox  (WGS84): {model_bbox_polygon.bounds}")
+        print(f"  download bbox (WGS84): {buffered_polygon.bounds}")
 
     project = create_or_open_project(project_dir)
 
     links_before = project.network.count_links()
     nodes_before = project.network.count_nodes()
+
+    # --- Detect stale network when buffer_km changed ---
+    if links_before > 0 and buffered_polygon is not None:
+        try:
+            net_bbox = _network_bbox_wgs84_from_project(project, crs_epsg_hint, pad_ratio=0, min_pad_deg=0)
+            net_box = box(*net_bbox)
+            buf_box = box(*buffered_polygon.bounds)
+            coverage = net_box.area / buf_box.area if buf_box.area > 0 else 1.0
+            if coverage < 0.95:
+                print(
+                    f"Existing network covers only {coverage:.0%} of the buffered area "
+                    f"– rebuilding project from scratch …"
+                )
+                project.close()
+                shutil.rmtree(project_dir)
+                project = create_or_open_project(project_dir)
+                links_before = 0
+                nodes_before = 0
+            else:
+                print("Existing network already covers the buffered area – skipping rebuild.")
+        except Exception as e:
+            print(f"⚠ could not check network extent vs buffer ({e}), keeping existing network")
 
     # --- Build network (only if empty) ---
     if links_before == 0 or nodes_before == 0:
@@ -1005,6 +1152,9 @@ def build_network_from_osm(
             model_area = box(west, south, east, north)
             project.network.create_from_osm(model_area=model_area)
             print(f"Network created from model_bbox (WGS84): {bbox_cfg}")
+        elif buffered_polygon is not None:
+            project.network.create_from_osm(model_area=buffered_polygon)
+            print(f"Network created from place_name '{place_name}' + {buffer_km} km buffer")
         else:
             project.network.create_from_osm(place_name=place_name)
             print(f"Network created from place_name: {place_name}")
@@ -1059,6 +1209,36 @@ def build_network_from_osm(
             isolated_stats.get("nodes_pruned", 0),
         )
 
+    # --- Trim: compute urban-core bbox, then cut highway tentacles ---
+    # Even with buffer_km=0, place_name downloads include highways that extend
+    # to the admin boundary edge.  We compute the extent of "urban" nodes
+    # (those touching at least one non-highway link), pad it, and trim.
+    trim_bbox = _compute_urban_trim_bbox(project, pad_ratio=0.02)
+    if model_bbox_polygon is not None:
+        model_trim = _native_bbox_from_wgs84_bbox(
+            project, list(model_bbox_polygon.bounds), crs_epsg_hint,
+        )
+        trim_bbox = (
+            min(trim_bbox[0], model_trim[0]),
+            min(trim_bbox[1], model_trim[1]),
+            max(trim_bbox[2], model_trim[2]),
+            max(trim_bbox[3], model_trim[3]),
+        )
+    print(f"Trimming network to urban-core bbox (native): {trim_bbox}")
+    trim_stats = trim_network_to_bbox_raw(project, trim_bbox, project_dir)
+    print(f"  trimmed: {trim_stats['links_deleted']} links, {trim_stats['nodes_deleted']} nodes")
+    if trim_stats["links_deleted"] > 0 and iso.get("enabled", True):
+        print("  re-running isolated-component filter after trim …")
+        iso2 = remove_disconnected_components_keep_largest(project, project_dir)
+        trim_stats["post_trim_iso_links_removed"] = iso2.get("links_removed", 0)
+        trim_stats["post_trim_iso_nodes_pruned"] = iso2.get("nodes_pruned", 0)
+        print(
+            f"  post-trim components: {iso2.get('components', 0)} "
+            f"| removed links: {iso2.get('links_removed', 0)}"
+        )
+    bbox_native = compute_bbox_from_links_raw(project)
+    print(f"  final network extent (native): {bbox_native}")
+
     # --- OSM enrichment of links ---
     enrich_stats = enrich_links_from_osm(
         project,
@@ -1066,6 +1246,7 @@ def build_network_from_osm(
         crs_epsg_hint=crs_epsg_hint,
         place_name=place_name,
         bbox_cfg=bbox_cfg,
+        buffered_polygon=buffered_polygon,
     )
     print("OSM enrichment:", enrich_stats)
 
@@ -1083,6 +1264,7 @@ def build_network_from_osm(
                 "links": int(links_n),
                 "nodes": int(nodes_n),
                 "place_name": place_name or "",
+                "buffer_km": buffer_km,
                 "osm_bbox_used_for_import_wgs84": bbox_cfg or None,
                 "trim_bbox_wgs84_requested": list(bbox_wgs84_used) if bbox_wgs84_used is not None else None,
                 "trim_bbox_native_used": {
@@ -1172,7 +1354,7 @@ def build_network_from_osm(
     print("Bbox used for map artifacts (native):", bbox_native)
     if bbox_wgs84_used is not None:
         print("Config reference bbox (WGS84):", bbox_wgs84_used)
-    print("Trim stats (disabled):", trim_stats)
+    print("Trim stats:", trim_stats)
     print("Enrich stats:", enrich_stats)
     print("Wrote:", counts_path)
     print("Wrote:", png_path_native)

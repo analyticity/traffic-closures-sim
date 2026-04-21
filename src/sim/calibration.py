@@ -44,6 +44,11 @@ from sim.assignment import (
     resolve_daily_cap_factor_default,
     _detect_volume_col,
 )
+import logging
+
+logger = logging.getLogger(__name__)
+
+from sim.calibration_state import CalibrationRun
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -152,7 +157,10 @@ def _load_gateway_observed(
                     if float(r["observed_aadt"]) > 0
                 }
         except Exception:
-            pass
+            logger.debug(
+                "Failed to load gateway observed counts from parquet; falling back to YAML",
+                exc_info=True,
+            )
 
     from sim.screenlines import load_screenlines
     sl_path = str(_get(cfg, ["calibration", "screenlines_path"], "config/screenlines.yaml"))
@@ -234,7 +242,7 @@ def _compute_gateway_modeled_volumes(
     vol_col: str,
 ) -> Dict[str, float]:
     """Sum modeled volume on each screenline and map to gateway names."""
-    from sim.screenlines import evaluate_all_screenlines
+    from sim.screenlines import _get_link_volume
 
     result: Dict[str, float] = {}
     if not screenlines or not vol_col:
@@ -247,11 +255,7 @@ def _compute_gateway_modeled_volumes(
 
         total = 0.0
         for link_id, direction in sl.links:
-            row = vol_df[vol_df["link_id"] == link_id]
-            if row.empty:
-                continue
-            vol = float(row[vol_col].iloc[0]) if vol_col in row.columns else 0.0
-            total += vol
+            total += _get_link_volume(vol_df, link_id, direction, vol_col)
         result[gw] = total
 
     return result
@@ -289,12 +293,18 @@ def load_pentlogram(cfg: Dict[str, Any]) -> gpd.GeoDataFrame:
                 bounds = sample.total_bounds
                 max_abs = max(abs(bounds[0]), abs(bounds[1]), abs(bounds[2]), abs(bounds[3]))
             except Exception:
+                logger.debug(
+                    "Failed to compute pentlogram sample bounds; assuming non-metric CRS",
+                    exc_info=True,
+                )
                 max_abs = 0
 
             declared_epsg = gdf.crs.to_epsg()
             if declared_epsg == 4326 and max_abs > 1000:
-                print(f"  WARNING: GeoJSON declared as EPSG:4326 but coordinates "
-                      f"are metric (max={max_abs:.0f}). Overriding to EPSG:{out_epsg}.")
+                logger.warning(
+                    f"  WARNING: GeoJSON declared as EPSG:4326 but coordinates "
+                    f"are metric (max={max_abs:.0f}). Overriding to EPSG:{out_epsg}."
+                )
                 gdf = gdf.set_crs(epsg=out_epsg, allow_override=True)
             elif declared_epsg != out_epsg:
                 gdf = gdf.to_crs(epsg=out_epsg)
@@ -303,7 +313,7 @@ def load_pentlogram(cfg: Dict[str, Any]) -> gpd.GeoDataFrame:
     valid_geom = gdf.geometry.notna() & ~gdf.geometry.is_empty
     n_invalid = int((~valid_geom).sum())
     if n_invalid > 0:
-        print(f"  WARNING: {n_invalid}/{len(gdf)} pentlogram features have invalid geometry")
+        logger.warning(f"  WARNING: {n_invalid}/{len(gdf)} pentlogram features have invalid geometry")
         gdf = gdf[valid_geom].copy()
 
     for col in ("car_24", "truc_24"):
@@ -313,7 +323,6 @@ def load_pentlogram(cfg: Dict[str, Any]) -> gpd.GeoDataFrame:
     # Pentlogram data from data.Brno:
     #   car_24  = total motor vehicles in thousands per 24h (ALL vehicles, not cars-only)
     #   truc_24 = percentage of trucks/buses (0-100), NOT absolute count
-    # observed_car is named for backward compat but equals total motor vehicles.
     units_cfg = _get(cfg, [
         "datasets", "sources", "calibration_brno_pentlogram_2024", "units",
     ], {}) or {}
@@ -322,24 +331,31 @@ def load_pentlogram(cfg: Dict[str, Any]) -> gpd.GeoDataFrame:
     total_vehicles = gdf.get("car_24", 0) * car_mult
     truck_pct = gdf.get("truc_24", 0).clip(0, 100)
 
-    gdf["observed_car"] = total_vehicles
+    gdf["observed_motor_total"] = total_vehicles
     gdf["observed_truck"] = total_vehicles * truck_pct / 100.0
     gdf["observed_total"] = total_vehicles
+    # Backward-compat alias (deprecated — use observed_motor_total)
+    gdf["observed_car"] = gdf["observed_motor_total"]
 
-    # Sanity check: warn if observed values are outside plausible range
-    nz = gdf[gdf["observed_car"] > 0]["observed_car"]
+    nz = gdf[gdf["observed_motor_total"] > 0]["observed_motor_total"]
     if not nz.empty:
         p50 = float(nz.median())
         p_max = float(nz.max())
         if p_max < 500:
-            print(f"  WARNING: observed_car max={p_max:.0f} seems very low. "
-                  f"Check car_24_multiplier (currently {car_mult}).")
+            logger.warning(
+                f"  WARNING: observed_motor_total max={p_max:.0f} seems very low. "
+                f"Check car_24_multiplier (currently {car_mult})."
+            )
         elif p50 > 100000:
-            print(f"  WARNING: observed_car median={p50:.0f} seems very high. "
-                  f"Check car_24_multiplier (currently {car_mult}).")
+            logger.warning(
+                f"  WARNING: observed_motor_total median={p50:.0f} seems very high. "
+                f"Check car_24_multiplier (currently {car_mult})."
+            )
         else:
-            print(f"  Pentlogram observed_car: median={p50:,.0f} max={p_max:,.0f} "
-                  f"(multiplier={car_mult})")
+            logger.info(
+                f"  Pentlogram observed_motor_total: median={p50:,.0f} max={p_max:,.0f} "
+                f"(multiplier={car_mult})"
+            )
 
     gdf = gdf[gdf["observed_total"] > 0].copy()
 
@@ -414,8 +430,10 @@ def _flag_neighbor_outliers(
 
     n_dropped = int(drop_mask.sum())
     if n_dropped > 0:
-        print(f"  Pentlogram validation: dropped {n_dropped} segments "
-              f"inconsistent with neighbors (ratio < {low_ratio})")
+        logger.info(
+            f"  Pentlogram validation: dropped {n_dropped} segments "
+            f"inconsistent with neighbors (ratio < {low_ratio})"
+        )
     return gdf[~drop_mask].copy()
 
 
@@ -475,15 +493,37 @@ def validate_geometries_or_fail(
         )
 
 
-def load_csd(cfg: Dict[str, Any], region_code: str = "CZ064") -> pd.DataFrame:
+def load_csd(cfg: Dict[str, Any], region_code: str | None = None) -> pd.DataFrame:
+    """Load CSD parquet with optional region filter from locale config.
+
+    When *region_code* is ``None`` (default), the region filter is read
+    from ``config/locale.yaml`` (``csd_region_filter``).  Pass an explicit
+    code like ``"CZ064"`` to override.
+    """
+    from sim.io_project import load_locale
+
     cache_dir = Path(_get(cfg, ["datasets", "cache_dir"], "data/cache"))
     parquet_path = cache_dir / "v2_csd2025.parquet"
     if not parquet_path.exists():
         raise FileNotFoundError(f"CSD parquet not found: {parquet_path}")
 
     df = pd.read_parquet(parquet_path)
-    if "kk" in df.columns:
-        df = df[df["kk"].astype(str).str.contains(region_code.replace("CZ", ""), na=False)].copy()
+
+    if region_code is not None:
+        if "kk" in df.columns:
+            df = df[df["kk"].astype(str).str.contains(
+                region_code.replace("CZ", ""), na=False,
+            )].copy()
+    else:
+        locale = load_locale(cfg)
+        csd_filter = locale.get("csd_region_filter") or {}
+        filter_col = csd_filter.get("column", "kk")
+        filter_val = str(csd_filter.get("contains", "064"))
+        if filter_col in df.columns:
+            df = df[df[filter_col].astype(str).str.contains(filter_val, na=False)].copy()
+
+    if "sil" in df.columns:
+        df["sil"] = df["sil"].astype(str)
     for col in ("sv", "o", "tv"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
@@ -677,7 +717,7 @@ def match_counts_to_links(
         links = links[links["modes"].astype(str).str.contains("c", na=False)].copy()
     n_after = len(links)
     if n_before != n_after:
-        print(f"  Matching: filtered {n_before} -> {n_after} car-driveable links")
+        logger.info(f"  Matching: filtered {n_before} -> {n_after} car-driveable links")
 
     pts = counts.copy()
     pts = pts[pts.geometry.notna() & ~pts.geometry.is_empty].copy()
@@ -687,7 +727,7 @@ def match_counts_to_links(
     valid_cent = np.isfinite(centroids.x) & np.isfinite(centroids.y)
     n_dropped = int((~valid_cent).sum())
     if n_dropped > 0:
-        print(f"  WARNING: dropped {n_dropped} counts with invalid centroid geometry")
+        logger.warning(f"  WARNING: dropped {n_dropped} counts with invalid centroid geometry")
     pts = pts[valid_cent].copy()
     pts["geometry"] = centroids[valid_cent]
 
@@ -836,7 +876,9 @@ def match_counts_to_links(
             n_excluded = int(bad.sum())
             if n_excluded > 0:
                 joined.loc[bad, "_excluded"] = True
-                print(f"  Matching: excluded {n_excluded} zero-volume links with high observed counts")
+                logger.info(
+                    f"  Matching: excluded {n_excluded} zero-volume links with high observed counts"
+                )
 
         # Reverse mismatch: observed is far below modeled on major roads.
         # E.g. a 9k pentlogram segment from a road below a bridge matched
@@ -857,8 +899,10 @@ def match_counts_to_links(
             n_extreme = int(extreme_low.sum())
             if n_extreme > 0:
                 joined.loc[extreme_low, "_excluded"] = True
-                print(f"  Matching: excluded {n_extreme} major-road matches "
-                      f"with obs/model ratio < 0.25")
+                logger.info(
+                    f"  Matching: excluded {n_extreme} major-road matches "
+                    f"with obs/model ratio < 0.25"
+                )
 
     # Corridor aggregation: sum volumes from parallel links (divided highways)
     if aggregate_corridor:
@@ -888,8 +932,10 @@ def match_counts_to_links(
         n_ext = int(extreme_corr.sum())
         if n_ext > 0:
             joined.loc[extreme_corr, "_excluded"] = True
-            print(f"  Matching: excluded {n_ext} major-road matches "
-                  f"with obs/corridor ratio < 0.25")
+            logger.info(
+                f"  Matching: excluded {n_ext} major-road matches "
+                f"with obs/corridor ratio < 0.25"
+            )
 
     for col in ("_count_bearing", "_link_bearing"):
         if col in joined.columns:
@@ -945,7 +991,7 @@ def _export_matching_diagnostics(
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / "matching_diagnostics.csv"
     diag.to_csv(out_path, index=False)
-    print(f"  Matching diagnostics: {out_path} ({len(diag)} rows)")
+    logger.info(f"  Matching diagnostics: {out_path} ({len(diag)} rows)")
 
 
 # ---------------------------------------------------------------------------
@@ -1202,6 +1248,194 @@ def aggregate_model_by_class(links: gpd.GeoDataFrame, vol_col: str) -> pd.DataFr
 
 
 # ---------------------------------------------------------------------------
+# CSD split for calibration / validation
+# ---------------------------------------------------------------------------
+
+def split_csd_for_calibration(
+    csd: pd.DataFrame,
+    strategy: str = "alternating",
+    calib_share: float = 0.65,
+    random_seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split CSD sections into calibration and validation subsets.
+
+    Both subsets always contain **all road classes** so that the
+    calibration can correct inter-class volume imbalances.
+
+    Returns ``(calib_df, valid_df)``.
+
+    Strategies
+    ----------
+    alternating  *(default)*
+        Within each road number (``sil``), sections are sorted by their
+        original order and assigned to calibration / validation in a
+        round-robin fashion.  Every road class appears in both subsets,
+        and geographically adjacent sections end up in different sets.
+    stratified
+        Stratified random split preserving ``road_class`` proportions
+        (``calib_share`` controls the calibration fraction, default 65 %).
+    spatial
+        Sections whose ``nazev_mesta`` is non-empty (urban) are used for
+        calibration; sections without a city name (rural/inter-urban)
+        become the validation set.
+    """
+    if not (0.0 < calib_share < 1.0):
+        raise ValueError(
+            f"calib_share must be in (0, 1), got {calib_share}"
+        )
+
+    csd = csd.copy()
+    csd["sil"] = csd["sil"].astype(str)
+    if "road_class" not in csd.columns:
+        csd["road_class"] = csd["sil"].apply(_classify_csd_road)
+
+    if strategy == "alternating":
+        period = max(2, round(1 / (1 - calib_share)))
+        is_calib = pd.Series(False, index=csd.index)
+        for _, grp in csd.groupby("sil"):
+            idxs = grp.index.tolist()
+            if len(idxs) == 1:
+                is_calib.at[idxs[0]] = True
+                continue
+            for i, idx in enumerate(idxs):
+                is_calib.at[idx] = (i % period) != 0
+            is_calib.at[idxs[0]] = True
+            is_calib.at[idxs[-1]] = False
+        calib_df = csd[is_calib].copy()
+        valid_df = csd[~is_calib].copy()
+
+    elif strategy == "stratified":
+        from sklearn.model_selection import train_test_split
+
+        test_size = max(0.05, min(0.95, 1.0 - calib_share))
+        rc_counts = csd["road_class"].value_counts()
+        n_classes = len(rc_counts)
+        n_test = max(1, round(len(csd) * test_size))
+        can_stratify = (
+            (rc_counts >= 2).all()
+            and len(csd) >= 4
+            and n_test >= n_classes
+        )
+        calib_df, valid_df = train_test_split(
+            csd,
+            test_size=test_size,
+            random_state=random_seed,
+            stratify=csd["road_class"] if can_stratify else None,
+        )
+        calib_df = calib_df.copy()
+        valid_df = valid_df.copy()
+
+    elif strategy == "spatial":
+        has_city = csd["nazev_mesta"].fillna("").str.strip().astype(bool)
+        calib_df = csd[has_city].copy()
+        valid_df = csd[~has_city].copy()
+        if calib_df.empty or valid_df.empty:
+            logger.warning(
+                "Spatial CSD split produced an empty %s subset — "
+                "all sections are %s. Falling back to alternating.",
+                "calibration" if calib_df.empty else "validation",
+                "rural" if calib_df.empty else "urban",
+            )
+            return split_csd_for_calibration(
+                csd, strategy="alternating",
+                calib_share=calib_share, random_seed=random_seed,
+            )
+
+    else:
+        raise ValueError(f"Unknown CSD split strategy: {strategy!r}")
+
+    logger.info(
+        "CSD split (%s): calibration=%d sections (%d roads), "
+        "validation=%d sections (%d roads)",
+        strategy,
+        len(calib_df), calib_df["sil"].nunique() if "sil" in calib_df.columns else 0,
+        len(valid_df), valid_df["sil"].nunique() if "sil" in valid_df.columns else 0,
+    )
+    return calib_df, valid_df
+
+
+def load_csd_as_link_counts(
+    csd: pd.DataFrame,
+    links_gdf: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """Convert CSD sections into a pentlogram-compatible GeoDataFrame.
+
+    For each CSD road (``sil``), finds network links whose ``osm_ref``
+    matches, then assigns the CSD AADT as observed counts on those links.
+    The returned GeoDataFrame has the same columns the calibration loop
+    expects from ``load_pentlogram``: ``observed_car``, ``observed_total``,
+    ``observed_motor_total``, ``observed_truck``, and link ``geometry``.
+    """
+    if "sil" not in csd.columns or "osm_ref" not in links_gdf.columns:
+        logger.warning("CSD→link_counts: missing 'sil' or 'osm_ref' column")
+        return gpd.GeoDataFrame()
+
+    csd = csd.copy()
+    csd["sil"] = csd["sil"].astype(str)
+    for col in ("o", "sv", "tv"):
+        if col in csd.columns:
+            csd[col] = pd.to_numeric(csd[col], errors="coerce").fillna(0)
+    if "road_class" not in csd.columns:
+        csd["road_class"] = csd["sil"].apply(_classify_csd_road)
+
+    csd_sil = csd["sil"].str.strip()
+    raw_refs = links_gdf["osm_ref"].fillna("").astype(str).str.strip()
+    ref_components = raw_refs.str.split(";").explode().str.strip()
+    ref_components = ref_components[ref_components != ""]
+
+    rows: list[dict] = []
+    for road in csd_sil.unique():
+        csd_sub = csd[csd_sil == road]
+        if csd_sub.empty:
+            continue
+
+        matching_indices = ref_components.index[ref_components == road]
+        if len(matching_indices) == 0:
+            continue
+
+        csd_mean_o = float(csd_sub["o"].mean())
+        csd_mean_sv = float(csd_sub["sv"].mean())
+        csd_mean_tv = float(csd_sub["tv"].mean())
+        road_class = csd_sub["road_class"].iloc[0]
+
+        matched_links = links_gdf.loc[matching_indices.unique()]
+        if "link_type" in matched_links.columns:
+            lt = matched_links["link_type"].astype(str)
+            compatible = _CSD_COMPATIBLE_LINK_TYPES.get(road_class)
+            if compatible:
+                matched_links = matched_links[lt.reindex(matched_links.index).isin(compatible)]
+            matched_links = matched_links[
+                ~lt.reindex(matched_links.index).isin(_NON_CAR_LINK_TYPES)
+            ]
+        if matched_links.empty:
+            continue
+
+        rows.append({
+            "link_id": matched_links.iloc[0].get("link_id", matched_links.index[0]),
+            "geometry": matched_links.iloc[0].geometry,
+            "observed_car": csd_mean_o,
+            "observed_motor_total": csd_mean_sv,
+            "observed_total": csd_mean_sv,
+            "observed_truck": max(0.0, csd_mean_sv - csd_mean_o),
+            "csd_road": road,
+            "csd_road_class": road_class,
+            "_n_matched_links": len(matched_links),
+        })
+
+    if not rows:
+        logger.warning("CSD→link_counts: no CSD roads matched any network links")
+        return gpd.GeoDataFrame()
+
+    result = gpd.GeoDataFrame(rows, geometry="geometry", crs=links_gdf.crs)
+    result = result[result["observed_total"] > 0].copy()
+    logger.info(
+        "CSD→link_counts: %d road-level observations from %d CSD roads",
+        len(result), result["csd_road"].nunique(),
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Journey time validation
 # ---------------------------------------------------------------------------
 
@@ -1439,7 +1673,7 @@ def run_supply_tuning(config_path: str | Path = "config/sim.yaml") -> None:
     tuning_cfg = calib_cfg.get("supply_tuning") or {}
 
     if not tuning_cfg.get("enabled", False):
-        print("Supply tuning disabled in config.")
+        logger.info("Supply tuning disabled in config.")
         return
 
     project_dir = Path(cfg["project_path"])
@@ -1453,10 +1687,10 @@ def run_supply_tuning(config_path: str | Path = "config/sim.yaml") -> None:
     inner_max_iter = int(tuning_cfg.get("inner_max_iterations", 3))
     obj_weights = {"geh": 1.0, "screenline": 2.0, "jt": 1.0}
 
-    print("=== SUPPLY PARAMETER TUNING ===")
-    print(f"  Road classes: {road_classes}")
-    print(f"  Speed range: {speed_range}")
-    print(f"  Capacity range: {cap_range}")
+    logger.info("=== SUPPLY PARAMETER TUNING ===")
+    logger.info(f"  Road classes: {road_classes}")
+    logger.info(f"  Speed range: {speed_range}")
+    logger.info(f"  Capacity range: {cap_range}")
 
     _save_base_values(project_dir)
 
@@ -1475,8 +1709,8 @@ def run_supply_tuning(config_path: str | Path = "config/sim.yaml") -> None:
 
         try:
             run_calibration(config_path)
-        except Exception as e:
-            print(f"    Calibration failed: {e}")
+        except Exception:
+            logger.exception("Calibration failed during supply tuning evaluation")
             return float("inf")
 
         report_path = output_dir / "calibration_report.json"
@@ -1504,15 +1738,18 @@ def run_supply_tuning(config_path: str | Path = "config/sim.yaml") -> None:
                             skim_data, zone_ids, jt_cfg["reference_routes"],
                         )
                 except Exception:
-                    pass
+                    logger.debug(
+                        "Journey time validation from skim matrix failed",
+                        exc_info=True,
+                    )
 
         return compute_objective(count_stats, sl_results, jt_results, obj_weights)
 
     best_obj = _evaluate(best_params)
-    print(f"\n  Baseline objective: {best_obj:.2f}")
+    logger.info(f"\n  Baseline objective: {best_obj:.2f}")
 
     for rc in road_classes:
-        print(f"\n  --- Tuning {rc} ---")
+        logger.info(f"\n  --- Tuning {rc} ---")
 
         # Speed factor
         best_sf = best_params.speed_factors.get(rc, 1.0)
@@ -1523,9 +1760,8 @@ def run_supply_tuning(config_path: str | Path = "config/sim.yaml") -> None:
                 speed_factors={**best_params.speed_factors, rc: sf},
                 capacity_factors=dict(best_params.capacity_factors),
             )
-            print(f"    speed_factor[{rc}]={sf} ... ", end="", flush=True)
             obj = _evaluate(trial)
-            print(f"obj={obj:.2f}")
+            logger.info(f"    speed_factor[{rc}]={sf} ... obj={obj:.2f}")
             if obj < best_obj:
                 best_obj = obj
                 best_params = trial
@@ -1541,9 +1777,8 @@ def run_supply_tuning(config_path: str | Path = "config/sim.yaml") -> None:
                 speed_factors=dict(best_params.speed_factors),
                 capacity_factors={**best_params.capacity_factors, rc: cf},
             )
-            print(f"    capacity_factor[{rc}]={cf} ... ", end="", flush=True)
             obj = _evaluate(trial)
-            print(f"obj={obj:.2f}")
+            logger.info(f"    capacity_factor[{rc}]={cf} ... obj={obj:.2f}")
             if obj < best_obj:
                 best_obj = obj
                 best_params = trial
@@ -1552,8 +1787,10 @@ def run_supply_tuning(config_path: str | Path = "config/sim.yaml") -> None:
 
     # Apply best params and run final full calibration
     calib_cfg["max_iterations"] = orig_max_iter
-    print(f"\n  Best params: speed={best_params.speed_factors}, "
-          f"capacity={best_params.capacity_factors}, obj={best_obj:.2f}")
+    logger.info(
+        f"\n  Best params: speed={best_params.speed_factors}, "
+        f"capacity={best_params.capacity_factors}, obj={best_obj:.2f}"
+    )
     apply_supply_params(project_dir, best_params)
 
     tuning_report = {
@@ -1570,8 +1807,8 @@ def run_supply_tuning(config_path: str | Path = "config/sim.yaml") -> None:
     }
     report_path = output_dir / "supply_tuning_report.json"
     report_path.write_text(json.dumps(tuning_report, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\n  Supply tuning report: {report_path}")
-    print("  Running final calibration with best parameters ...")
+    logger.info(f"\n  Supply tuning report: {report_path}")
+    logger.info("  Running final calibration with best parameters ...")
     run_calibration(config_path)
 
 
@@ -1585,7 +1822,11 @@ def _check_final_convergence(
     geh_target: float,
     daily_conv: Dict[str, Any],
 ) -> bool:
-    """Check whether the final iteration satisfies convergence criteria."""
+    """Check whether the final iteration satisfies convergence criteria.
+
+    For daily models the screenline criterion is included alongside
+    R², slope, %RMSE, and bias — matching the iteration-loop guards.
+    """
     if not history:
         return False
     final = history[-1]
@@ -1595,11 +1836,14 @@ def _check_final_convergence(
         prmse = float(final.get("pct_rmse") or 999.0)
         bias = abs(float(final.get("bias_pct") or 999.0))
         sr = daily_conv.get("slope_range", [0.85, 1.15])
+        sl_max_dev = float(final.get("max_screenline_pct_dev") or 999.0)
+        sl_target = float(daily_conv.get("screenline_max_pct_deviation", 15.0))
         return (
             r2 >= float(daily_conv.get("r2_target", 0.80))
             and float(sr[0]) <= slp <= float(sr[1])
             and prmse <= float(daily_conv.get("pct_rmse_max", 35.0))
             and bias <= float(daily_conv.get("bias_abs_max_pct", 15.0))
+            and sl_max_dev <= sl_target
         )
     return float(final.get("geh_lt5_pct", 0)) >= geh_target
 
@@ -1656,6 +1900,7 @@ class _CalibrationContext:
     def __init__(self, config_path: str | Path = "config/sim.yaml") -> None:
         from sim.screenlines import load_screenlines, resolve_screenline_links
 
+        self.config_path = config_path
         cfg = load_config(config_path)
         self.cfg = cfg
         self.project_dir = Path(cfg["project_path"])
@@ -1696,7 +1941,17 @@ class _CalibrationContext:
         self.conflict_res = str(calib_cfg.get("match_conflict_resolution", "nearest"))
         self.agg_corridor = bool(calib_cfg.get("aggregate_corridor", True))
         self.count_target = str(calib_cfg.get("count_target", "total"))
-        self.obs_col = "observed_car" if self.count_target == "car_only" else "observed_total"
+        _COUNT_TARGET_COL = {
+            "car_only": "observed_car",
+            "motor_total": "observed_motor_total",
+            "total": "observed_total",
+        }
+        self.obs_col = _COUNT_TARGET_COL.get(self.count_target, "observed_total")
+        if self.count_target not in _COUNT_TARGET_COL:
+            logger.warning(
+                f"  WARNING: unknown count_target '{self.count_target}', "
+                f"falling back to observed_total"
+            )
 
         # Convergence
         conv_cfg = calib_cfg.get("convergence") or {}
@@ -1711,22 +1966,62 @@ class _CalibrationContext:
         if not self.matrix_path.exists():
             raise FileNotFoundError(f"OD matrix not found: {self.matrix_path}")
 
-        # Backup / restore seed matrix
+        # Backup / restore seed matrix — versioned by content hash
+        import hashlib
+
+        def _file_hash(path: Path) -> str:
+            h = hashlib.sha256()
+            h.update(path.read_bytes())
+            return h.hexdigest()[:16]
+
         backup = self.matrix_path.with_suffix(".aem.orig")
-        if not backup.exists():
+        current_hash = _file_hash(self.matrix_path)
+
+        if backup.exists():
+            backup_hash = _file_hash(backup)
+            if backup_hash != current_hash:
+                logger.warning(
+                    "Seed matrix changed since last backup "
+                    "(backup hash=%s, current hash=%s). "
+                    "Updating .aem.orig to new seed.",
+                    backup_hash, current_hash,
+                )
+                shutil.copy2(self.matrix_path, backup)
+        else:
             shutil.copy2(self.matrix_path, backup)
+            logger.info("Created seed matrix backup: %s", backup)
+
         reset_matrix = bool(calib_cfg.get("reset_matrix_before_run", True))
         if reset_matrix and backup.exists():
             shutil.copy2(backup, self.matrix_path)
-            print("  Restored OD matrix from .aem.orig")
+            logger.info("  Restored OD matrix from .aem.orig")
 
         # Observed counts + network links
-        self.pent = load_pentlogram(cfg)
-        validate_geometries_or_fail(
-            self.pent, name="pentlogram", expected_epsg=get_metric_epsg(self.cfg),
-        )
         self.links_gdf = _load_network_links(self.project_dir)
-        print(f"  Pentlogram: {len(self.pent)} observed segments")
+        self.count_source = str(calib_cfg.get("count_source", "pentlogram"))
+
+        if self.count_source == "csd_split":
+            split_cfg = calib_cfg.get("csd_split") or {}
+            csd_full = load_csd(cfg)
+            calib_csd, _valid_csd = split_csd_for_calibration(
+                csd_full,
+                strategy=str(split_cfg.get("strategy", "alternating")),
+                calib_share=float(split_cfg.get("calib_share", 0.65)),
+                random_seed=int(split_cfg.get("random_seed", 42)),
+            )
+            self.pent = load_csd_as_link_counts(calib_csd, self.links_gdf)
+            if self.pent.empty:
+                raise RuntimeError(
+                    "CSD split produced no link-level observations for calibration. "
+                    "Check that osm_ref values match CSD road numbers."
+                )
+            logger.info(f"  CSD-split calibration: {len(self.pent)} link observations")
+        else:
+            self.pent = load_pentlogram(cfg)
+            validate_geometries_or_fail(
+                self.pent, name="pentlogram", expected_epsg=get_metric_epsg(self.cfg),
+            )
+            logger.info(f"  Pentlogram: {len(self.pent)} observed segments")
 
         # Screenlines
         sl_path = str(calib_cfg.get("screenlines_path", "config/screenlines.yaml"))
@@ -1735,12 +2030,14 @@ class _CalibrationContext:
         if self.screenlines:
             self.sl_query = {}
             for sl in self.screenlines:
-                resolved = sl.links or resolve_screenline_links(sl, self.links_gdf)
+                resolved = resolve_screenline_links(sl, self.links_gdf)
                 if resolved:
                     sl.links = resolved
                     self.sl_query[sl.name] = [(lid, d) for lid, d in resolved]
-            print(f"  Screenlines: {len(self.screenlines)} defined, "
-                  f"{len(self.sl_query)} with links")
+            logger.info(
+                f"  Screenlines: {len(self.screenlines)} defined, "
+                f"{len(self.sl_query)} with links"
+            )
 
         # Open matrix (stays open across iterations)
         self.mat = AequilibraeMatrix()
@@ -1753,6 +2050,14 @@ class _CalibrationContext:
         self.seed_upper = seed * self.max_deviation
         self.seed_lower[seed <= 0] = 0.0
         self.seed_upper[seed <= 0] = 0.0
+
+        # Swap closures for the calibration period before opening the project
+        bc_cfg = cfg.get("baseline_closures") or {}
+        calib_period = bc_cfg.get("calibration_period")
+        if bc_cfg.get("enabled", False) and calib_period:
+            from sim.network_normalization import swap_db_closures
+            swap_db_closures(config_path, measurement_period=calib_period)
+            logger.info("  Closures swapped to calibration period: %s", calib_period)
 
         # AequilibraE project + graph (reused across iterations)
         self.project = Project()
@@ -1774,16 +2079,21 @@ class _CalibrationContext:
                 self.gw_observed = _load_gateway_observed(cfg)
                 if self.gw_zone_map and self.gw_observed:
                     active = set(self.gw_zone_map) & set(self.gw_observed)
-                    print(f"  Gateway calibration: {len(active)} gateways with observed data "
-                          f"({', '.join(sorted(active))})")
+                    logger.info(
+                        f"  Gateway calibration: {len(active)} gateways with observed data "
+                        f"({', '.join(sorted(active))})"
+                    )
                 else:
-                    print("  Gateway calibration: no matching zone/observed data — disabled")
+                    logger.info(
+                        "  Gateway calibration: no matching zone/observed data — disabled"
+                    )
                     self.gw_cal_enabled = False
-            except Exception as exc:
-                print(f"  Gateway calibration init failed: {exc}")
+            except Exception:
+                logger.exception("Gateway calibration init failed")
                 self.gw_cal_enabled = False
 
-        # Tracking state
+        # Tracking state (encapsulated in CalibrationRun for FSM audit)
+        self.run = CalibrationRun()
         self.best_Z: float = float("inf")
         self.best_demand: Optional[np.ndarray] = None
         self.best_iteration: int = 0
@@ -1801,9 +2111,9 @@ class _CalibrationContext:
             save_skims=save_skims,
             select_links=self.sl_query,
             bpr_parameters=self.cfg_bpr,
-            gc_field=self.gc_field,
-            gc_multiplier=self.gc_mult,
-            gc_vot=self.gc_vot,
+            fixed_cost_field=self.gc_field,
+            fixed_cost_multiplier=self.gc_mult,
+            vot=self.gc_vot,
             multi_class=self.cfg_multi,
             graph=self.cached_graph,
             cores=self.cores,
@@ -1815,19 +2125,62 @@ class _CalibrationContext:
             if self.best_demand is not None:
                 self.mat.matrix[self.core_name][:, :] = self.best_demand
                 self.mat.save()
-                print(f"  Restored best matrix from iteration {self.best_iteration} "
-                      f"(Z={self.best_Z:,.1f})")
+                logger.info(
+                    f"  Restored best matrix from iteration {self.best_iteration} "
+                    f"(Z={self.best_Z:,.1f})"
+                )
             self.mat.close()
             self.project.close()
         except Exception:
-            pass
+            logger.exception("restore_best_and_close failed")
+
+    def finalize_best_state(self) -> Optional[pd.DataFrame]:
+        """Run a final assignment on the restored best-demand matrix.
+
+        Must be called *after* ``restore_best_and_close()`` so that the
+        on-disk matrix already contains the best demand.  Returns the
+        vol_df from this final assignment so the caller can persist
+        artifacts that are consistent with the best OD matrix.
+        """
+        if self.best_demand is None:
+            return None
+
+        mat = AequilibraeMatrix()
+        mat.load(str(self.matrix_path))
+        mat.computational_view([self.core_name])
+
+        project = Project()
+        project.open(str(self.project_dir))
+        try:
+            graph = build_graph(project, mat, bpr_parameters=self.cfg_bpr)
+            vol_df, _skims, _sl = execute_assignment(
+                project, mat,
+                algorithm=self.algorithm,
+                max_iter=self.max_iter_assign,
+                rgap_target=self.rgap,
+                bpr_parameters=self.cfg_bpr,
+                fixed_cost_field=self.gc_field,
+                fixed_cost_multiplier=self.gc_mult,
+                vot=self.gc_vot,
+                multi_class=self.cfg_multi,
+                graph=graph,
+                cores=self.cores,
+            )
+            logger.info(
+                f"  Final assignment on best-state demand completed "
+                f"(iteration {self.best_iteration})"
+            )
+            return vol_df
+        finally:
+            mat.close()
+            project.close()
 
     def save_results(self, vol_df: Optional[pd.DataFrame] = None) -> None:
         """Persist assignment results parquet and report path."""
         if self.history and vol_df is not None:
             results_path = self.output_dir / "assignment_results.parquet"
             vol_df.to_parquet(str(results_path), index=False)
-            print(f"  Saved: {results_path}")
+            logger.info(f"  Saved: {results_path}")
 
 
 def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
@@ -1886,10 +2239,10 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     conv_tol = float(odme_cfg.get("convergence_tol", 0.01))
     global_residual_damping = float(odme_cfg.get("global_residual_damping", 0.3))
 
-    print("=== ODME GRADIENT CALIBRATION (Spiess method) ===")
-    print(f"  max_outer={max_outer}, gd_inner={gd_inner}, max_deviation={ctx.max_deviation}")
-    print(f"  weight_function={weight_method}, convergence_tol={conv_tol}")
-    print(f"  global_residual_damping={global_residual_damping}")
+    logger.info("=== ODME GRADIENT CALIBRATION (Spiess method) ===")
+    logger.info(f"  max_outer={max_outer}, gd_inner={gd_inner}, max_deviation={ctx.max_deviation}")
+    logger.info(f"  weight_function={weight_method}, convergence_tol={conv_tol}")
+    logger.info(f"  global_residual_damping={global_residual_damping}")
 
     history = ctx.history
     prev_Z = float("inf")
@@ -1897,15 +2250,16 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     best_demand = ctx.best_demand
     best_iteration = ctx.best_iteration
     effective_global_damping = global_residual_damping
+    sl_results: Dict[str, Any] = {}
 
     try:
         for outer_it in range(1, max_outer + 1):
-            print(f"\n{'='*60}")
-            print(f"  ODME Outer Iteration {outer_it}/{max_outer}")
-            print(f"{'='*60}")
+            logger.info(f"\n{'='*60}")
+            logger.info(f"  ODME Outer Iteration {outer_it}/{max_outer}")
+            logger.info(f"{'='*60}")
 
             total_demand = float(mat.matrix_view.sum())
-            print(f"  Demand total: {total_demand:,.0f}")
+            logger.info(f"  Demand total: {total_demand:,.0f}")
 
             # --- 1) Equilibrium assignment with select-link ---
             save_skims_now = bool(calib_cfg.get("save_skims", False)) and outer_it == 1
@@ -1929,7 +2283,7 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 try:
                     skims.export(str(skim_path))
                 except Exception:
-                    pass
+                    logger.debug("Skim export failed", exc_info=True)
 
             vol_col = _detect_volume_col(vol_df)
             class_tot_cols = [
@@ -1942,7 +2296,7 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 vol_col = "total_vehicles_tot"
 
             total_vol = float(vol_df[vol_col].sum()) if vol_col else 0.0
-            print(f"  Assigned volume: {total_vol:,.0f}  (col={vol_col})")
+            logger.info(f"  Assigned volume: {total_vol:,.0f}  (col={vol_col})")
 
             # --- 2) Match ALL pentlogram counts to links ---
             links_with_vol = links_gdf.copy()
@@ -1966,7 +2320,9 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     if excl_ids:
                         n_before = len(pent)
                         pent = pent[~pent["objectid"].isin(excl_ids)].copy()
-                        print(f"  Pre-filter: removed {n_before - len(pent)} excluded stations")
+                        logger.info(
+                            f"  Pre-filter: removed {n_before - len(pent)} excluded stations"
+                        )
                 _export_matching_diagnostics(
                     matched,
                     "_corridor_volume" if "_corridor_volume" in matched.columns else vol_col,
@@ -1982,7 +2338,7 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 valid = valid[~valid["_excluded"]].copy()
 
             if valid.empty:
-                print("  WARNING: no valid matched counts — cannot compute gradient")
+                logger.warning("  WARNING: no valid matched counts — cannot compute gradient")
                 continue
 
             mod_all = valid[compare_col].values.astype(np.float64)
@@ -2008,11 +2364,13 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             # Adaptive damping: if Z increased, reduce global damping
             if outer_it > 1 and Z_current > prev_Z:
                 effective_global_damping = max(effective_global_damping * 0.7, 0.05)
-                print(f"  WARNING: Z increased — reducing global_damping to {effective_global_damping:.3f}")
+                logger.warning(
+                    f"  WARNING: Z increased — reducing global_damping to {effective_global_damping:.3f}"
+                )
 
-            print(f"  Z={Z_current:,.1f}  (prev={prev_Z:,.1f}  delta={Z_current - prev_Z:+,.1f})")
-            print(f"  R²={r2}  slope={slope}  %RMSE={pct_rmse}  bias={bias_pct}%")
-            print(f"  GEH<5: {geh5:.1f}%  n_counts={len(valid)}")
+            logger.info(f"  Z={Z_current:,.1f}  (prev={prev_Z:,.1f}  delta={Z_current - prev_Z:+,.1f})")
+            logger.info(f"  R²={r2}  slope={slope}  %RMSE={pct_rmse}  bias={bias_pct}%")
+            logger.info(f"  GEH<5: {geh5:.1f}%  n_counts={len(valid)}")
 
             # Evaluate screenlines for reporting
             sl_results: Dict[str, Any] = {}
@@ -2026,8 +2384,10 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     if sr.observed_total > 0 and np.isfinite(sr.ratio):
                         dev = abs(sr.ratio - 1.0) * 100.0
                         max_sl_pct_dev = max(max_sl_pct_dev, dev)
-                    print(f"  SL '{sn}': mod={sr.modeled_total:,.0f} "
-                          f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f} GEH={sr.geh:.1f}")
+                    logger.info(
+                        f"  SL '{sn}': mod={sr.modeled_total:,.0f} "
+                        f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f} GEH={sr.geh:.1f}"
+                    )
 
             # Record iteration history
             iter_record = {
@@ -2045,12 +2405,12 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             if outer_it > 1:
                 rel_change = abs(Z_current - prev_Z) / max(prev_Z, 1.0)
                 if rel_change < conv_tol:
-                    print(f"  CONVERGED: |delta Z|/Z = {rel_change:.6f} < {conv_tol}")
+                    logger.info(f"  CONVERGED: |delta Z|/Z = {rel_change:.6f} < {conv_tol}")
                     break
 
             # Stall detection: if best Z hasn't improved in 4 outer iterations
             if outer_it - best_iteration >= 4:
-                print(f"  STALLED: no Z improvement since iteration {best_iteration}")
+                logger.info(f"  STALLED: no Z improvement since iteration {best_iteration}")
                 break
 
             # Also check daily convergence criteria
@@ -2072,7 +2432,7 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 and (max_sl_pct_dev <= daily_sl_max_dev if sl_results else True)
             )
             if daily_ok:
-                print(f"  CONVERGED: all daily criteria met")
+                logger.info(f"  CONVERGED: all daily criteria met")
                 break
 
             prev_Z = Z_current
@@ -2131,12 +2491,16 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     np.clip(demand, seed_lower, seed_upper, out=demand)
                     np.maximum(demand, 0.0, out=demand)
 
-                    print(f"    GD inner {gd_it}: {len(corrections_applied)} SLs applied, "
-                          f"demand_total={demand.sum():,.0f}")
+                    logger.info(
+                        f"    GD inner {gd_it}: {len(corrections_applied)} SLs applied, "
+                        f"demand_total={demand.sum():,.0f}"
+                    )
 
                 if corrections_applied:
-                    print(f"  Screenline ratios: "
-                          f"{', '.join(f'{n}={r}' for n, r in corrections_applied)}")
+                    logger.info(
+                        f"  Screenline ratios: "
+                        f"{', '.join(f'{n}={r}' for n, r in corrections_applied)}"
+                    )
 
             # --- 6) Global residual correction from ALL count posts ---
             # After the select-link gradient step, compute aggregate bias
@@ -2158,9 +2522,11 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                         demand *= global_factor
                         np.clip(demand, seed_lower, seed_upper, out=demand)
                         np.maximum(demand, 0.0, out=demand)
-                        print(f"  Global residual: obs/mod={global_ratio:.3f} "
-                              f"→ factor={global_factor:.4f}  "
-                              f"demand={demand.sum():,.0f}")
+                        logger.info(
+                            f"  Global residual: obs/mod={global_ratio:.3f} "
+                            f"→ factor={global_factor:.4f}  "
+                            f"demand={demand.sum():,.0f}"
+                        )
 
             # --- 7) Gateway calibration — per-gateway OD scaling ---
             if ctx.gw_cal_enabled and vol_col:
@@ -2179,14 +2545,14 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     seed_upper=seed_upper,
                 )
                 if gw_corrections:
-                    print(f"  Gateway calibration ({len(gw_corrections)}):")
+                    logger.info(f"  Gateway calibration ({len(gw_corrections)}):")
                     for gc_line in gw_corrections:
-                        print(f"    {gc_line}")
+                        logger.info(f"    {gc_line}")
 
             # --- 8) Write updated demand back to matrix ---
             data[:, :] = demand
             mat.save()
-            print(f"  Matrix saved. Total demand: {demand.sum():,.0f}")
+            logger.info(f"  Matrix saved. Total demand: {demand.sum():,.0f}")
 
     finally:
         ctx.best_Z = best_Z
@@ -2194,16 +2560,25 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
         ctx.best_iteration = best_iteration
         ctx.restore_best_and_close()
 
+    # Run final assignment on best-state demand so artifacts are consistent
+    best_vol_df = ctx.finalize_best_state()
+    if best_vol_df is not None:
+        vol_df = best_vol_df
+
+    # Use best iteration stats for the report when available
+    model_time_period = str(calib_cfg.get("model_time_period", "daily"))
+    best_final = history[best_iteration - 1] if history and 0 < best_iteration <= len(history) else (history[-1] if history else {})
+
     # --- Save calibration report ---
     report = {
         "method": "odme_spiess_gradient",
         "iterations": len(history),
         "converged": len(history) > 0 and (
             (len(history) >= 2 and abs(history[-1].get("Z_objective", 0) - history[-2].get("Z_objective", 1)) / max(abs(history[-2].get("Z_objective", 1)), 1) < conv_tol)
-            or _check_final_convergence(history, "daily", 85.0, daily_conv)
+            or _check_final_convergence(history, model_time_period, 85.0, daily_conv)
         ),
         "history": history,
-        "final": history[-1] if history else {},
+        "final": best_final,
         "config": {
             "max_outer_iterations": max_outer,
             "gradient_descent_iterations": gd_inner,
@@ -2220,20 +2595,22 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     }
     report_path = output_dir / "calibration_report.json"
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\nODME report: {report_path}")
+    logger.info(f"\nODME report: {report_path}")
 
     if history:
         z_start = history[0].get("Z_objective", 0)
         z_end = best_Z if best_Z < float("inf") else history[-1].get("Z_objective", 0)
-        print(f"  Z: {z_start:,.1f} → {z_end:,.1f}  "
-              f"(reduction: {(1 - z_end / max(z_start, 1)) * 100:.1f}%)  "
-              f"best at iteration {best_iteration}")
+        logger.info(
+            f"  Z: {z_start:,.1f} → {z_end:,.1f}  "
+            f"(reduction: {(1 - z_end / max(z_start, 1)) * 100:.1f}%)  "
+            f"best at iteration {best_iteration}"
+        )
 
     # Save final assignment results
     if history:
         out_path = output_dir / "assignment_results.parquet"
         vol_df.to_parquet(str(out_path), index=False)
-        print(f"  Final assignment: {out_path}")
+        logger.info(f"  Final assignment: {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -2297,9 +2674,19 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     scale_method = str(scale_cfg.get("method", "sector"))
     scale_enabled = bool(scale_cfg.get("enabled", True))
     damping = float(scale_cfg.get("damping", 0.5))
-    min_factor = float(scale_cfg.get("min_factor", 0.5))
-    max_factor = float(scale_cfg.get("max_factor", 2.0))
-    adaptive_scaling = bool(scale_cfg.get("adaptive_data_driven", True))
+    # NOTE: min_factor, max_factor, and adaptive_data_driven from scaling
+    # config are loaded for reporting but NOT used in the actual update step.
+    # Elasticity is controlled by seed_lower / seed_upper (from max_deviation).
+    _unused_scale_params = {
+        k: scale_cfg[k]
+        for k in ("min_factor", "max_factor", "adaptive_data_driven")
+        if k in scale_cfg
+    }
+    if _unused_scale_params:
+        logger.debug(
+            "Scaling config params present but unused (elasticity uses max_deviation): %s",
+            _unused_scale_params,
+        )
     quality_cfg = calib_cfg.get("quality_gates") or {}
     q_bias_hard = float(quality_cfg.get("hard_class_bias_max_abs_pct", 90.0))
     q_wmape_warn = float(quality_cfg.get("warn_wmape_pct", 47.0))
@@ -2314,16 +2701,20 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     w_bias = float(q_obj_weights.get("class_bias_max_abs_pct", 0.35))
     w_rmse = float(q_obj_weights.get("pct_rmse", 0.35))
 
-    print("=== FSM ITERATIVE CALIBRATION ===")
-    print(f"  model_time_period={model_time_period}, max_iterations={max_iterations}")
+    logger.info("=== FSM ITERATIVE CALIBRATION ===")
+    logger.info(f"  model_time_period={model_time_period}, max_iterations={max_iterations}")
     if model_time_period == "daily":
-        print(f"  Daily convergence: R²>={daily_r2_target}, slope∈[{daily_slope_lo},{daily_slope_hi}], "
-              f"%RMSE<={daily_pct_rmse_max}, SL_dev<={daily_sl_max_dev}%, |bias|<={daily_bias_max}%")
-        print(f"  (GEH<5 >= {geh_target}% kept as diagnostic; daily_capacity_factor={daily_cap_factor})")
+        logger.info(
+            f"  Daily convergence: R²>={daily_r2_target}, slope∈[{daily_slope_lo},{daily_slope_hi}], "
+            f"%RMSE<={daily_pct_rmse_max}, SL_dev<={daily_sl_max_dev}%, |bias|<={daily_bias_max}%"
+        )
+        logger.info(
+            f"  (GEH<5 >= {geh_target}% kept as diagnostic; daily_capacity_factor={daily_cap_factor})"
+        )
     else:
-        print(f"  Hourly convergence: target GEH<5 >= {geh_target}%")
-    print(f"  scaling: enabled={scale_enabled}, method={scale_method}, damping={damping}")
-    print(f"  count_target: {count_target} (comparing against '{obs_col}')")
+        logger.info(f"  Hourly convergence: target GEH<5 >= {geh_target}%")
+    logger.info(f"  scaling: enabled={scale_enabled}, method={scale_method}, damping={damping}")
+    logger.info(f"  count_target: {count_target} (comparing against '{obs_col}')")
 
     from sim.screenlines import evaluate_all_screenlines
 
@@ -2340,11 +2731,11 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
 
     try:
         for it in range(1, max_iterations + 1):
-            print(f"\n── Iteration {it}/{max_iterations} ──")
+            logger.info(f"\n── Iteration {it}/{max_iterations} ──")
 
             # 1) Assignment
             total_demand = float(mat.matrix_view.sum())
-            print(f"  Demand total: {total_demand:,.0f}")
+            logger.info(f"  Demand total: {total_demand:,.0f}")
             save_skims_now = bool(calib_cfg.get("save_skims", False)) and it == 1
             vol_df, skims, sl_matrices = execute_assignment(
                 project,
@@ -2366,7 +2757,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 skim_path = output_dir / "skims.aem"
                 try:
                     skims.export(str(skim_path))
-                    print(f"  Skims saved: {skim_path}")
+                    logger.info(f"  Skims saved: {skim_path}")
                 except Exception as exc:
                     import warnings as _w
                     _w.warn(f"Skim export failed ({skim_path}): {exc}", RuntimeWarning, stacklevel=1)
@@ -2386,27 +2777,29 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 vol_col = "total_vehicles_tot"
 
             total_vol = float(vol_df[vol_col].sum()) if vol_col else 0.0
-            print(f"  Assigned volume: {total_vol:,.0f}  (col={vol_col})")
+            logger.info(f"  Assigned volume: {total_vol:,.0f}  (col={vol_col})")
             if total_vol > 0 and total_demand > 0:
-                print(f"  Route amplification: {total_vol / total_demand:.1f} links/trip")
+                logger.info(f"  Route amplification: {total_vol / total_demand:.1f} links/trip")
 
             if it == 1:
                 try:
                     bkdn = compute_class_volume_breakdown(vol_df, links_gdf)
                     if bkdn:
-                        print("  Volume breakdown by road class / traffic class:")
+                        logger.info("  Volume breakdown by road class / traffic class:")
                         for col_name, by_rc in bkdn.items():
                             if col_name.startswith("_"):
                                 continue
                             for rc in ("motorway", "trunk", "primary", "secondary", "tertiary", "other"):
                                 info = by_rc.get(rc)
                                 if info:
-                                    print(f"    {col_name:20s}  {rc:12s}  vol={info['total_volume']:>12,.0f}  links={info['n_links']}")
+                                    logger.info(
+                                        f"    {col_name:20s}  {rc:12s}  vol={info['total_volume']:>12,.0f}  links={info['n_links']}"
+                                    )
                         shares = bkdn.get("_class_shares", {})
                         for rc, detail in shares.items():
-                            print(f"    {rc} class shares: {detail['shares']}")
+                            logger.info(f"    {rc} class shares: {detail['shares']}")
                 except Exception as ex:
-                    print(f"  WARNING: volume breakdown failed: {ex}")
+                    logger.warning(f"  WARNING: volume breakdown failed: {ex}")
 
             # 2) Match to pentlogram
             links_with_vol = links_gdf.copy()
@@ -2461,10 +2854,12 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     best_demand = mat.matrix[core_name][:, :].copy()
                     best_iteration = it
 
-            print(f"  R²={r2}  slope={slope}  %RMSE={pct_rmse}  bias={bias_pct}%")
-            print(f"  GEH<5: {geh5:.1f}%  GEH<10: {geh10:.1f}%  "
-                  f"daily-adj GEH<{stats.get('daily_geh_threshold', 5):.0f}: {daily_geh_adj:.1f}%")
-            print(f"  Z={Z_current:,.0f}  (best={best_Z:,.0f} at it={best_iteration})")
+            logger.info(f"  R²={r2}  slope={slope}  %RMSE={pct_rmse}  bias={bias_pct}%")
+            logger.info(
+                f"  GEH<5: {geh5:.1f}%  GEH<10: {geh10:.1f}%  "
+                f"daily-adj GEH<{stats.get('daily_geh_threshold', 5):.0f}: {daily_geh_adj:.1f}%"
+            )
+            logger.info(f"  Z={Z_current:,.0f}  (best={best_Z:,.0f} at it={best_iteration})")
 
             if not valid.empty and "link_id" in valid.columns and "direction" in links_gdf.columns:
                 _dir_lookup = links_gdf[["link_id", "direction"]].drop_duplicates("link_id")
@@ -2478,8 +2873,10 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                             sub[compare_col].values, sub[obs_col].values,
                             daily_capacity_factor=daily_cap_factor,
                         )
-                        print(f"    {label} (n={len(sub)}): slope={s_stats.get('slope')}  "
-                              f"bias={s_stats.get('bias_pct')}%  R²={s_stats.get('r2')}")
+                        logger.info(
+                            f"    {label} (n={len(sub)}): slope={s_stats.get('slope')}  "
+                            f"bias={s_stats.get('bias_pct')}%  R²={s_stats.get('r2')}"
+                        )
 
             if it == 1 and not valid.empty and "link_type" in valid.columns:
                 _rc = valid["link_type"].map(_coarse_road_class)
@@ -2490,9 +2887,11 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     _m = rc_rows[compare_col].values.astype(float)
                     _o = rc_rows[obs_col].values.astype(float)
                     _ratio = float(_m.sum() / max(_o.sum(), 1))
-                    print(f"    {rc:12s} (n={len(rc_rows):4d}): "
-                          f"sum_mod={_m.sum():>12,.0f}  sum_obs={_o.sum():>12,.0f}  "
-                          f"ratio={_ratio:.3f}")
+                    logger.info(
+                        f"    {rc:12s} (n={len(rc_rows):4d}): "
+                        f"sum_mod={_m.sum():>12,.0f}  sum_obs={_o.sum():>12,.0f}  "
+                        f"ratio={_ratio:.3f}"
+                    )
 
             last_extended = {}
             if not valid.empty and compare_col and compare_col in valid.columns:
@@ -2501,14 +2900,16 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                         valid, compare_col, obs_col,
                     )
                 except Exception as ex:
-                    print(f"  WARNING: extended link metrics failed: {ex}")
+                    logger.warning(f"  WARNING: extended link metrics failed: {ex}")
                     last_extended = {}
 
             mq = match_quality_report(matched)
             if it == 1:
-                print(f"  Match quality: {mq['n_matched']}/{mq['n_total']} matched, "
-                      f"{mq['n_link_conflicts']} conflicts, "
-                      f"mean_dist={mq['mean_match_distance_m']}m")
+                logger.info(
+                    f"  Match quality: {mq['n_matched']}/{mq['n_total']} matched, "
+                    f"{mq['n_link_conflicts']} conflicts, "
+                    f"mean_dist={mq['mean_match_distance_m']}m"
+                )
 
                 # Build persistent exclusion set from iteration-1 matching
                 # so that bad stations (e.g. 9k service road matched to 62k
@@ -2518,8 +2919,10 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     if excl_ids:
                         n_before = len(pent)
                         pent = pent[~pent["objectid"].isin(excl_ids)].copy()
-                        print(f"  Pre-filter: removed {n_before - len(pent)} excluded stations "
-                              f"from pentlogram ({len(pent)} remaining)")
+                        logger.info(
+                            f"  Pre-filter: removed {n_before - len(pent)} excluded stations "
+                            f"from pentlogram ({len(pent)} remaining)"
+                        )
 
                 # Export matching diagnostics CSV
                 _export_matching_diagnostics(matched, compare_col, obs_col, output_dir)
@@ -2535,12 +2938,17 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                             if rc_rows.empty:
                                 continue
                             worst = rc_rows.reindex(rc_rows["_bias"].abs().nlargest(5).index)
-                            print(f"  Top-5 {rc} links by |bias|:")
+                            logger.info(f"  Top-5 {rc} links by |bias|:")
                             for _, row in worst.iterrows():
-                                print(f"    mod={row[compare_col]:>8,.0f}  obs={row[obs_col]:>8,.0f}  "
-                                      f"bias={row['_bias']:>+8,.0f}  type={row['link_type']}")
+                                logger.info(
+                                    f"    mod={row[compare_col]:>8,.0f}  obs={row[obs_col]:>8,.0f}  "
+                                    f"bias={row['_bias']:>+8,.0f}  type={row['link_type']}"
+                                )
                     except Exception:
-                        pass
+                        logger.debug(
+                            "Top-5 bias by road class diagnostic failed",
+                            exc_info=True,
+                        )
 
             # Evaluate screenlines
             sl_results: Dict[str, Any] = {}
@@ -2555,10 +2963,12 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                         dev = abs(sr.ratio - 1.0) * 100.0
                         max_sl_pct_dev = max(max_sl_pct_dev, dev)
                     if it == 1 or it == max_iterations:
-                        print(f"  Screenline '{sn}': mod={sr.modeled_total:,.0f} "
-                              f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f} GEH={sr.geh:.1f}")
+                        logger.info(
+                            f"  Screenline '{sn}': mod={sr.modeled_total:,.0f} "
+                            f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f} GEH={sr.geh:.1f}"
+                        )
                 if sl_results:
-                    print(f"  Screenline max %deviation: {max_sl_pct_dev:.1f}%")
+                    logger.info(f"  Screenline max %deviation: {max_sl_pct_dev:.1f}%")
 
             iter_record = {
                 "iteration": it,
@@ -2600,7 +3010,10 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     else:
                         obj_non_improve += 1
                 except Exception:
-                    pass
+                    logger.debug(
+                        "Quality objective computation failed",
+                        exc_info=True,
+                    )
             history.append(iter_record)
 
             # 4) Convergence check — daily vs hourly criteria
@@ -2621,17 +3034,17 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
 
                 passed = [k for k, v in checks.items() if v]
                 failed = [k for k, v in checks.items() if not v]
-                print(f"  Daily convergence: {len(passed)}/{len(checks)} criteria met")
+                logger.info(f"  Daily convergence: {len(passed)}/{len(checks)} criteria met")
                 if failed:
-                    print(f"    PASS: {', '.join(passed) if passed else 'none'}")
-                    print(f"    FAIL: {', '.join(failed)}")
+                    logger.info(f"    PASS: {', '.join(passed) if passed else 'none'}")
+                    logger.info(f"    FAIL: {', '.join(failed)}")
 
                 if all(checks.values()):
-                    print(f"  CONVERGED (daily): all criteria met")
+                    logger.info(f"  CONVERGED (daily): all criteria met")
                     converged = True
             else:
                 if geh5 >= geh_target:
-                    print(f"  CONVERGED: GEH<5 = {geh5:.1f}% >= target {geh_target}%")
+                    logger.info(f"  CONVERGED: GEH<5 = {geh5:.1f}% >= target {geh_target}%")
                     converged = True
 
             if converged:
@@ -2639,22 +3052,28 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
 
             # Stall detection: Z-based (primary) + quality-objective (secondary)
             if it - best_iteration >= q_obj_patience + 1:
-                print(f"  Z-STALL: no Z improvement since iteration {best_iteration}")
+                logger.info(f"  Z-STALL: no Z improvement since iteration {best_iteration}")
                 break
             if model_time_period == "daily":
                 if q_obj_patience > 0 and obj_non_improve >= q_obj_patience:
-                    print(f"  QUALITY STOP: objective non-improving for "
-                          f"{obj_non_improve} iterations")
+                    logger.info(
+                        f"  QUALITY STOP: objective non-improving for "
+                        f"{obj_non_improve} iterations"
+                    )
                     break
             else:
                 improvement = geh5 - prev_geh5
                 if it > 1 and improvement < min_improvement:
-                    print(f"  STALLED: GEH improvement {improvement:.2f}% "
-                          f"< {min_improvement}%")
+                    logger.info(
+                        f"  STALLED: GEH improvement {improvement:.2f}% "
+                        f"< {min_improvement}%"
+                    )
                     break
                 if q_obj_patience > 0 and obj_non_improve >= q_obj_patience:
-                    print(f"  QUALITY STOP: objective non-improving for "
-                          f"{obj_non_improve} iterations")
+                    logger.info(
+                        f"  QUALITY STOP: objective non-improving for "
+                        f"{obj_non_improve} iterations"
+                    )
                     break
 
             prev_geh5 = geh5
@@ -2695,8 +3114,10 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                         corrections_log.append(f"{sl_name}={ratio:.2f}")
 
                     if corrections_log:
-                        print(f"  Spiess SL corrections ({len(corrections_log)}): "
-                              f"{', '.join(corrections_log)}")
+                        logger.info(
+                            f"  Spiess SL corrections ({len(corrections_log)}): "
+                            f"{', '.join(corrections_log)}"
+                        )
 
                 # (b) Global residual correction from all count posts
                 sum_obs = float(valid[obs_col].sum())
@@ -2707,8 +3128,10 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     global_factor = float(np.clip(global_factor, 0.8, 1.25))
                     if abs(global_factor - 1.0) > 0.003:
                         demand *= global_factor
-                        print(f"  Global residual: obs/mod={global_ratio:.3f} "
-                              f"→ factor={global_factor:.4f}")
+                        logger.info(
+                            f"  Global residual: obs/mod={global_ratio:.3f} "
+                            f"→ factor={global_factor:.4f}"
+                        )
 
                 # (c) Gateway calibration — per-gateway OD scaling
                 if ctx.gw_cal_enabled and vol_col:
@@ -2727,20 +3150,20 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                         seed_upper=seed_upper,
                     )
                     if gw_corrections:
-                        print(f"  Gateway calibration ({len(gw_corrections)}):")
+                        logger.info(f"  Gateway calibration ({len(gw_corrections)}):")
                         for gc_line in gw_corrections:
-                            print(f"    {gc_line}")
+                            logger.info(f"    {gc_line}")
 
                 # (d) Elasticity clip
                 np.clip(demand, seed_lower, seed_upper, out=demand)
                 np.maximum(demand, 0.0, out=demand)
                 data[:, :] = demand
-                print(f"  Demand after update: {demand.sum():,.0f}")
+                logger.info(f"  Demand after update: {demand.sum():,.0f}")
 
             elif not scale_enabled:
-                print("  Scaling disabled (principle: frozen / diagnostic run)")
+                logger.info("  Scaling disabled (principle: frozen / diagnostic run)")
             else:
-                print("  Cannot scale — no valid matched volumes")
+                logger.warning("  Cannot scale — no valid matched volumes")
 
             # Persist scaled matrix for next iteration
             mat.save()
@@ -2750,6 +3173,11 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
         ctx.best_demand = best_demand
         ctx.best_iteration = best_iteration
         ctx.restore_best_and_close()
+
+    # Run final assignment on best-state demand so artifacts are consistent
+    best_vol_df = ctx.finalize_best_state()
+    if best_vol_df is not None:
+        vol_df = best_vol_df
 
     # Per-period validation (uses daily observed × period shares)
     period_stats: Dict[str, Any] = {}
@@ -2761,7 +3189,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             period_shares = get_demand_period_shares(profile)
             cal_periods = period_cfg.get("periods", ["am", "pm", "daily"])
 
-            print("\n=== PER-PERIOD VALIDATION ===")
+            logger.info("\n=== PER-PERIOD VALIDATION ===")
 
             mat_p = AequilibraeMatrix()
             mat_p.load(str(matrix_path))
@@ -2772,15 +3200,15 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 for period in cal_periods:
                     p_core = f"wd_{period}" if period != "daily" else "wd_daily"
                     if p_core not in mat_p.names:
-                        print(f"  Skipping {period}: core '{p_core}' not in matrix")
+                        logger.warning(f"  Skipping {period}: core '{p_core}' not in matrix")
                         continue
 
                     p_share = period_shares.get(period, 1.0)
-                    print(f"\n  Period: {period} (share={p_share:.3f}, core={p_core})")
+                    logger.info(f"\n  Period: {period} (share={p_share:.3f}, core={p_core})")
 
                     mat_p.computational_view([p_core])
                     p_demand = float(mat_p.matrix_view.sum())
-                    print(f"    Demand: {p_demand:,.0f}")
+                    logger.info(f"    Demand: {p_demand:,.0f}")
 
                     vol_df_p, _, _sl_p = execute_assignment(
                         project_p,
@@ -2821,15 +3249,18 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                             daily_capacity_factor=p_dcf,
                         )
                         period_stats[period] = ps
-                        print(f"    R²={ps.get('r2')}  slope={ps.get('slope')}  "
+                        logger.info(f"    R²={ps.get('r2')}  slope={ps.get('slope')}  "
                               f"%RMSE={ps.get('pct_rmse')}  n={ps.get('n')}")
                     else:
-                        print(f"    No valid matched volumes for {period}")
+                        logger.warning(f"    No valid matched volumes for {period}")
             finally:
                 mat_p.close()
                 project_p.close()
-        except Exception as e:
-            print(f"  Period validation error: {e}")
+        except Exception:
+            logger.exception("Period calibration validation failed")
+
+    # Use best iteration stats for the report when available
+    best_final = history[best_iteration - 1] if history and 0 < best_iteration <= len(history) else (history[-1] if history else {})
 
     # Save calibration report
     report = {
@@ -2837,7 +3268,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
         "model_time_period": model_time_period,
         "converged": _check_final_convergence(history, model_time_period, geh_target, daily_conv),
         "history": history,
-        "final": history[-1] if history else {},
+        "final": best_final,
         "config": {
             "max_iterations": max_iterations,
             "model_time_period": model_time_period,
@@ -2876,7 +3307,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
             ],
         },
         "observed_summary": {
-            "total_car": round(float(pent["observed_car"].sum()), 0),
+            "total_motor": round(float(pent["observed_motor_total"].sum()), 0),
             "total_truck": round(float(pent["observed_truck"].sum()), 0),
             "total_all": round(float(pent["observed_total"].sum()), 0),
             "n_count_stations": len(pent),
@@ -2887,13 +3318,13 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     }
     report_path = output_dir / "calibration_report.json"
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\nCalibration report: {report_path}")
+    logger.info(f"\nCalibration report: {report_path}")
 
     # Save final assignment
     if history:
         out_path = output_dir / "assignment_results.parquet"
         vol_df.to_parquet(str(out_path), index=False)
-        print(f"Final assignment: {out_path}")
+        logger.info(f"Final assignment: {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -2903,7 +3334,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
 _CSD_COMPATIBLE_LINK_TYPES: dict = {
     "motorway": {"motorway", "motorway_link"},
     "trunk": {"trunk", "trunk_link", "primary", "primary_link"},
-    "secondary": {"secondary", "secondary_link", "primary", "primary_link", "trunk", "trunk_link"},
+    "secondary": {"secondary", "secondary_link", "primary", "primary_link"},
     "tertiary": {"tertiary", "tertiary_link", "secondary", "secondary_link", "unclassified", "residential"},
 }
 
@@ -2929,6 +3360,7 @@ def match_csd_to_links(
     if "sil" not in csd.columns or "osm_ref" not in links_gdf.columns:
         return pd.DataFrame()
 
+    csd["sil"] = csd["sil"].astype(str)
     for col in ("o", "sv", "tv"):
         if col in csd.columns:
             csd[col] = pd.to_numeric(csd[col], errors="coerce").fillna(0)
@@ -2936,10 +3368,10 @@ def match_csd_to_links(
     csd["road_class"] = csd["sil"].apply(_classify_csd_road)
     csd_sil = csd["sil"].str.strip()
 
-    vol_cols = [
+    vol_cols = sorted(
         c for c in links_gdf.columns
         if c.endswith("_tot") and c not in ("PCE_tot", "Preload_tot")
-    ]
+    )
     tot_col = None
     if "total_vehicles_tot" in vol_cols:
         tot_col = "total_vehicles_tot"
@@ -3111,7 +3543,7 @@ def compute_validation_benchmarks(
         bias_pass = bias <= bias_max
         sl_pass = sl_max_error <= sl_max
 
-        daily_pass = r2_pass and slope_pass and prmse_pass and bias_pass
+        daily_pass = r2_pass and slope_pass and prmse_pass and bias_pass and sl_pass
         result.update({
             "daily_r2": round(r2, 4),
             "daily_r2_pass": r2_pass,
@@ -3143,7 +3575,15 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
     _ensure_dir(output_dir)
     buffer_m = float(_get(cfg, ["calibration", "match_buffer_m"], 50.0))
 
-    print("=== COMPREHENSIVE VALIDATION ===")
+    # Swap closures to validation period (e.g. 2025)
+    bc_cfg = cfg.get("baseline_closures") or {}
+    valid_period = bc_cfg.get("validation_period")
+    if bc_cfg.get("enabled", False) and valid_period:
+        from sim.network_normalization import swap_db_closures
+        swap_db_closures(config_path, measurement_period=valid_period)
+        logger.info("  Closures swapped to validation period: %s", valid_period)
+
+    logger.info("=== COMPREHENSIVE VALIDATION ===")
 
     results_path = output_dir / "assignment_results.parquet"
     if not results_path.exists():
@@ -3168,14 +3608,15 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
             vol_df["total_vehicles_tot"] = vol_df[class_tot_cols].sum(axis=1)
             vol_col = "total_vehicles_tot"
 
-    print(f"  Loaded assignment: {len(vol_df)} links, vol_col={vol_col}")
+    logger.info(f"  Loaded assignment: {len(vol_df)} links, vol_col={vol_col}")
 
     links_gdf = _load_network_links(project_dir)
     if vol_col and "link_id" in vol_df.columns:
         links_gdf = links_gdf.merge(vol_df[["link_id", vol_col]], on="link_id", how="left")
 
     count_target = str(calib_cfg.get("count_target", "total"))
-    obs_col = "observed_car" if count_target == "car_only" else "observed_total"
+    _ct_map = {"car_only": "observed_car", "motor_total": "observed_motor_total", "total": "observed_total"}
+    obs_col = _ct_map.get(count_target, "observed_total")
 
     assign_cfg = cfg.get("assignment") or {}
     bpr_cfg = assign_cfg.get("bpr") or {}
@@ -3184,47 +3625,102 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
 
     report: Dict[str, Any] = {"model_time_period": model_time_period}
 
-    # 1) Pentlogram (reference -- same data as calibration)
-    print(f"\n1) Pentlogram comparison (reference, time_period={model_time_period}) ...")
+    count_source = str(calib_cfg.get("count_source", "pentlogram"))
+    report["count_source"] = count_source
+
+    # 1) Reference comparison (calibration data check)
     pent_stats: Dict[str, Any] = {"n": 0}
-    try:
-        pent = load_pentlogram(cfg)
-        validate_geometries_or_fail(
-            pent, name="pentlogram", expected_epsg=get_metric_epsg(cfg),
-        )
-        agg_corr = bool(calib_cfg.get("aggregate_corridor", True))
-        matched = match_counts_to_links(pent, links_gdf, buffer_m=buffer_m,
-                                         aggregate_corridor=agg_corr,
-                                         vol_col=vol_col)
-        vc = vol_col if vol_col and vol_col in matched.columns else None
-        compare_vc = "_corridor_volume" if "_corridor_volume" in matched.columns else vc
-        if compare_vc and compare_vc in matched.columns:
-            valid = matched.dropna(subset=[compare_vc, obs_col])
-            valid = valid[valid[obs_col] > 0]
-            if "_excluded" in valid.columns:
-                valid = valid[~valid["_excluded"]].copy()
-            pent_stats = compute_stats(
-                valid[compare_vc].values, valid[obs_col].values,
-                daily_capacity_factor=daily_cap_factor,
+    matched = gpd.GeoDataFrame()
+
+    if count_source == "csd_split":
+        logger.info("\n1) CSD calibration-subset reference comparison ...")
+        try:
+            split_cfg = calib_cfg.get("csd_split") or {}
+            csd_full = load_csd(cfg)
+            calib_csd, _ = split_csd_for_calibration(
+                csd_full,
+                strategy=str(split_cfg.get("strategy", "alternating")),
+                calib_share=float(split_cfg.get("calib_share", 0.65)),
+                random_seed=int(split_cfg.get("random_seed", 42)),
             )
-            report["pentlogram"] = {"matched": int(len(valid)), **pent_stats}
-            print(f"  Matched: {len(valid)}  R²={pent_stats.get('r2')}  "
-                  f"slope={pent_stats.get('slope')}  %RMSE={pent_stats.get('pct_rmse')}  "
-                  f"bias={pent_stats.get('bias_pct')}%")
-            print(f"  GEH<5: {pent_stats.get('geh_lt5_pct')}%  "
-                  f"daily-adj GEH<{pent_stats.get('daily_geh_threshold', 5):.0f}: "
-                  f"{pent_stats.get('daily_geh_lt_adj_pct')}%")
-        else:
-            print("  No volume column on links")
-    except Exception as e:
-        print(f"  SKIP: {e}")
+            pent = load_csd_as_link_counts(calib_csd, links_gdf)
+            if not pent.empty:
+                agg_corr = bool(calib_cfg.get("aggregate_corridor", True))
+                matched = match_counts_to_links(pent, links_gdf, buffer_m=buffer_m,
+                                                 aggregate_corridor=agg_corr,
+                                                 vol_col=vol_col)
+                vc = vol_col if vol_col and vol_col in matched.columns else None
+                compare_vc = "_corridor_volume" if "_corridor_volume" in matched.columns else vc
+                if compare_vc and compare_vc in matched.columns:
+                    valid = matched.dropna(subset=[compare_vc, obs_col])
+                    valid = valid[valid[obs_col] > 0]
+                    if "_excluded" in valid.columns:
+                        valid = valid[~valid["_excluded"]].copy()
+                    pent_stats = compute_stats(
+                        valid[compare_vc].values, valid[obs_col].values,
+                        daily_capacity_factor=daily_cap_factor,
+                    )
+                    report["calibration_reference"] = {"matched": int(len(valid)), **pent_stats}
+                    logger.info(f"  Matched: {len(valid)}  R²={pent_stats.get('r2')}  "
+                          f"bias={pent_stats.get('bias_pct')}%")
+        except Exception:
+            logger.exception("CSD calibration-subset reference comparison skipped")
+    else:
+        logger.info(f"\n1) Pentlogram comparison (reference, time_period={model_time_period}) ...")
+        try:
+            pent = load_pentlogram(cfg)
+            validate_geometries_or_fail(
+                pent, name="pentlogram", expected_epsg=get_metric_epsg(cfg),
+            )
+            agg_corr = bool(calib_cfg.get("aggregate_corridor", True))
+            matched = match_counts_to_links(pent, links_gdf, buffer_m=buffer_m,
+                                             aggregate_corridor=agg_corr,
+                                             vol_col=vol_col)
+            vc = vol_col if vol_col and vol_col in matched.columns else None
+            compare_vc = "_corridor_volume" if "_corridor_volume" in matched.columns else vc
+            if compare_vc and compare_vc in matched.columns:
+                valid = matched.dropna(subset=[compare_vc, obs_col])
+                valid = valid[valid[obs_col] > 0]
+                if "_excluded" in valid.columns:
+                    valid = valid[~valid["_excluded"]].copy()
+                pent_stats = compute_stats(
+                    valid[compare_vc].values, valid[obs_col].values,
+                    daily_capacity_factor=daily_cap_factor,
+                )
+                report["pentlogram"] = {"matched": int(len(valid)), **pent_stats}
+                logger.info(f"  Matched: {len(valid)}  R²={pent_stats.get('r2')}  "
+                      f"slope={pent_stats.get('slope')}  %RMSE={pent_stats.get('pct_rmse')}  "
+                      f"bias={pent_stats.get('bias_pct')}%")
+                logger.info(f"  GEH<5: {pent_stats.get('geh_lt5_pct')}%  "
+                      f"daily-adj GEH<{pent_stats.get('daily_geh_threshold', 5):.0f}: "
+                      f"{pent_stats.get('daily_geh_lt_adj_pct')}%")
+                ext_metrics = compute_extended_link_metrics(valid, compare_vc, obs_col)
+                if ext_metrics:
+                    report["extended_metrics"] = ext_metrics
+            else:
+                logger.warning("  No volume column on links")
+        except Exception:
+            logger.exception("Pentlogram comparison step skipped")
 
     # 2) CSD -- independent per-road validation
-    print("\n2) CSD independent validation (per-road matching via osm_ref) ...")
+    #    When count_source=="csd_split", only the validation subset is used.
+    logger.info("\n2) CSD independent validation (per-road matching via osm_ref) ...")
     csd_match_df = pd.DataFrame()
     csd = None
     try:
-        csd = load_csd(cfg)
+        if count_source == "csd_split":
+            split_cfg = calib_cfg.get("csd_split") or {}
+            csd_full = load_csd(cfg)
+            _, csd = split_csd_for_calibration(
+                csd_full,
+                strategy=str(split_cfg.get("strategy", "alternating")),
+                calib_share=float(split_cfg.get("calib_share", 0.65)),
+                random_seed=int(split_cfg.get("random_seed", 42)),
+            )
+            logger.info(f"  Using CSD validation subset ({len(csd)} sections)")
+        else:
+            csd = load_csd(cfg)
+
         csd_agg = aggregate_csd_by_class(csd)
         report["csd_observed"] = csd_agg.to_dict(orient="records")
 
@@ -3236,30 +3732,30 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
         if not csd_match_df.empty:
             report["csd_link_matching"] = csd_match_df.to_dict(orient="records")
 
-        print(f"  CSD: {len(csd)} sections")
+        logger.info(f"  CSD: {len(csd)} sections")
         for _, r in csd_agg.iterrows():
-            print(f"    {r['road_class']:12s}  sections={int(r['sections']):4d}  "
+            logger.info(f"    {r['road_class']:12s}  sections={int(r['sections']):4d}  "
                   f"mean_AADT={r['mean_sv']:>8.0f}  mean_cars={r['mean_o']:>8.0f}")
 
         if not csd_match_df.empty:
-            print(f"  Per-road comparison: {len(csd_match_df)} roads matched")
+            logger.info(f"  Per-road comparison: {len(csd_match_df)} roads matched")
             for _, r in csd_match_df.iterrows():
-                print(
+                logger.info(
                     f"    {r['road']:>8s} ({r['road_class']:>10s})  "
                     f"csd_sv={r['csd_mean_sv']:>8.0f}  model={r['model_lw_mean']:>8.0f}  "
                     f"GEH={r['geh']:>5.1f}  sections={r['csd_sections']}  links={r['model_links']}"
                 )
             summary = getattr(csd_match_df, "attrs", {}).get("summary")
             if summary:
-                print(f"  Summary ({summary['n_roads']} roads): "
+                logger.info(f"  Summary ({summary['n_roads']} roads): "
                       f"R²={summary['r2']:.3f}  bias={summary['bias_pct']:.1f}%  "
                       f"%RMSE={summary['pct_rmse']:.1f}  mean_GEH={summary['mean_geh']:.1f}")
                 report["csd_summary"] = summary
-    except Exception as e:
-        print(f"  SKIP: {e}")
+    except Exception:
+        logger.exception("CSD independent validation step skipped")
 
     # 3) Screenline validation
-    print("\n3) Screenline validation ...")
+    logger.info("\n3) Screenline validation ...")
     sl_results: Dict[str, Any] = {}
     try:
         from sim.screenlines import load_screenlines, evaluate_all_screenlines
@@ -3273,16 +3769,16 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
             )
             for sn, sr in sl_res.items():
                 sl_results[sn] = sr.to_dict()
-                print(f"  {sn}: mod={sr.modeled_total:,.0f} obs={sr.observed_total:,.0f} "
+                logger.info(f"  {sn}: mod={sr.modeled_total:,.0f} obs={sr.observed_total:,.0f} "
                       f"ratio={sr.ratio:.2f} GEH={sr.geh:.1f}")
             report["screenlines"] = sl_results
         else:
-            print("  No screenlines defined")
-    except Exception as e:
-        print(f"  SKIP: {e}")
+            logger.warning("  No screenlines defined")
+    except Exception:
+        logger.exception("Screenline validation step skipped")
 
     # 4) Journey time validation
-    print("\n4) Journey time validation ...")
+    logger.info("\n4) Journey time validation ...")
     jt_results: List[Dict[str, Any]] = []
     speed_comparison: Dict[str, Any] = {}
     try:
@@ -3291,9 +3787,9 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
             speed_comparison = compute_class_speed_comparison(links_gdf)
             report["class_speed_comparison"] = speed_comparison
             if speed_comparison:
-                print("  Speed comparison (model vs CSD):")
+                logger.info("  Speed comparison (model vs CSD):")
                 for lt, sc in speed_comparison.items():
-                    print(f"    {lt:20s}  model={sc['modeled_kmh']:>5.1f}  "
+                    logger.info(f"    {lt:20s}  model={sc['modeled_kmh']:>5.1f}  "
                           f"ref={sc.get('reference_kmh', sc.get('csd_implied_kmh', 0)):>5.1f}  "
                           f"diff={sc['pct_diff']:>+5.1f}%")
 
@@ -3314,19 +3810,19 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
                     report["journey_time_routes"] = jt_results
                     for r in jt_results:
                         status = "PASS" if r.get("pass") else "FAIL"
-                        print(f"  {r.get('name', '?'):20s}  model={r.get('model_min', '?')}min  "
+                        logger.info(f"  {r.get('name', '?'):20s}  model={r.get('model_min', '?')}min  "
                               f"ref={r.get('ref_min', '?')}min  {status}")
                 else:
                     mat.close()
             else:
-                print("  No skims available -- skip route checks")
+                logger.warning("  No skims available -- skip route checks")
         else:
-            print("  No reference routes configured")
-    except Exception as e:
-        print(f"  SKIP: {e}")
+            logger.info("  No reference routes configured")
+    except Exception:
+        logger.exception("Journey time validation step skipped")
 
     # 5) Benchmark summary
-    print(f"\n5) Validation benchmarks (model_time_period={model_time_period}) ...")
+    logger.info(f"\n5) Validation benchmarks (model_time_period={model_time_period}) ...")
     daily_conv = _get(cfg, ["calibration", "convergence", "daily"], {})
     benchmarks = compute_validation_benchmarks(
         pent_stats, sl_results, jt_results,
@@ -3356,29 +3852,45 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
     }
     overall = "PASS" if benchmarks["overall_pass"] else "FAIL"
     if model_time_period == "daily":
-        print(f"  R² >= 0.85:     {benchmarks.get('daily_r2', 0):.4f}  "
+        dt = daily_conv or {}
+        r2_tgt = float(dt.get("r2_target", 0.80))
+        sl_range = dt.get("slope_range", [0.85, 1.15])
+        prmse_max = float(dt.get("pct_rmse_max", 35.0))
+        bias_max = float(dt.get("bias_abs_max_pct", 15.0))
+        sl_max = float(dt.get("screenline_max_pct_deviation", 15.0))
+        logger.info(f"  R² >= {r2_tgt}:     {benchmarks.get('daily_r2', 0):.4f}  "
               f"{'PASS' if benchmarks.get('daily_r2_pass') else 'FAIL'}")
-        print(f"  slope [0.9-1.1]: {benchmarks.get('daily_slope', 0):.4f}  "
+        logger.info(f"  slope [{sl_range[0]}-{sl_range[1]}]: {benchmarks.get('daily_slope', 0):.4f}  "
               f"{'PASS' if benchmarks.get('daily_slope_pass') else 'FAIL'}")
-        print(f"  %RMSE <= 30%:   {benchmarks.get('daily_pct_rmse', 0):.1f}%  "
+        logger.info(f"  %RMSE <= {prmse_max:g}%:   {benchmarks.get('daily_pct_rmse', 0):.1f}%  "
               f"{'PASS' if benchmarks.get('daily_pct_rmse_pass') else 'FAIL'}")
-        print(f"  |bias| <= 10%:  {benchmarks.get('daily_bias_abs_pct', 0):.2f}%  "
+        logger.info(f"  |bias| <= {bias_max:g}%:  {benchmarks.get('daily_bias_abs_pct', 0):.2f}%  "
               f"{'PASS' if benchmarks.get('daily_bias_pass') else 'FAIL'}")
-        print(f"  SL dev <= 15%:  {benchmarks.get('screenline_max_error_pct', 0):.1f}%  "
+        logger.info(f"  SL dev <= {sl_max:g}%:  {benchmarks.get('screenline_max_error_pct', 0):.1f}%  "
               f"{'PASS' if benchmarks.get('daily_screenline_pass') else 'FAIL'}")
-        print(f"  (GEH<5: {geh:.1f}% — diagnostic only for daily model)")
+        logger.info(f"  (GEH<5: {geh:.1f}% — diagnostic only for daily model)")
     else:
-        print(f"  GEH<5 >= 85%:  {geh:.1f}%  "
+        logger.info(f"  GEH<5 >= 85%:  {geh:.1f}%  "
               f"{'PASS' if benchmarks.get('geh_benchmark_pass_hourly') else 'FAIL'}")
     if benchmarks["jt_benchmark_pass"] is not None:
-        print(f"  JT within tol:  {benchmarks['jt_within_tolerance_pct']:.1f}%  "
+        logger.info(f"  JT within tol:  {benchmarks['jt_within_tolerance_pct']:.1f}%  "
               f"{'PASS' if benchmarks['jt_benchmark_pass'] else 'FAIL'}")
-    print(f"  Screenline max error: {benchmarks['screenline_max_error_pct']:.1f}%")
-    print(f"  OVERALL: {overall}")
+    logger.info(f"  Screenline max error: {benchmarks['screenline_max_error_pct']:.1f}%")
+    logger.info(f"  OVERALL: {overall}")
 
     report_path = output_dir / "validation_report.json"
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\nValidation report: {report_path}")
+    logger.info(f"\nValidation report: {report_path}")
+
+    # Strip closures and run a clean final assignment
+    if bc_cfg.get("enabled", False) and valid_period:
+        from sim.network_normalization import swap_db_closures
+        from sim.assignment import run_assignment
+
+        logger.info("\n=== POST-VALIDATION: stripping closures, clean assignment ===")
+        swap_db_closures(config_path, measurement_period=None)
+        run_assignment(config_path)
+        logger.info("  Clean (closure-free) assignment saved.")
 
 
 # ---------------------------------------------------------------------------
@@ -3406,13 +3918,14 @@ def run_match_diagnostics(config_path: str | Path = "config/sim.yaml") -> None:
     agg_corridor = bool(calib_cfg.get("aggregate_corridor", True))
 
     count_target = str(calib_cfg.get("count_target", "total"))
-    obs_col = "observed_car" if count_target == "car_only" else "observed_total"
+    _ct_map = {"car_only": "observed_car", "motor_total": "observed_motor_total", "total": "observed_total"}
+    obs_col = _ct_map.get(count_target, "observed_total")
 
     assign_cfg = cfg.get("assignment") or {}
     bpr_cfg = assign_cfg.get("bpr") or {}
     daily_cap_factor = resolve_daily_cap_factor_default(bpr_cfg)
 
-    print("=== MATCH DIAGNOSTICS (lightweight refresh) ===")
+    logger.info("=== MATCH DIAGNOSTICS (lightweight refresh) ===")
 
     results_path = output_dir / "assignment_results.parquet"
     if not results_path.exists():
@@ -3435,13 +3948,13 @@ def run_match_diagnostics(config_path: str | Path = "config/sim.yaml") -> None:
             vol_df["total_vehicles_tot"] = vol_df[class_tot_cols].sum(axis=1)
             vol_col = "total_vehicles_tot"
 
-    print(f"  Loaded assignment: {len(vol_df)} links, vol_col={vol_col}")
+    logger.info(f"  Loaded assignment: {len(vol_df)} links, vol_col={vol_col}")
 
     pent = load_pentlogram(cfg)
     validate_geometries_or_fail(
         pent, name="pentlogram", expected_epsg=get_metric_epsg(cfg),
     )
-    print(f"  Pentlogram: {len(pent)} segments (after cleaning)")
+    logger.info(f"  Pentlogram: {len(pent)} segments (after cleaning)")
 
     links_gdf = _load_network_links(project_dir)
     if vol_col and "link_id" in vol_df.columns:
@@ -3468,12 +3981,12 @@ def run_match_diagnostics(config_path: str | Path = "config/sim.yaml") -> None:
             valid[compare_col].values, valid[obs_col].values,
             daily_capacity_factor=daily_cap_factor,
         )
-        print(f"  Matched: {len(valid)}  R²={stats.get('r2')}  slope={stats.get('slope')}  "
+        logger.info(f"  Matched: {len(valid)}  R²={stats.get('r2')}  slope={stats.get('slope')}  "
               f"%RMSE={stats.get('pct_rmse')}  bias={stats.get('bias_pct')}%")
-        print(f"  GEH<5: {stats.get('geh_lt5_pct')}%")
+        logger.info(f"  GEH<5: {stats.get('geh_lt5_pct')}%")
 
     mq = match_quality_report(matched)
-    print(f"  Match quality: {mq['n_matched']}/{mq['n_total']} matched, "
+    logger.info(f"  Match quality: {mq['n_matched']}/{mq['n_total']} matched, "
           f"{mq['n_link_conflicts']} conflicts, "
           f"mean_dist={mq['mean_match_distance_m']}m")
-    print(f"  Done. Diagnostics CSV: {output_dir / 'matching_diagnostics.csv'}")
+    logger.info(f"  Done. Diagnostics CSV: {output_dir / 'matching_diagnostics.csv'}")

@@ -61,18 +61,12 @@ def classify_day(d: date | str, cfg: Dict[str, Any] | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 def _classify_csd_road(sil: str) -> str:
-    s = str(sil).strip().upper()
-    if s.startswith("D"):
-        return "motorway"
-    try:
-        num = int(s.replace("M", ""))
-        if num < 100:
-            return "primary"
-        if num < 400:
-            return "secondary"
-        return "tertiary"
-    except ValueError:
-        return "primary" if "M" in s else "other"
+    """Classify CSD road code to coarse class.
+
+    Delegates to the canonical implementation in calibration.py.
+    """
+    from sim.calibration import _classify_csd_road as _impl
+    return _impl(sil)
 
 
 def learn_day_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:

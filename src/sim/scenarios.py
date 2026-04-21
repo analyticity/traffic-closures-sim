@@ -12,10 +12,12 @@ the on-disk project and baseline results remain untouched.
 from __future__ import annotations
 
 import json
+import logging
+import threading
 import time
 import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -28,9 +30,14 @@ from aequilibrae.matrix import AequilibraeMatrix
 from sim.assignment import build_graph, execute_assignment, fix_node_ids
 from sim.io_project import load_config
 from sim._metrics import aggregate_daily_volumes
+from sim.scenario_state import JobStatus, transition_job
+
+logger = logging.getLogger(__name__)
 
 CLOSURE_CAPACITY = 0.001
 CLOSURE_TRAVEL_TIME = 99_999.0
+
+_SCENARIO_OUTPUT_DIR = Path("outputs/scenarios")
 
 
 # ---------------------------------------------------------------------------
@@ -83,41 +90,68 @@ def apply_scenario_to_graph(graph, scenario_links: List[Dict[str, Any]]) -> None
 @dataclass
 class ScenarioJob:
     id: str
-    status: str = "running"
+    status: JobStatus = JobStatus.QUEUED
     error: Optional[str] = None
     started_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
-    geojson: Optional[dict] = None
+    geojson_path: Optional[Path] = None
     scenario_links: List[Dict[str, Any]] = field(default_factory=list)
+    _future: Optional[Future] = field(default=None, repr=False)
 
     def elapsed(self) -> float:
         end = self.finished_at or time.time()
         return round(end - self.started_at, 1)
 
     def to_status_dict(self) -> dict:
+        # API contract: frontend expects "done" | "running" | "error" (not enum names).
+        if self.status == JobStatus.SUCCEEDED:
+            api_status = "done"
+        elif self.status in (JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.TIMED_OUT):
+            api_status = "error"
+        elif self.status == JobStatus.RUNNING:
+            api_status = "running"
+        else:
+            api_status = "running"  # QUEUED — keep polling / same UX as running
         return {
             "id": self.id,
-            "status": self.status,
+            "status": api_status,
             "error": self.error,
             "started_at": self.started_at,
             "elapsed_seconds": self.elapsed(),
         }
 
+    def load_geojson(self) -> Optional[dict]:
+        """Load result GeoJSON from disk (not kept in RAM)."""
+        if self.geojson_path and self.geojson_path.exists():
+            return json.loads(self.geojson_path.read_text(encoding="utf-8"))
+        return None
+
+    def _set_status(self, target: JobStatus) -> None:
+        self.status = transition_job(self.status, target)
+
 
 _jobs: Dict[str, ScenarioJob] = {}
+_jobs_lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=1)
 
 JOB_TTL_SECONDS = 3600
+JOB_TIMEOUT_SECONDS = 1800
 
 
 def _prune_old_jobs() -> None:
     now = time.time()
-    expired = [
-        jid for jid, j in _jobs.items()
-        if j.finished_at and (now - j.finished_at) > JOB_TTL_SECONDS
-    ]
-    for jid in expired:
-        del _jobs[jid]
+    with _jobs_lock:
+        expired = [
+            jid for jid, j in _jobs.items()
+            if j.finished_at and (now - j.finished_at) > JOB_TTL_SECONDS
+        ]
+        for jid in expired:
+            job = _jobs.pop(jid)
+            if job.geojson_path and job.geojson_path.exists():
+                try:
+                    job.geojson_path.unlink()
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +165,9 @@ def _run_scenario_worker(
 ) -> None:
     """Execute a scenario assignment in a background thread."""
     try:
+        with _jobs_lock:
+            job._set_status(JobStatus.RUNNING)
+
         project_dir = Path(cfg["project_path"])
         demand_cfg = cfg.get("demand") or {}
         calib_cfg = cfg.get("calibration") or {}
@@ -189,12 +226,21 @@ def _run_scenario_worker(
             project.close()
             mat.close()
 
-        job.geojson = _build_scenario_geojson(baseline_links_gdf, df)
-        job.status = "done"
+        geojson = _build_scenario_geojson(baseline_links_gdf, df)
+
+        _SCENARIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = _SCENARIO_OUTPUT_DIR / f"{job.id}.geojson"
+        out_path.write_text(json.dumps(geojson), encoding="utf-8")
+        job.geojson_path = out_path
+
+        with _jobs_lock:
+            job._set_status(JobStatus.SUCCEEDED)
 
     except Exception:
-        job.status = "error"
-        job.error = traceback.format_exc()
+        logger.exception("Scenario job %s failed", job.id)
+        job.error = "Scenario computation failed. Check server logs for details."
+        with _jobs_lock:
+            job._set_status(JobStatus.FAILED)
     finally:
         job.finished_at = time.time()
 
@@ -288,10 +334,28 @@ def submit_scenario(
         id=str(uuid.uuid4()),
         scenario_links=scenario_links,
     )
-    _jobs[job.id] = job
-    _executor.submit(_run_scenario_worker, job, cfg, baseline_links_gdf)
+    with _jobs_lock:
+        _jobs[job.id] = job
+    future = _executor.submit(_run_scenario_worker, job, cfg, baseline_links_gdf)
+    job._future = future
     return job
 
 
 def get_job(job_id: str) -> Optional[ScenarioJob]:
-    return _jobs.get(job_id)
+    with _jobs_lock:
+        return _jobs.get(job_id)
+
+
+def cancel_job(job_id: str) -> bool:
+    """Attempt to cancel a queued job. Returns True if cancelled."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return False
+        if job.status != JobStatus.QUEUED:
+            return False
+        if job._future and job._future.cancel():
+            job._set_status(JobStatus.CANCELLED)
+            job.finished_at = time.time()
+            return True
+    return False

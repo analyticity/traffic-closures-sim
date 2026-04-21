@@ -17,6 +17,7 @@ Public API
 """
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import warnings
@@ -30,6 +31,8 @@ from aequilibrae.matrix import AequilibraeMatrix
 from aequilibrae.paths import TrafficAssignment, TrafficClass
 
 from sim.io_project import load_config
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_daily_cap_factor_default(bpr_cfg: dict) -> float:
@@ -198,7 +201,7 @@ def _resolve_vdf_params(
             "alpha": float(bpr_parameters.get("alpha_default", bpr_parameters.get("alpha", 0.15))),
             "beta": float(bpr_parameters.get("beta_default", bpr_parameters.get("beta", 4.0))),
         }
-    return {"alpha": 0.85, "beta": 4.0}
+    return {"alpha": 0.15, "beta": 4.0}
 
 
 def _resolve_time_field(graph) -> str:
@@ -321,9 +324,9 @@ def execute_assignment(
         traffic_classes.append(tc)
         primary_tc = tc
 
-    if select_links and primary_tc is not None:
-        graph_link_ids = set(primary_tc.graph.graph["link_id"].values)
-        valid_sl: Dict[str, list] = {}
+    valid_sl: Dict[str, list] = {}
+    if select_links and traffic_classes:
+        graph_link_ids = set(traffic_classes[0].graph.graph["link_id"].values)
         for sl_name, link_list in select_links.items():
             valid_pairs = [(lid, d) for lid, d in link_list if lid in graph_link_ids]
             missing = [(lid, d) for lid, d in link_list if lid not in graph_link_ids]
@@ -336,14 +339,15 @@ def execute_assignment(
             if valid_pairs:
                 valid_sl[sl_name] = valid_pairs
         if valid_sl:
-            try:
-                primary_tc.set_select_links(valid_sl)
-            except Exception as exc:
-                warnings.warn(
-                    f"set_select_links failed: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            for tc in traffic_classes:
+                try:
+                    tc.set_select_links(valid_sl)
+                except Exception as exc:
+                    warnings.warn(
+                        f"set_select_links failed for class '{tc.name}': {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
         elif select_links:
             warnings.warn(
                 "All select-link entries have missing links — select-link analysis disabled",
@@ -380,7 +384,7 @@ def execute_assignment(
                     stacklevel=2,
                 )
             else:
-                print(f"  Assignment converged: rgap={final_rgap:.6f} in {n_iters} iterations")
+                logger.info(f"  Assignment converged: rgap={final_rgap:.6f} in {n_iters} iterations")
     except Exception as exc:
         warnings.warn(f"Could not read assignment convergence report: {exc}", RuntimeWarning, stacklevel=2)
 
@@ -406,16 +410,22 @@ def execute_assignment(
             warnings.warn(f"Could not retrieve skims ({skim_method}): {exc}", RuntimeWarning, stacklevel=2)
 
     sl_matrices: Dict[str, np.ndarray] = {}
-    if select_links and primary_tc is not None:
-        for sl_name in select_links:
-            try:
-                sl_matrices[sl_name] = primary_tc.results.select_link_od.matrix[sl_name][:, :].copy()
-            except Exception as exc:
-                warnings.warn(
-                    f"Select-link OD extraction failed for '{sl_name}': {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+    if valid_sl and traffic_classes:
+        for sl_name in valid_sl:
+            combined: Optional[np.ndarray] = None
+            for tc in traffic_classes:
+                try:
+                    m = tc.results.select_link_od.matrix[sl_name][:, :].copy()
+                    combined = m if combined is None else combined + m
+                except Exception as exc:
+                    warnings.warn(
+                        f"Select-link OD extraction failed for '{sl_name}' "
+                        f"class '{tc.name}': {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            if combined is not None:
+                sl_matrices[sl_name] = combined
 
     # --- Peak-hour volumes and LOS (for display) ---
     _enrich_with_peak_hour_and_los(df, graph)
@@ -498,28 +508,28 @@ def _run_assignment_pass(
     core_name = str(calib_cfg.get("core_name", "wd_daily"))
     cores = int(assign_cfg.get("cores", 0))
 
-    print(banner)
+    logger.info(banner)
 
-    print("\n1) Pre-flight checks ...")
+    logger.info("\n1) Pre-flight checks ...")
     renamed = fix_node_ids(project_dir)
     if renamed:
-        print(f"   Fixed {renamed} overflow node IDs")
+        logger.info(f"   Fixed {renamed} overflow node IDs")
     conn_info = _check_connectors(project_dir)
-    print(f"   Connectors: {conn_info['connectors']}, "
+    logger.info(f"   Connectors: {conn_info['connectors']}, "
           f"centroids: {conn_info['centroids']}, "
           f"connected: {conn_info['centroids_connected']}")
     if not conn_info["ok"]:
-        print("   WARNING: not all centroids reach the road network!")
+        logger.warning("   WARNING: not all centroids reach the road network!")
 
     if not matrix_path.exists():
         raise FileNotFoundError(f"OD matrix not found: {matrix_path}")
 
-    print(f"\n2) Loading matrix: {matrix_path}")
+    logger.info(f"\n2) Loading matrix: {matrix_path}")
     mat = AequilibraeMatrix()
     mat.load(str(matrix_path))
     mat.computational_view([core_name])
     total_demand = float(mat.matrix_view.sum())
-    print(f"   Core '{core_name}': {mat.zones} zones, demand={total_demand:,.0f}")
+    logger.info(f"   Core '{core_name}': {mat.zones} zones, demand={total_demand:,.0f}")
 
     gc_cfg = assign_cfg.get("generalized_cost") or {}
     gc_enabled = bool(gc_cfg.get("enabled", False))
@@ -530,7 +540,7 @@ def _run_assignment_pass(
     mc_cfg = assign_cfg.get("multi_class") or {}
     multi_classes = list(mc_cfg["classes"]) if mc_cfg.get("enabled") and "classes" in mc_cfg else None
 
-    print(f"\n3) Running {algorithm.upper()} ...")
+    logger.info(f"\n3) Running {algorithm.upper()} ...")
     project = Project()
     project.open(str(project_dir))
     try:
@@ -556,36 +566,36 @@ def _run_assignment_pass(
     tot_col = _detect_volume_col(df)
     total_vol = float(df[tot_col].sum()) if tot_col else 0.0
     note = log_volume_note or "Results"
-    print(f"\n4) {note}: {len(df)} links, vol_col={tot_col}, total={total_vol:,.0f}")
+    logger.info(f"\n4) {note}: {len(df)} links, vol_col={tot_col}, total={total_vol:,.0f}")
 
     if total_vol <= 0:
         import sqlite3 as _sq
-        print("\n   *** ZERO VOLUME — diagnostics ***")
-        print(f"   Matrix demand: {total_demand:,.0f}")
-        print(f"   Connectors OK: {conn_info['ok']}  "
+        logger.warning("\n   *** ZERO VOLUME — diagnostics ***")
+        logger.info(f"   Matrix demand: {total_demand:,.0f}")
+        logger.info(f"   Connectors OK: {conn_info['ok']}  "
               f"(connected={conn_info['centroids_connected']}/{conn_info['centroids']})")
         db = str(project_dir / "project_database.sqlite")
         cn = _sq.connect(db)
         modes = cn.execute(
             "SELECT modes, COUNT(*) FROM links WHERE link_type='centroid_connector' GROUP BY modes"
         ).fetchall()
-        print(f"   Connector modes: {modes}")
+        logger.info(f"   Connector modes: {modes}")
         bad_tt = cn.execute(
             "SELECT SUM(CASE WHEN travel_time_ab<=0 OR travel_time_ab IS NULL THEN 1 ELSE 0 END), COUNT(*) FROM links"
         ).fetchone()
-        print(f"   Links with bad travel_time: {bad_tt[0]}/{bad_tt[1]}")
+        logger.info(f"   Links with bad travel_time: {bad_tt[0]}/{bad_tt[1]}")
         cn.close()
-        print("   Likely causes: connectors not reaching road network, or centroid IDs mismatch.")
+        logger.info("   Likely causes: connectors not reaching road network, or centroid IDs mismatch.")
 
     out_path = output_dir / "assignment_results.parquet"
     df.to_parquet(str(out_path), index=False)
-    print(f"   Saved: {out_path}")
+    logger.info(f"   Saved: {out_path}")
 
     if skims is not None:
         skim_path = output_dir / "skims.aem"
         try:
             skims.export(str(skim_path))
-            print(f"   Skims saved: {skim_path}")
+            logger.info(f"   Skims saved: {skim_path}")
         except Exception as exc:
             warnings.warn(
                 f"Skim export failed ({skim_path}): {exc}. "
@@ -626,7 +636,7 @@ def run_warm_skim_assignment(config_path: str | Path = "config/sim.yaml") -> Non
 
         def _warn_to_print(message, category, filename, lineno, file=None, line=None):
             if "Assignment did NOT converge" in str(message):
-                print(f"  [info] Warm skim: {message} (acceptable for preliminary pass)")
+                logger.info(f"  [info] Warm skim: {message} (acceptable for preliminary pass)")
             else:
                 warnings.showwarning(message, category, filename, lineno, file, line)
 
@@ -678,7 +688,7 @@ def run_temporal_assignment(
     factor = get_combined_factor(date_str, period, profile)
     day_type = classify_day(date_str)
 
-    print(f"=== TEMPORAL ASSIGNMENT: {date_str} ({day_type}), period={period}, factor={factor:.3f} ===")
+    logger.info(f"=== TEMPORAL ASSIGNMENT: {date_str} ({day_type}), period={period}, factor={factor:.3f} ===")
 
     mat = AequilibraeMatrix()
     mat.load(str(matrix_path))
@@ -687,7 +697,7 @@ def run_temporal_assignment(
     # Scale matrix data in memory (do NOT save — keep original on disk)
     mat.matrix_view[:, :] = mat.matrix_view[:, :] * factor
     total_demand = float(mat.matrix_view.sum())
-    print(f"  Scaled demand: {total_demand:,.0f}")
+    logger.info(f"  Scaled demand: {total_demand:,.0f}")
 
     fix_node_ids(project_dir)
 
@@ -707,6 +717,6 @@ def run_temporal_assignment(
 
     tot_col = _detect_volume_col(df)
     total_vol = float(df[tot_col].sum()) if tot_col else 0.0
-    print(f"  Result: {len(df)} links, total_vol={total_vol:,.0f}")
+    logger.info(f"  Result: {len(df)} links, total_vol={total_vol:,.0f}")
 
     return df

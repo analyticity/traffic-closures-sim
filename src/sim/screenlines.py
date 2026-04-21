@@ -1,12 +1,13 @@
 """Screenline, cordon, and radial definitions for localized calibration.
 
 Supports three specification methods:
-- Explicit link IDs (most precise)
-- Geometry cut-line (WKT linestring, auto-detects crossing links)
+- Geometry cut-line (WKT linestring, auto-detects crossing links) -- preferred
 - Boundary polygon (GeoJSON file, for cordons)
+- Explicit link IDs (fragile fallback, breaks on network re-import)
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,6 +18,8 @@ import geopandas as gpd
 import yaml
 
 from sim._metrics import compute_geh
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -29,10 +32,13 @@ class ScreenlineDef:
     description: str = ""
     sl_type: str = "screenline"
     links: List[Tuple[int, int]] = field(default_factory=list)
+    has_explicit_links: bool = False
     geometry_wkt: Optional[str] = None
     boundary_geojson: Optional[str] = None
     observed_aadt_cars: Optional[float] = None
     observed_aadt_all: Optional[float] = None
+    attr_filter: Dict[str, str] = field(default_factory=dict)
+    expected_links: Optional[int] = None
 
 
 @dataclass
@@ -93,15 +99,24 @@ def load_screenlines(config_path: str | Path) -> List[ScreenlineDef]:
         obs_cars = e.get("observed_aadt_cars")
         obs_all = e.get("observed_aadt_all")
 
+        raw_filter = e.get("filter") or {}
+        attr_filter = {str(k): str(v) for k, v in raw_filter.items()} if isinstance(raw_filter, dict) else {}
+
+        raw_expected = e.get("expected_links")
+        expected_links = int(raw_expected) if raw_expected is not None else None
+
         result.append(ScreenlineDef(
             name=name,
             description=str(e.get("description", "")),
             sl_type=str(e.get("type", "screenline")),
             links=links,
+            has_explicit_links=bool(links),
             geometry_wkt=e.get("geometry_wkt"),
             boundary_geojson=e.get("boundary_geojson"),
             observed_aadt_cars=float(obs_cars) if obs_cars is not None else None,
             observed_aadt_all=float(obs_all) if obs_all is not None else None,
+            attr_filter=attr_filter,
+            expected_links=expected_links,
         ))
     return result
 
@@ -110,6 +125,23 @@ def load_screenlines(config_path: str | Path) -> List[ScreenlineDef]:
 # Link resolver (explicit + geometry)
 # ---------------------------------------------------------------------------
 
+def _match_attr_filter(row: pd.Series, attr_filter: Dict[str, str]) -> bool:
+    """Check if a link row matches ALL attribute filter constraints.
+
+    Each filter value may be comma-separated to allow multiple alternatives
+    (OR within a key, AND across keys).
+    """
+    for key, pattern in attr_filter.items():
+        val = row.get(key)
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            return False
+        val_str = str(val).strip().lower()
+        alternatives = [a.strip().lower() for a in pattern.split(",")]
+        if val_str not in alternatives:
+            return False
+    return True
+
+
 def resolve_screenline_links(
     sl: ScreenlineDef,
     links_gdf: gpd.GeoDataFrame,
@@ -117,38 +149,87 @@ def resolve_screenline_links(
 ) -> List[Tuple[int, int]]:
     """Resolve a screenline definition to a list of (link_id, direction) tuples.
 
-    If the screenline has explicit link IDs, returns those directly.
-    If it has a geometry (cut-line or boundary polygon), finds intersecting links.
+    If the screenline has explicit link IDs (``has_explicit_links``), returns
+    those directly.  Otherwise resolves from ``geometry_wkt`` (preferred) or
+    ``boundary_geojson`` by intersecting link geometries, optionally filtered
+    by ``attr_filter``.
     """
-    if sl.links:
+    if sl.has_explicit_links and sl.links:
         return sl.links
 
-    from shapely import wkt
+    from shapely import wkt as shapely_wkt
+    from shapely.ops import transform as shapely_transform
+    import pyproj
 
-    if links_gdf.crs is not None and links_gdf.crs.to_epsg() != metric_epsg:
-        lm = links_gdf.to_crs(epsg=metric_epsg)
-    else:
-        lm = links_gdf
+    # --- build the cut-line geometry in metric CRS --------------------------
+    geom_raw = None
+    geom_crs: Optional[int] = None
 
-    geom = None
     if sl.geometry_wkt:
-        geom = wkt.loads(sl.geometry_wkt)
+        geom_raw = shapely_wkt.loads(sl.geometry_wkt)
+        geom_crs = 4326  # WKT in YAML is always WGS84
     elif sl.boundary_geojson:
         bp = Path(sl.boundary_geojson)
         if bp.exists():
             bg = gpd.read_file(bp)
             if bg.crs is not None and bg.crs.to_epsg() != metric_epsg:
                 bg = bg.to_crs(epsg=metric_epsg)
-            geom = bg.geometry.unary_union.boundary
+            geom_raw = bg.geometry.unary_union.boundary
+            geom_crs = metric_epsg
 
-    if geom is None:
+    if geom_raw is None:
         return []
 
+    if geom_crs is not None and geom_crs != metric_epsg:
+        transformer = pyproj.Transformer.from_crs(
+            f"EPSG:{geom_crs}", f"EPSG:{metric_epsg}", always_xy=True,
+        )
+        geom_metric = shapely_transform(transformer.transform, geom_raw)
+    else:
+        geom_metric = geom_raw
+
+    # --- reproject links if needed ------------------------------------------
+    if links_gdf.crs is not None and links_gdf.crs.to_epsg() != metric_epsg:
+        lm = links_gdf.to_crs(epsg=metric_epsg)
+    else:
+        lm = links_gdf
+
+    # --- spatial intersection via sindex ------------------------------------
+    candidates = lm.sindex.query(geom_metric, predicate="intersects")
     resolved: List[Tuple[int, int]] = []
-    for _, row in lm.iterrows():
-        if row.geometry is not None and row.geometry.intersects(geom):
-            lid = int(row["link_id"])
-            resolved.append((lid, 0))
+    for idx in candidates:
+        row = lm.iloc[idx]
+        if row.geometry is None:
+            continue
+        if sl.attr_filter and not _match_attr_filter(row, sl.attr_filter):
+            continue
+        lid = int(row["link_id"])
+        resolved.append((lid, 0))
+
+    # --- expected_links validation ------------------------------------------
+    if sl.expected_links is not None and len(resolved) != sl.expected_links:
+        logger.warning(
+            "Screenline '%s': resolved %d link(s) but expected %d — check "
+            "cut-line geometry and filter (filter=%s)",
+            sl.name, len(resolved), sl.expected_links, sl.attr_filter or "none",
+        )
+
+    # --- log results --------------------------------------------------------
+    link_names = []
+    for lid, _ in resolved:
+        match = lm[lm["link_id"] == lid]
+        lname = str(match["name"].iloc[0]) if (not match.empty and "name" in match.columns) else "?"
+        link_names.append(f"{lid} ({lname})")
+    if resolved:
+        logger.info(
+            "Screenline '%s' resolved to %d link(s): %s",
+            sl.name, len(resolved), ", ".join(link_names),
+        )
+    else:
+        logger.warning(
+            "Screenline '%s' resolved to 0 links (filter=%s)",
+            sl.name, sl.attr_filter or "none",
+        )
 
     return resolved
 

@@ -1034,9 +1034,13 @@ def _closure_overlaps_period(
     period_start: str,
     period_end: str,
 ) -> bool:
-    """Check whether a closure's [start, end] overlaps [period_start, period_end]."""
+    """Check whether a closure's [start, end] overlaps [period_start, period_end].
+
+    Closures without an ``end`` date are treated as single-day events
+    (active only on their ``start`` date).
+    """
     c_start = closure.get("start") or "1900-01-01"
-    c_end = closure.get("end") or "2099-12-31"
+    c_end = closure.get("end") or c_start
     return c_start <= period_end and c_end >= period_start
 
 
@@ -1045,7 +1049,7 @@ def load_closures(
     *,
     measurement_period: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Load closures from parquet (NDIC) or legacy JSON (Police CR).
+    """Load closures from parquet or legacy JSON.
 
     Returns a list of dicts, each with at least ``lon``, ``lat``,
     ``severity`` (``"full"`` / ``"lane_reduction"`` / ``"speed_limit"``),
@@ -1284,6 +1288,127 @@ def strip_closures(
     print(f"  Stripped closures: restored {restored} links to pre-closure values")
     print(f"  Re-exported network to {outputs_dir}")
 
+    # Re-run assignment on the restored (closure-free) network so that
+    # assignment_results.parquet reflects the clean state shown on the map.
+    demand_cfg = cfg.get("demand") or {}
+    matrix_path = Path(demand_cfg.get("matrix_path", "data/demand/od_matrix.aem"))
+    if matrix_path.is_file():
+        print("\n=== RE-ASSIGNMENT (post strip-closures) ===")
+        from sim.assignment import run_assignment
+        run_assignment(config_path)
+    else:
+        print(f"  WARNING: OD matrix not found at {matrix_path} — skipping post-strip re-assignment")
+        print("  The map will show stale volumes computed with closures still active.")
+
+
+def swap_db_closures(
+    config_path: str | Path = "config/sim.yaml",
+    measurement_period: Optional[Dict[str, str]] = None,
+) -> int:
+    """Strip existing closures from the DB and optionally apply new ones.
+
+    This manipulates the AequilibraE SQLite ``links`` table directly:
+
+    1. If ``_preclosure_*`` columns exist, restore original values (strip).
+    2. If *measurement_period* is given, load closures filtered to that
+       window and apply them (setting ``_preclosure_*`` for future revert).
+
+    Returns the number of closures applied (0 when stripping only).
+    """
+    cfg = load_config(config_path)
+    project_dir = Path(cfg["project_path"])
+    db_path = resolve_project_database_path(project_dir)
+    if not db_path.is_file():
+        print(f"  swap_db_closures: DB not found at {db_path}")
+        return 0
+
+    # --- Step 1: strip existing closures ---
+    conn = sqlite3.connect(str(db_path))
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(links)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    preclosure_cols = {
+        "_preclosure_capacity_ab", "_preclosure_capacity_ba",
+        "_preclosure_speed_ab", "_preclosure_speed_ba",
+    }
+    if preclosure_cols.issubset(existing_cols):
+        cur.execute(
+            "UPDATE links SET "
+            "  capacity_ab = _preclosure_capacity_ab, "
+            "  capacity_ba = _preclosure_capacity_ba, "
+            "  speed_ab = _preclosure_speed_ab, "
+            "  speed_ba = _preclosure_speed_ba, "
+            "  travel_time_ab = CASE WHEN _preclosure_speed_ab > 0 "
+            "    THEN distance * 3.6 / _preclosure_speed_ab ELSE travel_time_ab END, "
+            "  travel_time_ba = CASE WHEN _preclosure_speed_ba > 0 "
+            "    THEN distance * 3.6 / _preclosure_speed_ba ELSE travel_time_ba END "
+            "WHERE _preclosure_capacity_ab IS NOT NULL"
+        )
+        restored = cur.rowcount
+        for col in preclosure_cols:
+            try:
+                cur.execute(f"ALTER TABLE links DROP COLUMN {col}")
+            except Exception:
+                pass
+        conn.commit()
+        print(f"  swap_db_closures: stripped closures from {restored} links")
+    else:
+        print("  swap_db_closures: no existing closures to strip")
+    conn.close()
+
+    if measurement_period is None:
+        return 0
+
+    # --- Step 2: apply closures for the given period ---
+    bc_cfg = cfg.get("baseline_closures") or {}
+    source_path = Path(bc_cfg.get("source_path", "data/cache/closures.parquet"))
+    closures = load_closures(source_path, measurement_period=measurement_period)
+    if not closures:
+        print(f"  swap_db_closures: no closures for period {measurement_period}")
+        return 0
+
+    project = Project()
+    project.open(str(project_dir))
+    try:
+        links = project.network.links.data.copy()
+        crs_epsg = get_metric_epsg(cfg)
+        links_gdf = gpd.GeoDataFrame(links, geometry="geometry", crs=crs_epsg)
+        links_gdf = apply_baseline_closures(links_gdf, closures, cfg)
+
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(links)")
+        existing = {row[1] for row in cur.fetchall()}
+        for pcol in preclosure_cols:
+            if pcol not in existing:
+                cur.execute(f"ALTER TABLE links ADD COLUMN {pcol} REAL")
+        for _, row in links_gdf.iterrows():
+            cur.execute(
+                "UPDATE links SET capacity_ab=?, capacity_ba=?, speed_ab=?, speed_ba=?, "
+                "travel_time_ab=?, travel_time_ba=?, "
+                "_preclosure_capacity_ab=?, _preclosure_capacity_ba=?, "
+                "_preclosure_speed_ab=?, _preclosure_speed_ba=? "
+                "WHERE link_id=?",
+                (
+                    float(row["capacity_ab"]), float(row["capacity_ba"]),
+                    float(row["speed_ab"]), float(row["speed_ba"]),
+                    float(row["travel_time_ab"]), float(row["travel_time_ba"]),
+                    float(row.get("_preclosure_capacity_ab", row["capacity_ab"])),
+                    float(row.get("_preclosure_capacity_ba", row["capacity_ba"])),
+                    float(row.get("_preclosure_speed_ab", row["speed_ab"])),
+                    float(row.get("_preclosure_speed_ba", row["speed_ba"])),
+                    int(row["link_id"]),
+                ),
+            )
+        conn.commit()
+        conn.close()
+    finally:
+        project.close()
+
+    n = len(closures)
+    print(f"  swap_db_closures: applied {n} closures for period {measurement_period}")
+    return n
+
 
 def normalize_and_export_network(
     config_path: str | Path = "config/sim.yaml",
@@ -1362,7 +1487,7 @@ def normalize_and_export_network(
         bc_cfg = cfg.get("baseline_closures") or {}
         if bc_cfg.get("enabled", False):
             print("\n=== BASELINE CLOSURES ===")
-            source_path = Path(bc_cfg.get("source_path", "data/cache/closures_snapshot.json"))
+            source_path = Path(bc_cfg.get("source_path", "data/cache/closures.parquet"))
             closures = load_closures(
                 source_path,
                 measurement_period=bc_cfg.get("measurement_period"),

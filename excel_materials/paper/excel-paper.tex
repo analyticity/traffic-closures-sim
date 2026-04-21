@@ -1,0 +1,151 @@
+\documentclass{ExcelAtFIT}
+%\documentclass[czech]{ExcelAtFIT} % when writing in CZECH
+%\documentclass[slovak]{ExcelAtFIT} % when writing in SLOVAK
+
+%--------------------------------------------------------
+%	REVIEW vs. FINAL VERSION
+%--------------------------------------------------------
+%   UNCOMMENT this line to get the FINAL VERSION
+\ExcelFinalCopy
+
+%--------------------------------------------------------
+%	PDF CUSTOMIZATION
+%--------------------------------------------------------
+\hypersetup{
+	pdftitle={Analysis of the Impact of Traffic Closures on Transport Using Simulations},
+	pdfauthor={Adam Kaňkovský},
+	pdfkeywords={traffic simulation, road closure, what-if analysis, macroscopic model, AequilibraE, open data}
+}
+
+\lstset{
+	backgroundcolor=\color{white},
+	basicstyle=\footnotesize\tt,
+}
+
+%--------------------------------------------------------
+%	ARTICLE INFORMATION
+%--------------------------------------------------------
+\ExcelYear{2026}
+
+\PaperTitle{Analysis of the Impact of Traffic Closures on Transport Using Simulations}
+
+\Authors{Adam Kaňkovský*}
+\affiliation{*%
+  \href{mailto:xkanko00@stud.fit.vutbr.cz}{xkanko00@stud.fit.vutbr.cz},
+  \textit{Faculty of Information Technology, Brno University of Technology}}
+
+%--------------------------------------------------------
+%	ABSTRACT
+%--------------------------------------------------------
+\Abstract{
+Traffic closures redistribute flows network-wide, but predicting congestion spillover requires simulation.
+This work presents an open-source, 16-step pipeline that builds, calibrates, and interactively analyzes a macroscopic traffic model of Brno using exclusively open data---OpenStreetMap, Czech census SLDB~2021, and national traffic counts CSD~2025.
+Over 6 ODME calibration iterations the model achieves $-2.45\%$ overall volume bias against 2\,289 count stations.
+A non-destructive scenario engine with a React/Leaflet frontend enables real-time What-If closure analysis with per-link delta visualization.
+}
+
+%--------------------------------------------------------
+\begin{document}
+
+\startdocument
+
+%--------------------------------------------------------
+%	CONTENTS
+%--------------------------------------------------------
+
+\section{Introduction}
+
+Traffic closures---for construction, events, or emergencies---cause cascading congestion far from the closure site.
+Planners need tools that quantify \emph{where} and \emph{how much} traffic redistributes.
+Classical macroscopic models~\cite{Ortuzar2011,Sheffi1985} can answer this, but building one from scratch for a specific city is labor-intensive and typically locked behind commercial software.
+
+This work presents a fully reproducible pipeline for macroscopic traffic simulation of Brno (CZ), built on the open-source AequilibraE framework~\cite{AequilibraE} and driven entirely by open data.
+The pipeline (\fbox{Figure~1} on the poster) proceeds in five phases: \emph{network construction} from OpenStreetMap~\cite{OSM}, \emph{zoning and supernetwork} for external demand, \emph{demand synthesis} from census commuting data~\cite{SLDB2021}, \emph{calibration} against local and national counts~\cite{CSD2025}, and \emph{serving} with an interactive scenario engine.
+
+Key implementation decisions diverge from a textbook Four-Step Model~\cite{Ortuzar2011}: demand is not generated via gravity/IPF but directly disaggregated from census data; through-traffic is data-driven from a contracted national graph; and calibration uses a Spiess-style ODME~\cite{Cascetta2009} rather than simple scaling.
+The contributions are:
+\begin{itemize}
+  \item Reproducible 16-step open-source pipeline using only open datasets.
+  \item National supernetwork for data-driven through-traffic classification.
+  \item Spiess-style ODME calibration with select-link screenlines and gateway damping.
+  \item Non-destructive scenario engine for interactive What-If analysis.
+  \item Rich diagnostic API: corridor explanation, bias clustering, through-traffic overlay.
+\end{itemize}
+
+
+\section{Network and Zoning}
+
+The road network (\fbox{Figure~2}) is imported from OpenStreetMap for Brno with a 2\,km buffer, filtered to car-drivable links (52\,k links, 47\,k nodes), and reduced to the largest connected component.
+An urban-core trim removes peripheral links while preserving motorway tentacles that connect to gateways.
+Novel repairs include SCC boundary repair (59 one-way motorway links made bidirectional) and divided highway dead-end repair (4 carriageway pairs connected via synthetic links on D1, D2, and D52).
+Attribute normalization fills speed, lanes, and capacity from per-link-type defaults; BPR volume-delay parameters~\cite{Barcelo2010} are consumed at assignment time.
+
+Zoning produces 219 Traffic Analysis Zones: 191 internal zones from OSM \texttt{admin\_level=9} (Brno-město + Brno-venkov) and 28 synthetic external gateway zones.
+Gateways are discovered from a whitelist (D1, D2, I/43, I/50, I/52, I/23, I/385, 602) supplemented by auto-discovered secondary boundary roads.
+Class-aware merging prevents collapsing motorway and secondary gateways that are spatially close.
+Each zone receives up to 6 diverse centroid connectors selected by sector-based spatial coverage.
+
+
+\section{Supernetwork and Demand}
+
+The \emph{supernetwork} (\fbox{Figure~3}) is a contracted national graph built from \texttt{czech-republic-latest.osm.pbf}.
+It classifies 6\,117 external places into 9 eligible gateways using shortest-path routing with a detour filter (ratio $\leq 1.25$, extra $\leq 18$\,min), yielding 68 through-traffic gateway pairs carrying approximately 73\,k vehicles/day.
+
+Demand is \textbf{not} a classical gravity model.
+SLDB~2021 commuting microdata~\cite{SLDB2021} is directly disaggregated to zones via fuzzy Czech toponym matching (Levenshtein + diacritics stripping) and hub groups (\emph{Brno} maps to 31 internal zones weighted by area).
+Work trips use car share 0.60, occupancy 1.25; school trips 0.25/1.30.
+Bidirectional period splits (AM/IP/PM/EV) produce time-of-day matrices.
+The final OD matrix totals 765\,k daily vehicles: 692\,k from SLDB commuting and 73\,k from supernetwork through-traffic.
+
+
+\section{Calibration}
+
+Calibration (\fbox{Figure~8}, \fbox{Table~1}) uses a Spiess-style gradient ODME~\cite{Cascetta2009}: the lower level is an AequilibraE Biconjugate Frank-Wolfe equilibrium assignment with BPR volume-delay functions; the upper level minimizes a weighted sum of squared count residuals.
+Select-link OD matrices from 11 screenlines steer the gradient, with a damped global residual correction (factor 0.4) and per-gateway calibration with elasticity bounds $[\text{seed}/3,\; 3 \cdot \text{seed}]$.
+
+Count data comes from 2\,289 pentlogram stations (Brno local counts, 2024) matched to network links using composite scoring (0.3\,distance + 0.3\,bearing + 0.2\,road class + 0.2\,volume hint).
+Over 6 ODME iterations, overall bias converges to $-2.45\%$ (modeled 28.5M vs.\ observed 29.2M) and maximum screenline deviation drops from 108\% to 89\%.
+
+
+\section{Scenario Engine}
+
+The scenario engine (\fbox{Figure~4}) is \emph{non-destructive}: only the in-memory AequilibraE graph is modified, leaving baseline project files untouched.
+Users select links on the interactive Leaflet map (\fbox{Figure~5}) and choose:
+\begin{itemize}
+  \item \textbf{Full closure}: capacity $\leftarrow 0.001$, travel time $\leftarrow 99\,999$\,s.
+  \item \textbf{Lane reduction}: capacity $\leftarrow$ capacity $\times$ (remaining\,/\,total).
+\end{itemize}
+The modified graph is assigned in a single-worker thread pool.
+The delta GeoJSON output (\fbox{Figure~7}) contains per-link volume, V/C, and travel time deltas, rendered as a diverging red--blue color scale filtered to $|\Delta\text{vol}| \geq 50$.
+\fbox{Figure~6} shows the interactive scenario panel with closure controls.
+
+
+\section{Diagnostics}
+
+The diagnostic API provides four tools beyond standard validation (\fbox{Figures~9--10}):
+\begin{itemize}
+  \item \textbf{Corridor explanation} (\fbox{Figure~9}): compares free-flow shortest path vs.\ a penalized ``forced through corridor'' path, reporting time/distance deltas with an intersection delay heuristic (signalized 20\,s, minor 6\,s).
+  \item \textbf{Bias clustering}: DBSCAN spatial clustering of count station bias markers to identify systematic over-/under-estimation regions.
+  \item \textbf{Through-traffic overlay} (\fbox{Figure~10}): links colored by external-through proportion with gateway markers and screenline overlays.
+  \item \textbf{Route comparison}: zone-to-zone shortest paths overlaid with matched count stations.
+\end{itemize}
+
+
+\section{Conclusions}
+
+The pipeline produces a working macroscopic model of Brno from fully open data in a single deterministic run.
+The non-destructive scenario engine allows rapid What-If exploration of closures and lane reductions with per-link delta visualization.
+Future work targets dynamic (time-dependent) assignment, live closure feed integration from NDIC, and improved calibration toward FHWA GEH$<$5\% thresholds.
+
+
+\section*{Acknowledgements}
+I would like to thank my supervisor Ing.\ Magdaléna Ondrušková for her guidance throughout this work.
+
+%--------------------------------------------------------
+%	REFERENCES
+%--------------------------------------------------------
+\phantomsection
+\bibliographystyle{unsrt}
+\bibliography{bibliography}
+
+\end{document}

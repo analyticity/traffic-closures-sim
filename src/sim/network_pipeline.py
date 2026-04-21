@@ -20,6 +20,49 @@ from shapely.geometry import box
 from sim.aequilibrae_paths import resolve_project_database_path
 from sim.io_project import get_metric_epsg, load_config
 
+# Palette for PNG map exports (thesis UI / print).
+# Full set: #000000 #3A4442 #423E3A #545454 #5E6762 #70747D #878D85 #A6A6A6 #B2B4AB #DFDCD3 #E8E4D9 #FFFFFF
+NETWORK_MAP_PALETTE = {
+    "figure": "#FFFFFF",
+    "title": "#000000",
+    "links_before": "#70747D",
+    "links_after": "#545454",
+    "bbox": "#3A4442",
+}
+
+# Print-oriented exports (~15 in × 400 DPI ≈ 6000 px edge — fine for ~¼ A1 at 300 DPI)
+NETWORK_MAP_EXPORT_DPI = 400
+NETWORK_MAP_EXPORT_FIGSIZE: Tuple[float, float] = (15.0, 15.0)
+
+
+def _save_network_links_map_png(
+    links_gdf: gpd.GeoDataFrame,
+    bbox_gdf: gpd.GeoDataFrame,
+    png_path: Path,
+    *,
+    title: str,
+    links_color: str,
+    dpi: int = NETWORK_MAP_EXPORT_DPI,
+    figsize: Tuple[float, float] = NETWORK_MAP_EXPORT_FIGSIZE,
+) -> None:
+    """Render links + bbox frame; used for maps_dir before/after snapshots."""
+    fig, ax = plt.subplots(figsize=figsize, facecolor=NETWORK_MAP_PALETTE["figure"])
+    ax.set_facecolor(NETWORK_MAP_PALETTE["figure"])
+    title_pt = max(14.0, min(24.0, figsize[0] * 1.05))
+    links_gdf.plot(ax=ax, color=links_color, linewidth=0.25, zorder=1)
+    bbox_gdf.boundary.plot(ax=ax, color=NETWORK_MAP_PALETTE["bbox"], linewidth=3.5, zorder=3)
+    ax.set_title(title, color=NETWORK_MAP_PALETTE["title"], fontsize=title_pt)
+    ax.set_axis_off()
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(
+        png_path,
+        dpi=dpi,
+        bbox_inches="tight",
+        facecolor=NETWORK_MAP_PALETTE["figure"],
+        pad_inches=0.05,
+    )
+    plt.close(fig)
+
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -1146,7 +1189,9 @@ def build_network_from_osm(
             print(f"⚠ could not check network extent vs buffer ({e}), keeping existing network")
 
     # --- Build network (only if empty) ---
+    osm_imported_this_run = False
     if links_before == 0 or nodes_before == 0:
+        osm_imported_this_run = True
         if bbox_cfg:
             west, south, east, north = [float(x) for x in bbox_cfg]
             model_area = box(west, south, east, north)
@@ -1169,6 +1214,37 @@ def build_network_from_osm(
         bbox_native = compute_bbox_from_links_raw(project)
         bbox_wgs84_used = None
         print("Network extent bbox (native):", bbox_native)
+
+    out_dir = Path(outputs_dir)
+    _ensure_dir(out_dir)
+
+    # Raw-import map only when OSM was pulled this run (otherwise DB already processed).
+    if osm_imported_this_run:
+        try:
+            links_df_pre = project.network.links.data
+            if len(links_df_pre) > 0 and "geometry" in links_df_pre.columns:
+                links_gdf_pre = gpd.GeoDataFrame(
+                    links_df_pre, geometry="geometry", crs=getattr(links_df_pre, "crs", None)
+                )
+                bbox_pre = compute_bbox_from_links_raw(project)
+                bbox_poly_pre = box(*bbox_pre)
+                bbox_gdf_pre = gpd.GeoDataFrame({"geometry": [bbox_poly_pre]}, crs=links_gdf_pre.crs)
+                png_before = out_dir / "links_native_before_processing.png"
+                _save_network_links_map_png(
+                    links_gdf_pre,
+                    bbox_gdf_pre,
+                    png_before,
+                    title="Network after OSM import (before filters & trim)",
+                    links_color=NETWORK_MAP_PALETTE["links_before"],
+                )
+                print(f"Wrote (pre-processing map): {png_before}")
+        except Exception as e:
+            print(f"⚠ could not write pre-processing map ({e})")
+    else:
+        print(
+            "Skipping links_native_before_processing.png (network loaded from existing project; "
+            "delete project DB to regenerate fresh OSM import snapshot)"
+        )
 
     trim_stats = {"nodes_deleted": 0, "links_deleted": 0}
 
@@ -1251,9 +1327,6 @@ def build_network_from_osm(
     print("OSM enrichment:", enrich_stats)
 
     # --- Visual verification artifacts ---
-    out_dir = Path(outputs_dir)
-    _ensure_dir(out_dir)
-
     links_n = project.network.count_links()
     nodes_n = project.network.count_nodes()
 
@@ -1290,15 +1363,14 @@ def build_network_from_osm(
     bbox_poly_native = box(*bbox_native)
     bbox_gdf_native = gpd.GeoDataFrame({"geometry": [bbox_poly_native]}, crs=links_gdf_native.crs)
 
-    # Plot in native coords
-    fig, ax = plt.subplots(figsize=(10, 10))
-    links_gdf_native.plot(ax=ax, linewidth=0.2, zorder=1)
-    bbox_gdf_native.boundary.plot(ax=ax, linewidth=3.0, zorder=3)
-    ax.set_title("AequilibraE links + reference bbox (native)")
-    ax.set_axis_off()
     png_path_native = out_dir / "links_native.png"
-    fig.savefig(png_path_native, dpi=200, bbox_inches="tight")
-    plt.close(fig)
+    _save_network_links_map_png(
+        links_gdf_native,
+        bbox_gdf_native,
+        png_path_native,
+        title="AequilibraE links + reference bbox (native)",
+        links_color=NETWORK_MAP_PALETTE["links_after"],
+    )
 
     # Export GeoJSON (native coords)
     geojson_path_native = out_dir / "links_native.geojson"
@@ -1334,14 +1406,14 @@ def build_network_from_osm(
         bbox_wgs84 = None
 
     if wgs_ok and links_wgs84 is not None and bbox_wgs84 is not None:
-        fig, ax = plt.subplots(figsize=(10, 10))
-        links_wgs84.plot(ax=ax, linewidth=0.2, zorder=1)
-        bbox_wgs84.boundary.plot(ax=ax, linewidth=3.0, zorder=3)
-        ax.set_title("AequilibraE links + bbox (WGS84, best-effort)")
-        ax.set_axis_off()
         png_path_wgs84 = out_dir / "links_wgs84.png"
-        fig.savefig(png_path_wgs84, dpi=200, bbox_inches="tight")
-        plt.close(fig)
+        _save_network_links_map_png(
+            links_wgs84,
+            bbox_wgs84,
+            png_path_wgs84,
+            title="AequilibraE links + bbox (WGS84, best-effort)",
+            links_color=NETWORK_MAP_PALETTE["links_after"],
+        )
 
         geojson_path_wgs84 = out_dir / "links_wgs84.geojson"
         bbox_geojson_path_wgs84 = out_dir / "model_bbox_wgs84.geojson"

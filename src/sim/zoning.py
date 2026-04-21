@@ -23,6 +23,11 @@ from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import nearest_points
 
 from sim.io_project import load_config
+from sim.network_pipeline import (
+    NETWORK_MAP_EXPORT_DPI,
+    NETWORK_MAP_EXPORT_FIGSIZE,
+    NETWORK_MAP_PALETTE,
+)
 from sim.zoning_sources import load_zones_from_sources
 from sim.zoning_sources.shared import remove_overlaps_by_priority
 
@@ -412,6 +417,45 @@ def _point_is_too_close(pt: Point, occupied_points: List[Any], min_sep_m: float 
     return False
 
 
+def _population_needs_remap(pop_path: Path) -> bool:
+    """Return True when zone_population.parquet exists but has only the no_zones fallback."""
+    try:
+        df = pd.read_parquet(pop_path)
+        if df.empty or "zone_id" not in df.columns:
+            return True
+        return bool((df["zone_id"] == 0).all())
+    except Exception:
+        return True
+
+
+def _ensure_zone_population(
+    cfg: dict, pop_path: Path, zones_geojson: Path,
+) -> Path:
+    """Regenerate zone_population.parquet if the raw CSV is available and
+    the current parquet is missing or contains the no_zones fallback."""
+    if pop_path.exists() and not _population_needs_remap(pop_path):
+        return pop_path
+
+    pop_source = (
+        cfg.get("datasets", {}).get("sources", {})
+        .get("population_sldb2021", {}).get("out_path", "")
+    )
+    pop_csv = Path(pop_source) if pop_source else Path()
+    if not pop_csv.exists():
+        return pop_path
+
+    from sim.fetch_datasets import preprocess_population_sldb2021
+
+    print("  [auto] regenerating zone_population.parquet with real zone IDs …")
+    preprocess_population_sldb2021(
+        pop_csv,
+        pop_path,
+        zones_geojson=zones_geojson if zones_geojson.exists() else None,
+        cfg=cfg,
+    )
+    return pop_path
+
+
 def _row_is_external(row: pd.Series) -> bool:
     val = row.get("is_external", 0)
     if pd.isna(val):
@@ -652,6 +696,7 @@ def calculate_centroids(zones: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             "zone_id",
             "name",
             "source_rank",
+            "source_place",
             "is_external",
             "gateway_name",
             "anchor_node_id",
@@ -1341,6 +1386,65 @@ def _build_external_gateway_zones_from_boundary_meta(
 # Map export (zones over network + AOI highlighted)
 # ----------------------------
 
+# Zone map: outline-only polygons. Colors aligned with scripts/create_pipeline_diagram.py accents.
+_PIPELINE_ZONE_EDGE = "#148F77"
+_PIPELINE_NET_FG = "#3A4442"
+_PIPELINE_BRNO_MESTO_ORANGE = "#CA6F1E"
+_PIPELINE_EXIT_PURPLE = "#8E44AD"
+
+_DISTRICT_BRNO_OUTLINE: Dict[str, str] = {
+    "Brno-město": _PIPELINE_BRNO_MESTO_ORANGE,
+    "Brno-venkov": _PIPELINE_ZONE_EDGE,
+}
+_DISTRICT_FALLBACK_OUTLINE: List[str] = [
+    _PIPELINE_BRNO_MESTO_ORANGE,
+    _PIPELINE_ZONE_EDGE,
+    _PIPELINE_NET_FG,
+]
+
+
+def _short_district_label(raw: Any) -> str:
+    """Short legend text; recognizes Brno districts from OSM ``place`` strings."""
+    s = str(raw).strip()
+    sl = s.lower()
+    if "brno-město" in sl or "brno-mesto" in sl:
+        return "Brno-město"
+    if "brno-venkov" in sl:
+        return "Brno-venkov"
+    if len(s) <= 44:
+        return s
+    return s[:41] + "…"
+
+
+def _prepare_internal_district_groups(internal_z: gpd.GeoDataFrame) -> List[Tuple[str, gpd.GeoDataFrame, str]]:
+    """
+    Split internal zones by ``source_place`` when present, else by ``source_rank``.
+    Returns list of (legend_label, subset_gdf, outline_hex) — polygons are drawn **outline only**.
+    """
+    if internal_z.empty:
+        return []
+
+    has_place = "source_place" in internal_z.columns and bool(internal_z["source_place"].notna().any())
+    work = internal_z.copy()
+    if has_place:
+        work["_dkey"] = work["source_place"].fillna(work["source_rank"].astype(str)).astype(str)
+    else:
+        work["_dkey"] = work["source_rank"].astype(str)
+
+    order = work.groupby("_dkey")["source_rank"].min().sort_values()
+    out: List[Tuple[str, gpd.GeoDataFrame, str]] = []
+    for i, key in enumerate(order.index.tolist()):
+        sub = work[work["_dkey"] == key].drop(columns=["_dkey"], errors="ignore")
+        short = _short_district_label(key)
+        if has_place and short in _DISTRICT_BRNO_OUTLINE:
+            edge = _DISTRICT_BRNO_OUTLINE[short]
+        else:
+            edge = _DISTRICT_FALLBACK_OUTLINE[i % len(_DISTRICT_FALLBACK_OUTLINE)]
+        label = _short_district_label(key) if has_place else f"Internal zones (source rank {key})"
+        out.append((label, sub, edge))
+    return out
+
+
 def export_map_png(
     project: Project,
     zones: gpd.GeoDataFrame,
@@ -1349,7 +1453,7 @@ def export_map_png(
     output_dir: Path,
     filename: str = "zones_map.png",
     title_suffix: str = "",
-    dpi: int = 250,
+    dpi: Optional[int] = None,
     debug_corridors: Optional[gpd.GeoDataFrame] = None,
     debug_points: Optional[gpd.GeoDataFrame] = None,
     *,
@@ -1362,6 +1466,10 @@ def export_map_png(
     except ImportError:
         print("⚠ matplotlib not installed — skipping map export")
         return
+
+    out_dpi = int(dpi) if dpi is not None else NETWORK_MAP_EXPORT_DPI
+    fig_w, fig_h = NETWORK_MAP_EXPORT_FIGSIZE
+    title_pt = max(14.0, min(24.0, float(fig_w) * 1.05))
 
     if zones.empty:
         print("⚠ no zones — skipping map export")
@@ -1423,49 +1531,145 @@ def export_map_png(
 
     aoi_gdf = gpd.GeoDataFrame({"geometry": [model_area_bbox]}, crs=f"EPSG:{target_epsg}")
 
-    fig, ax = plt.subplots(1, 1, figsize=(16, 16))
+    fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h), facecolor=NETWORK_MAP_PALETTE["figure"])
+    ax.set_facecolor(NETWORK_MAP_PALETTE["figure"])
 
-    links_gdf.plot(ax=ax, color="dimgray", linewidth=0.8, alpha=0.9, zorder=1)
+    # AOI wash (keep light — road overlay reads on top later)
+    aoi_gdf.plot(ax=ax, color="#DFDCD3", alpha=0.22, zorder=1)
 
-    aoi_gdf.plot(ax=ax, color="gold", alpha=0.08, zorder=2)
-    aoi_gdf.boundary.plot(ax=ax, color="goldenrod", linewidth=3.0, zorder=10)
+    district_groups = _prepare_internal_district_groups(internal_zones)
+    legend_internal_patches: List[Any] = []
+    legend_centroid_lines: List[Any] = []
 
-    if not internal_zones.empty:
-        internal_zones.plot(
+    _link_overlay_color = "#141414"
+    _link_overlay_lw = 0.72
+
+    for label, sub_z, edge in district_groups:
+        if sub_z.empty:
+            continue
+        sub_z.plot(
             ax=ax,
-            facecolor="lightblue",
-            edgecolor="navy",
-            alpha=0.35,
-            linewidth=1.0,
+            facecolor="none",
+            edgecolor=edge,
+            linewidth=2.85,
+            alpha=1.0,
             zorder=3,
         )
+        legend_internal_patches.append(
+            Patch(
+                facecolor="none",
+                edgecolor=edge,
+                linewidth=2.85,
+                label=f"{label} ({len(sub_z)})",
+            ),
+        )
 
+    # Synthetic exit polygons (often empty — gateways are centroid-only); outline only.
     if not external_zones.empty:
         external_zones.plot(
             ax=ax,
-            facecolor="mistyrose",
-            edgecolor="darkred",
-            alpha=0.55,
-            linewidth=1.2,
-            zorder=4,
+            facecolor="none",
+            edgecolor=_PIPELINE_EXIT_PURPLE,
+            linewidth=3.25,
+            alpha=1.0,
+            zorder=5,
         )
 
-    if not internal_centroids.empty:
+    # Road network above zone outlines so links remain readable everywhere
+    links_gdf.plot(
+        ax=ax,
+        color=_link_overlay_color,
+        linewidth=_link_overlay_lw,
+        alpha=0.94,
+        zorder=12,
+    )
+
+    for label, sub_z, edge in district_groups:
+        if sub_z.empty or internal_centroids.empty or "zone_id" not in internal_centroids.columns:
+            continue
+        zids = sub_z["zone_id"]
+        cent_sub = internal_centroids[internal_centroids["zone_id"].isin(zids)]
+        if cent_sub.empty:
+            continue
+        cent_sub.plot(
+            ax=ax,
+            color=edge,
+            edgecolors=NETWORK_MAP_PALETTE["figure"],
+            linewidths=1.45,
+            markersize=30,
+            marker="o",
+            zorder=14,
+        )
+        legend_centroid_lines.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                color=edge,
+                linestyle="None",
+                markersize=8,
+                markeredgecolor=NETWORK_MAP_PALETTE["figure"],
+                markeredgewidth=1.2,
+                label=f"{label} centroids ({len(cent_sub)})",
+            ),
+        )
+
+    if district_groups and not internal_centroids.empty and "zone_id" not in internal_centroids.columns:
         internal_centroids.plot(
             ax=ax,
-            color="navy",
-            markersize=20,
+            color=_PIPELINE_NET_FG,
+            edgecolors=NETWORK_MAP_PALETTE["figure"],
+            linewidths=1.35,
+            markersize=28,
             marker="o",
-            zorder=5,
+            zorder=14,
+        )
+        legend_centroid_lines.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                color=_PIPELINE_NET_FG,
+                linestyle="None",
+                markersize=8,
+                markeredgecolor=NETWORK_MAP_PALETTE["figure"],
+                markeredgewidth=1.0,
+                label=f"Internal centroids ({len(internal_centroids)})",
+            ),
+        )
+    elif not district_groups and not internal_centroids.empty:
+        internal_centroids.plot(
+            ax=ax,
+            color=_PIPELINE_NET_FG,
+            edgecolors=NETWORK_MAP_PALETTE["figure"],
+            linewidths=1.35,
+            markersize=28,
+            marker="o",
+            zorder=14,
+        )
+        legend_centroid_lines.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                color=_PIPELINE_NET_FG,
+                linestyle="None",
+                markersize=8,
+                markeredgecolor=NETWORK_MAP_PALETTE["figure"],
+                markeredgewidth=1.0,
+                label=f"Internal centroids ({len(internal_centroids)})",
+            ),
         )
 
     if not external_centroids.empty:
         external_centroids.plot(
             ax=ax,
-            color="red",
-            markersize=45,
+            color=_PIPELINE_EXIT_PURPLE,
+            edgecolors=_PIPELINE_NET_FG,
+            linewidths=1.25,
+            markersize=56,
             marker="X",
-            zorder=6,
+            zorder=15,
         )
 
     if debug_corridors is not None and not debug_corridors.empty:
@@ -1477,10 +1681,10 @@ def export_map_png(
 
         dbg.plot(
             ax=ax,
-            color="red",
+            color="#70747D",
             linewidth=2.5,
             alpha=0.85,
-            zorder=7,
+            zorder=18,
         )
 
     if debug_points is not None and not debug_points.empty:
@@ -1496,46 +1700,103 @@ def export_map_png(
         if not terminals.empty:
             terminals.plot(
                 ax=ax,
-                color="yellow",
+                color="#5E6762",
                 markersize=35,
                 marker="o",
-                zorder=8,
+                zorder=19,
             )
 
         if not anchors.empty:
             anchors.plot(
                 ax=ax,
-                color="red",
+                color="#3A4442",
                 markersize=90,
                 marker="X",
-                zorder=9,
+                zorder=20,
             )
+
+    aoi_gdf.boundary.plot(
+        ax=ax,
+        color=NETWORK_MAP_PALETTE["bbox"],
+        linewidth=3.5,
+        zorder=22,
+    )
 
     ax.set_xlim(minx, maxx)
     ax.set_ylim(miny, maxy)
     ax.set_aspect("equal", adjustable="box")
     ax.set_title(
         f"Network + TAZ zones ({len(zones)}) + AOI{title_suffix}",
-        fontsize=16,
+        fontsize=title_pt,
         fontweight="bold",
+        color=NETWORK_MAP_PALETTE["title"],
         pad=20,
     )
 
-    legend_handles = [
-        Line2D([0], [0], color="dimgray", linewidth=2.0, label="Network"),
-        Patch(facecolor="lightblue", edgecolor="navy", alpha=0.35, label=f"Internal zones ({len(internal_zones)})"),
-        Patch(facecolor="mistyrose", edgecolor="darkred", alpha=0.55, label=f"Exit zones ({len(external_zones)})"),
-        Line2D([0], [0], marker="o", color="navy", linestyle="None", markersize=8, label=f"Internal centroids ({len(internal_centroids)})"),
-        Line2D([0], [0], marker="X", color="red", linestyle="None", markersize=9, label=f"Exit centroids ({len(external_centroids)})"),
-        Patch(facecolor="gold", edgecolor="goldenrod", alpha=0.08, label="AOI"),
+    legend_handles: List[Any] = [
+        Line2D(
+            [0],
+            [0],
+            color=_link_overlay_color,
+            linewidth=3.0,
+            label="Network (overlay)",
+        ),
     ]
-    ax.legend(handles=legend_handles, loc="upper right", framealpha=0.95)
+    legend_handles.extend(legend_internal_patches)
+    if not external_zones.empty:
+        legend_handles.append(
+            Patch(
+                facecolor="none",
+                edgecolor=_PIPELINE_EXIT_PURPLE,
+                linewidth=2.8,
+                label=f"Exit zones ({len(external_zones)})",
+            ),
+        )
+    legend_handles.extend(legend_centroid_lines)
+    if not external_centroids.empty:
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="X",
+                color=_PIPELINE_EXIT_PURPLE,
+                linestyle="None",
+                markersize=10,
+                markeredgecolor=_PIPELINE_NET_FG,
+                markeredgewidth=0.9,
+                label=f"Exit / gateway centroids ({len(external_centroids)})",
+            ),
+        )
+    legend_handles.append(
+        Patch(
+            facecolor="#DFDCD3",
+            edgecolor=NETWORK_MAP_PALETTE["bbox"],
+            alpha=0.35,
+            linewidth=1.5,
+            label="AOI",
+        ),
+    )
+
+    ax.legend(
+        handles=legend_handles,
+        loc="upper left",
+        bbox_to_anchor=(1.14, 1.02),
+        borderaxespad=0.75,
+        framealpha=0.96,
+        fontsize=max(9.5, title_pt * 0.52),
+    )
 
     ax.set_axis_off()
 
     output_dir.mkdir(parents=True, exist_ok=True)
     png_path = output_dir / filename
-    fig.savefig(png_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    fig.savefig(
+        png_path,
+        dpi=out_dpi,
+        bbox_inches="tight",
+        facecolor=NETWORK_MAP_PALETTE["figure"],
+        pad_inches=0.55,
+    )
     plt.close(fig)
     print(f"✓ map: {png_path}")
 
@@ -2339,7 +2600,11 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
             output_dir=output_dir,
             filename="zones_map_pre_connectors.png",
             title_suffix=" (pre-connectors)",
-            dpi=int(zoning_cfg.get("map_dpi", 250)),
+            dpi=(
+                int(zoning_cfg["map_dpi"])
+                if zoning_cfg.get("map_dpi") is not None
+                else None
+            ),
             debug_corridors=debug_corridors,
             debug_points=debug_points,
             crs_epsg=crs_epsg,
@@ -2373,7 +2638,13 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
             lambda z: zone_to_centroid.get(int(z), int(z))
         ).astype(int)
 
+        output_dir.mkdir(parents=True, exist_ok=True)
+        zones.to_file(output_dir / "zones.geojson", driver="GeoJSON")
+        centroids.to_file(output_dir / "centroids.geojson", driver="GeoJSON")
+
         pop_path = Path(cfg.get("datasets", {}).get("cache_dir", "data/cache")) / "zone_population.parquet"
+        pop_path = _ensure_zone_population(cfg, pop_path, output_dir / "zones.geojson")
+
         if pop_path.exists():
             pop_df = pd.read_parquet(pop_path)
             pop_map = dict(zip(pop_df["zone_id"], pop_df["population"]))
@@ -2390,12 +2661,11 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
 
             print(f"  population data loaded: {len(pop_map)} zones, total={sum(pop_map.values()):,}")
             print("  external zones exported with population=0")
-        else:
-            print(f"  [info] {pop_path} not found — population will be added after fetch-data")
 
-        output_dir.mkdir(parents=True, exist_ok=True)
-        zones.to_file(output_dir / "zones.geojson", driver="GeoJSON")
-        centroids.to_file(output_dir / "centroids.geojson", driver="GeoJSON")
+            zones.to_file(output_dir / "zones.geojson", driver="GeoJSON")
+            centroids.to_file(output_dir / "centroids.geojson", driver="GeoJSON")
+        else:
+            print(f"  [info] {pop_path} not found — run fetch-data to download population CSV")
 
         mapping_path = output_dir / "zone_centroid_mapping.json"
         mapping_path.write_text(
@@ -2418,7 +2688,11 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
             output_dir=output_dir,
             filename="zones_map.png",
             title_suffix=" (final)",
-            dpi=int(zoning_cfg.get("map_dpi", 250)),
+            dpi=(
+                int(zoning_cfg["map_dpi"])
+                if zoning_cfg.get("map_dpi") is not None
+                else None
+            ),
             crs_epsg=crs_epsg,
         )
 

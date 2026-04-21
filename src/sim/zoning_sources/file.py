@@ -70,8 +70,15 @@ def load_zones_file_source(
     else:
         name = pd.Series(["zone"] * len(g), index=g.index)
 
+    label = str(src.get("label") or path.stem)
     out = gpd.GeoDataFrame(
-        {"zone_id": zone_id, "name": name, "source_rank": rank, "geometry": g.geometry},
+        {
+            "zone_id": zone_id,
+            "name": name,
+            "source_rank": rank,
+            "source_place": label,
+            "geometry": g.geometry,
+        },
         crs=g.crs,
     )
 

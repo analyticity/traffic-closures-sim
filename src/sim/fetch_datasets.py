@@ -693,7 +693,7 @@ def preprocess_population_sldb2021(
     _ensure_dir(out_parquet.parent)
     result.to_parquet(out_parquet, index=False)
 
-    matched = len([r for r in result_rows if r["match"] != "default_avg"])
+    matched = len([r for r in result_rows if r["match"] != "default_median"])
     total_pop = int(result["population"].sum())
     return {
         "parquet": str(out_parquet),
@@ -832,6 +832,175 @@ def _postprocess_pentlogram(
     except Exception as exc:
         print(f"  WARNING: pentlogram post-processing failed: {exc}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL closures provider (replaces NDIC ArcGIS)
+# ---------------------------------------------------------------------------
+
+_PG_FULL_CLOSURE_TYPES = frozenset({"road_closed", "roadClosed"})
+_PG_LANE_REDUCTION_TYPES = frozenset({
+    "laneClosures", "narrowLanes", "singleAlternateLineTraffic", "contraflow",
+})
+
+
+def _map_pg_severity(restriction_type: str, pg_severity: str) -> str:
+    """Map PG ``restriction_type`` + ``severity`` to internal severity value."""
+    if restriction_type in _PG_FULL_CLOSURE_TYPES:
+        return "full"
+    if restriction_type in _PG_LANE_REDUCTION_TYPES:
+        return "lane_reduction"
+    severity_map = {"standstill": "full", "serious": "lane_reduction", "moderate": "speed_limit"}
+    return severity_map.get(pg_severity, "lane_reduction")
+
+
+def fetch_postgres_closures(
+    cfg: Dict[str, Any],
+    source_cfg: Dict[str, Any],
+    *,
+    force: bool = False,
+    **_kwargs: Any,
+) -> Dict[str, Any]:
+    """Fetch closure/restriction data from the PostgreSQL ``restrictions`` table.
+
+    Produces a parquet file with the same schema consumed by
+    :func:`sim.network_normalization.load_closures` (``lon``, ``lat``,
+    ``severity``, ``start``, ``end``, ``road_ref``, ``description_cs``).
+    """
+    import psycopg2
+
+    if gpd is None:
+        raise RuntimeError("geopandas is required for postgres_closures provider")
+
+    cache_dir = Path(cfg["datasets"]["cache_dir"])
+    _ensure_dir(cache_dir)
+    cache_path = cache_dir / "closures.parquet"
+
+    if cache_path.exists() and not force:
+        print(f"  Using cached {cache_path}")
+        gdf = gpd.read_parquet(cache_path)
+        return {
+            "features": int(len(gdf)),
+            "parquet": str(cache_path),
+            "closures_parquet": str(cache_path),
+            "closures_count": int(len(gdf)),
+        }
+
+    db_cfg = cfg.get("closures_db") or {}
+    conn = psycopg2.connect(
+        host=db_cfg.get("host", "REDACTED_HOST"),
+        port=int(db_cfg.get("port", 5432)),
+        dbname=db_cfg.get("dbname", "traffic"),
+        user=db_cfg.get("user", "admin"),
+        password=db_cfg.get("password", "admin"),
+    )
+
+    table = source_cfg.get("table", "restrictions")
+
+    query = f"""
+        SELECT
+            id,
+            restriction_type,
+            restriction_subtype,
+            severity       AS pg_severity,
+            status,
+            road_number,
+            street_name,
+            city,
+            description_cs,
+            max_speed_kmh,
+            valid_from,
+            valid_to,
+            first_seen,
+            last_seen,
+            ST_Y(location_point_geog::geometry) AS lat,
+            ST_X(location_point_geog::geometry) AS lon
+        FROM {table}
+        WHERE location_point_geog IS NOT NULL
+        ORDER BY id
+    """
+
+    try:
+        df = pd.read_sql(query, conn)
+    finally:
+        conn.close()
+
+    if df.empty:
+        print("  PostgreSQL closures: no rows returned")
+        return {"features": 0, "parquet": str(cache_path), "closures_count": 0}
+
+    print(f"  PostgreSQL closures: fetched {len(df)} rows")
+
+    bbox = _load_aoi_bbox_wgs84(cfg)
+    if bbox is not None:
+        w, s, e, n = bbox
+        margin = 0.02
+        before = len(df)
+        mask = (
+            (df["lon"] >= w - margin) & (df["lon"] <= e + margin)
+            & (df["lat"] >= s - margin) & (df["lat"] <= n + margin)
+        )
+        df = df[mask].copy()
+        print(f"  PostgreSQL closures: {before} total -> {len(df)} in model area")
+
+    if df.empty:
+        print("  PostgreSQL closures: no features in model area")
+        return {"features": 0, "parquet": str(cache_path), "closures_count": 0}
+
+    df["severity"] = df.apply(
+        lambda r: _map_pg_severity(
+            str(r.get("restriction_type", "")),
+            str(r.get("pg_severity", "")),
+        ),
+        axis=1,
+    )
+
+    df["road_ref"] = df["road_number"].fillna("").astype(str).str.strip()
+
+    for ts_col, fallback_col, out_col in [
+        ("valid_from", "first_seen", "start"),
+        ("valid_to", "last_seen", "end"),
+    ]:
+        primary = (
+            pd.to_datetime(df[ts_col], errors="coerce", utc=True)
+            if ts_col in df.columns
+            else pd.Series(pd.NaT, index=df.index)
+        )
+        fallback = (
+            pd.to_datetime(df[fallback_col], errors="coerce", utc=True)
+            if fallback_col in df.columns
+            else pd.Series(pd.NaT, index=df.index)
+        )
+        merged = primary.fillna(fallback)
+        df[out_col] = merged.dt.strftime("%Y-%m-%d").fillna("")
+
+    if "description_cs" not in df.columns:
+        df["description_cs"] = ""
+    else:
+        df["description_cs"] = df["description_cs"].fillna("")
+
+    from shapely.geometry import Point
+
+    geometry = [Point(lon, lat) for lon, lat in zip(df["lon"], df["lat"])]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+
+    full_count = int((gdf["severity"] == "full").sum())
+    partial_count = int((gdf["severity"] == "lane_reduction").sum())
+    speed_count = int((gdf["severity"] == "speed_limit").sum())
+    print(
+        f"  PostgreSQL closures: {len(gdf)} events in model area "
+        f"({full_count} full, {partial_count} lane_reduction, {speed_count} speed_limit)"
+    )
+
+    gdf = _coerce_object_columns_for_parquet(gdf)
+    gdf.to_parquet(cache_path, index=False)
+
+    return {
+        "features": int(len(gdf)),
+        "parquet": str(cache_path),
+        "closures_parquet": str(cache_path),
+        "closures_count": int(len(gdf)),
+    }
 
 
 _NDIC_FULL_CLOSURE_KEYWORDS = (
@@ -1431,6 +1600,12 @@ def run_fetch_datasets(
                     timeout_s=timeout_s,
                     retries=retries,
                     headers=headers,
+                    force=force,
+                )
+            elif provider == "postgres_closures":
+                info = fetch_postgres_closures(
+                    cfg,
+                    scfg,
                     force=force,
                 )
             else:

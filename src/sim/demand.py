@@ -248,29 +248,43 @@ def _preflight_external_inputs(
             )
 
 
-def _load_external_gateway_lookup(
+def _load_external_gateway_lookup_directional(
     path: Path,
     gateways: Dict[str, List[Tuple[int, float]]],
-) -> Tuple[Dict[str, List[Tuple[int, float]]], Dict[str, str]]:
-    """
-    Build mapping:
-      external normalized place name -> list[(gateway_zone_id, weight)]
-    from coarse-supernetwork output.
+) -> Tuple[
+    Dict[str, List[Tuple[int, float]]],
+    Dict[str, List[Tuple[int, float]]],
+    Dict[str, str],
+    Dict[str, str],
+]:
+    """Build **directional** gateway lookup for external places.
 
-    Expected parquet columns:
-      - place_name or place_name_norm
-      - gateway_name
-      - rank (optional)
-      - route_cost_s (optional)
+    The supernetwork stores separate ``rank_in`` / ``rank_out`` and
+    ``route_cost_to_gateway_s`` / ``route_cost_from_gateway_s`` per
+    (place, gateway) pair.  A town south of Brno may enter the model
+    via D2_S (inbound) yet exit via I52_S (outbound).  Collapsing to
+    a single gateway per place loses that directional information and
+    starves some corridors of demand.
+
+    Returns
+    -------
+    inbound_members : place_norm -> [(zone_id, weight), ...]
+        Gateway zones for traffic **entering** the model (place is origin).
+    outbound_members : place_norm -> [(zone_id, weight), ...]
+        Gateway zones for traffic **leaving** the model (place is destination).
+    inbound_gateway : place_norm -> gateway_name
+    outbound_gateway : place_norm -> gateway_name
     """
+    _empty: Tuple[dict, dict, dict, dict] = ({}, {}, {}, {})
+
     if not path.exists():
         print(f"  External gateway lookup not found: {path}")
-        return {}, {}
+        return _empty
 
     df = pd.read_parquet(path)
     if df.empty:
         print(f"  External gateway lookup is empty: {path}")
-        return {}, {}
+        return _empty
 
     if "place_name_norm" not in df.columns:
         if "place_name" in df.columns:
@@ -283,35 +297,99 @@ def _load_external_gateway_lookup(
     if "gateway_name" not in df.columns:
         raise RuntimeError(f"External gateway lookup missing gateway_name: {path}")
 
-    if "rank" not in df.columns:
-        df["rank"] = 1
-    if "route_cost_s" not in df.columns:
-        df["route_cost_s"] = np.nan
-
     df["place_name_norm"] = df["place_name_norm"].astype(str).map(_norm_name)
     df["gateway_name"] = df["gateway_name"].astype(str).str.strip()
     df = df[df["place_name_norm"] != ""].copy()
     df = df[df["gateway_name"].isin(set(gateways.keys()))].copy()
     if df.empty:
         print(f"  External gateway lookup has no usable rows after filtering: {path}")
-        return {}, {}
+        return _empty
 
-    df = df.sort_values(["place_name_norm", "rank", "route_cost_s"], ascending=[True, True, True])
-    best = df.drop_duplicates(subset=["place_name_norm"], keep="first").copy()
+    has_directional = (
+        "rank_in" in df.columns and "rank_out" in df.columns
+    )
 
-    place_to_members: Dict[str, List[Tuple[int, float]]] = {}
-    place_to_gateway: Dict[str, str] = {}
+    if has_directional:
+        in_cost = "route_cost_to_gateway_s" if "route_cost_to_gateway_s" in df.columns else "route_cost_s"
+        out_cost = "route_cost_from_gateway_s" if "route_cost_from_gateway_s" in df.columns else "route_cost_s"
+    else:
+        in_cost = "route_cost_s" if "route_cost_s" in df.columns else None
+        out_cost = in_cost
 
-    for _, row in best.iterrows():
-        place_norm = str(row["place_name_norm"]).strip()
-        gateway_name = str(row["gateway_name"]).strip()
-        if not place_norm or gateway_name not in gateways:
-            continue
-        place_to_members[place_norm] = gateways[gateway_name]
-        place_to_gateway[place_norm] = gateway_name
+    def _build_weighted_members(
+        df_src: pd.DataFrame,
+        cost_col: Optional[str],
+    ) -> Tuple[Dict[str, List[Tuple[int, float]]], Dict[str, str]]:
+        """Build place -> [(zone_id, weight)] using ALL candidates with
+        cost-inverse weighting instead of picking only the best one."""
+        members: Dict[str, List[Tuple[int, float]]] = {}
+        primary_gw: Dict[str, str] = {}
 
-    print(f"  External gateway lookup loaded: {len(place_to_members)} places")
-    return place_to_members, place_to_gateway
+        if cost_col is None or cost_col not in df_src.columns:
+            return members, primary_gw
+
+        for place, grp in df_src.groupby("place_name_norm"):
+            pn = str(place).strip()
+            if not pn:
+                continue
+
+            costs = pd.to_numeric(grp[cost_col], errors="coerce").values
+            gw_names = grp["gateway_name"].values
+
+            valid_mask = np.isfinite(costs) & (costs > 0)
+            if not valid_mask.any():
+                continue
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                inv_costs = np.where(valid_mask, 1.0 / costs, 0.0)
+            total_inv = inv_costs.sum()
+            if total_inv <= 0:
+                continue
+            weights = inv_costs / total_inv
+
+            zone_list: List[Tuple[int, float]] = []
+            best_gw: Optional[str] = None
+            best_w = -1.0
+
+            for gw_name_raw, w in zip(gw_names, weights):
+                if w <= 0:
+                    continue
+                gw_name = str(gw_name_raw).strip()
+                if gw_name not in gateways:
+                    continue
+                if best_gw is None or w > best_w:
+                    best_gw = gw_name
+                    best_w = w
+                for zone_id, zone_w in gateways[gw_name]:
+                    zone_list.append((zone_id, zone_w * w))
+
+            if zone_list:
+                members[pn] = zone_list
+                primary_gw[pn] = best_gw or ""
+
+        return members, primary_gw
+
+    inbound_members, inbound_gateway = _build_weighted_members(df, in_cost)
+    outbound_members, outbound_gateway = _build_weighted_members(df, out_cost)
+
+    n_differ = sum(
+        1 for pn in inbound_gateway
+        if pn in outbound_gateway and inbound_gateway[pn] != outbound_gateway[pn]
+    )
+
+    gw_counts_in: Dict[str, int] = {}
+    for pn, zlist in inbound_members.items():
+        for gw_name in set(str(g) for g in [inbound_gateway.get(pn, "")]):
+            gw_counts_in[gw_name] = gw_counts_in.get(gw_name, 0) + 1
+    top_in = sorted(gw_counts_in.items(), key=lambda x: -x[1])
+    gw_summary = ", ".join(f"{g}={c}" for g, c in top_in[:5])
+
+    print(
+        f"  External gateway lookup loaded (multi-candidate weighted): "
+        f"{len(inbound_members)} inbound, {len(outbound_members)} outbound places "
+        f"({n_differ} differ in/out); primary gw: {gw_summary}"
+    )
+    return inbound_members, outbound_members, inbound_gateway, outbound_gateway
 
 
 def _load_through_gateway_pairs(path: Path) -> pd.DataFrame:
@@ -1010,42 +1088,48 @@ def _zone_index(zone_ids: np.ndarray) -> Dict[int, int]:
     return {int(z): i for i, z in enumerate(zone_ids)}
 
 
-def _resolve_place_candidates(
+def _resolve_place_candidates_directional(
     name: str,
     *,
     primary: Dict[str, int],
     stripped: Dict[str, int],
     groups: Dict[str, List[Tuple[int, float]]],
-    external_lookup: Dict[str, List[Tuple[int, float]]],
+    inbound_lookup: Dict[str, List[Tuple[int, float]]],
+    outbound_lookup: Dict[str, List[Tuple[int, float]]],
     gateways: Dict[str, List[Tuple[int, float]]],
     allow_legacy_fallback: bool,
-) -> Tuple[List[Tuple[int, float]], str, str]:
-    """
-    Returns:
-      candidates, mode, kind
+) -> Tuple[
+    List[Tuple[int, float]], List[Tuple[int, float]], str, str,
+]:
+    """Resolve place name to zone candidates with separate in/out gateways.
 
-    kind:
-      - internal
-      - external
-      - missing
+    Returns (inbound_candidates, outbound_candidates, mode, kind).
+    For internal places both lists are identical.
     """
     zone_id = _match_zone_id(name, primary, stripped)
     if zone_id is not None:
-        return [(zone_id, 1.0)], "direct", "internal"
+        c = [(zone_id, 1.0)]
+        return c, c, "direct", "internal"
 
     key = _norm_name(name)
     if key in groups:
-        return groups[key], "group", "internal"
+        c = groups[key]
+        return c, c, "group", "internal"
 
-    if key in external_lookup:
-        return external_lookup[key], "lookup", "external"
+    in_cands = inbound_lookup.get(key)
+    out_cands = outbound_lookup.get(key)
+    if in_cands or out_cands:
+        # Keep directions separate: empty list for missing direction means
+        # the OD loop will skip trips in that direction rather than route
+        # through the wrong gateway.
+        return in_cands or [], out_cands or [], "lookup", "external"
 
     if allow_legacy_fallback and gateways:
         cands = _assign_external_to_gateway_fallback(key, gateways)
         if cands:
-            return cands, "legacy_fallback", "external"
+            return cands, cands, "legacy_fallback", "external"
 
-    return [], "missing", "missing"
+    return [], [], "missing", "missing"
 
 
 def _build_od_cores(
@@ -1058,9 +1142,13 @@ def _build_od_cores(
     groups: Dict[str, List[Tuple[int, float]]],
     gateways: Dict[str, List[Tuple[int, float]]],
     external_lookup: Dict[str, List[Tuple[int, float]]],
+    external_lookup_out: Optional[Dict[str, List[Tuple[int, float]]]] = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
     _validate_shares(bcfg.periods, bcfg.shares_work, "weekday.work")
     _validate_shares(bcfg.periods, bcfg.shares_school, "weekday.school")
+
+    if external_lookup_out is None:
+        external_lookup_out = external_lookup
 
     z2i = _zone_index(zone_ids)
     zset = set(z2i.keys())
@@ -1087,26 +1175,32 @@ def _build_od_cores(
     if origin_col is None or dest_col is None:
         raise RuntimeError(f"Expected columns op_obec/doj_obec, got: {list(df.columns)}")
 
-    # -- Phase 1: Pre-cache name resolutions for all unique place names -----
+    # -- Phase 1: Pre-cache directional name resolutions --------------------
+    # External places need different gateway zones depending on whether they
+    # are the origin (traffic enters model -> inbound gateway) or the
+    # destination (traffic exits model -> outbound gateway).
     origin_names = df[origin_col].fillna("").astype(str).str.strip().values
     dest_names = df[dest_col].fillna("").astype(str).str.strip().values
 
     all_unique_names: set[str] = set(origin_names) | set(dest_names)
     all_unique_names.discard("")
 
-    resolve_kwargs = dict(
-        primary=primary,
-        stripped=stripped,
-        groups=groups,
-        external_lookup=external_lookup,
-        gateways=gateways,
-        allow_legacy_fallback=bcfg.external.allow_legacy_fallback,
-    )
-    _EMPTY: Tuple[list, str, str] = ([], "missing", "missing")
-    name_cache: Dict[str, Tuple[List[Tuple[int, float]], str, str]] = {}
+    _EMPTY_DIR: Tuple[list, list, str, str] = ([], [], "missing", "missing")
+    name_cache_dir: Dict[str, Tuple[
+        List[Tuple[int, float]], List[Tuple[int, float]], str, str,
+    ]] = {}
     for name in all_unique_names:
-        name_cache[name] = _resolve_place_candidates(name, **resolve_kwargs)
-    print(f"  Pre-cached {len(name_cache)} unique place-name resolutions")
+        name_cache_dir[name] = _resolve_place_candidates_directional(
+            name,
+            primary=primary,
+            stripped=stripped,
+            groups=groups,
+            inbound_lookup=external_lookup,
+            outbound_lookup=external_lookup_out,
+            gateways=gateways,
+            allow_legacy_fallback=bcfg.external.allow_legacy_fallback,
+        )
+    print(f"  Pre-cached {len(name_cache_dir)} unique place-name resolutions (directional)")
 
     # -- Phase 2: Vectorize vehicle conversion ------------------------------
     work_col_name = "dojizdka_prace"
@@ -1139,7 +1233,7 @@ def _build_od_cores(
 
     mat_arrays = [mats[f"wd_{p}"] for p in period_list]
 
-    # -- Phase 4: Iterate rows using cached arrays --------------------------
+    # -- Phase 4: Iterate rows using directional cached arrays --------------
     _MODE_STAT = {"direct": "mapped_direct", "group": "mapped_group",
                   "lookup": "mapped_external_lookup",
                   "legacy_fallback": "mapped_external_legacy_fallback"}
@@ -1160,13 +1254,15 @@ def _build_od_cores(
             stats["missing_destination"] += 1
             continue
 
-        o_cands, o_mode, o_kind = name_cache.get(on, _EMPTY)
-        d_cands, d_mode, d_kind = name_cache.get(dn, _EMPTY)
+        o_entry = name_cache_dir.get(on, _EMPTY_DIR)
+        d_entry = name_cache_dir.get(dn, _EMPTY_DIR)
+        o_in_cands, o_out_cands, o_mode, o_kind = o_entry
+        d_in_cands, d_out_cands, d_mode, d_kind = d_entry
 
-        if not o_cands:
+        if not o_in_cands and not o_out_cands:
             stats["missing_origin"] += 1
             continue
-        if not d_cands:
+        if not d_in_cands and not d_out_cands:
             stats["missing_destination"] += 1
             continue
 
@@ -1201,21 +1297,43 @@ def _build_od_cores(
             fwd = fwd * ext_comm_scale
             ret = ret * ext_comm_scale
 
-        for oz, ow in o_cands:
+        # Forward trip: origin -> destination
+        #   origin external = traffic enters model -> use inbound gateway
+        #   dest   external = traffic exits model  -> use outbound gateway
+        fwd_o_cands = o_in_cands
+        fwd_d_cands = d_out_cands
+
+        # Return trip: destination -> origin (reverse direction)
+        #   dest becomes origin (enters model) -> use inbound gateway
+        #   origin becomes dest (exits model)  -> use outbound gateway
+        ret_o_cands = d_in_cands
+        ret_d_cands = o_out_cands
+
+        for oz, ow in fwd_o_cands:
             if oz not in zset:
                 continue
             oi = z2i[oz]
-            for dz, dw in d_cands:
+            for dz, dw in fwd_d_cands:
                 if dz not in zset:
                     continue
                 di = z2i[dz]
                 f = float(ow) * float(dw)
-
                 for pi in range(n_periods):
                     mat_arrays[pi][oi, di] += fwd[pi] * f
-                    mat_arrays[pi][di, oi] += ret[pi] * f
 
-                stats["pairs_used"] += 1
+        for oz, ow in ret_o_cands:
+            if oz not in zset:
+                continue
+            oi = z2i[oz]
+            for dz, dw in ret_d_cands:
+                if dz not in zset:
+                    continue
+                di = z2i[dz]
+                f = float(ow) * float(dw)
+                for pi in range(n_periods):
+                    mat_arrays[pi][oi, di] += ret[pi] * f
+
+        stats["pairs_used"] += 1
 
     mats["wd_daily"] = sum(mats[name] for name in period_cores)
 
@@ -1427,8 +1545,14 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
     _mark("preflight_external_inputs")
 
     external_lookup: Dict[str, List[Tuple[int, float]]] = {}
+    external_lookup_out: Dict[str, List[Tuple[int, float]]] = {}
     if bcfg.external.enabled:
-        external_lookup, _ = _load_external_gateway_lookup(
+        (
+            external_lookup,
+            external_lookup_out,
+            _gw_in_names,
+            _gw_out_names,
+        ) = _load_external_gateway_lookup_directional(
             bcfg.external.gateway_lookup_path,
             gateways,
         )
@@ -1447,6 +1571,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
         groups=groups,
         gateways=gateways,
         external_lookup=external_lookup,
+        external_lookup_out=external_lookup_out,
     )
     _mark("build_commuting_cores")
 
@@ -1650,7 +1775,8 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
         "segments": segment_totals,
         "groups": {k: {"zones": len(v)} for k, v in groups.items()},
         "gateways": {k: len(v) for k, v in gateways.items()},
-        "external_lookup_places": len(external_lookup),
+        "external_lookup_places_inbound": len(external_lookup),
+        "external_lookup_places_outbound": len(external_lookup_out),
         **summary,
         "final_cores_sum": {name: round(float(all_cores[name].sum()), 1) for name in sorted(all_cores.keys())},
         "final_nonzero_cells": {name: int(np.count_nonzero(all_cores[name])) for name in sorted(all_cores.keys())},

@@ -159,24 +159,6 @@ def calibrate_gravity_simple(
     return {"function": "EXPO", "beta": round(beta, 6)}
 
 
-def apply_gravity(
-    productions: np.ndarray,
-    attractions: np.ndarray,
-    impedance: np.ndarray,
-    beta: float = 0.0001,
-) -> np.ndarray:
-    """Generate synthetic OD from gravity model with exponential deterrence."""
-    imp = np.maximum(impedance, 100.0)
-    f = np.exp(-beta * imp)
-    np.fill_diagonal(f, 0)
-    od = productions[:, None] * attractions[None, :] * f
-    total_p = productions.sum()
-    total_od = od.sum()
-    if total_od > 0 and total_p > 0:
-        od *= total_p / total_od
-    return od
-
-
 # ---------------------------------------------------------------------------
 # IPF (Iterative Proportional Fitting)
 # ---------------------------------------------------------------------------

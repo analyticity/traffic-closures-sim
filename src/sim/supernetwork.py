@@ -16,8 +16,14 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 from shapely.geometry import LineString, MultiLineString, Point
+from shapely.ops import unary_union
 
 from sim.io_project import get_metric_epsg, load_config
+from sim.network_pipeline import (
+    NETWORK_MAP_EXPORT_DPI,
+    NETWORK_MAP_EXPORT_FIGSIZE,
+    NETWORK_MAP_PALETTE,
+)
 from sim._text import norm_name as _norm_name
 from sim._metrics import persons_to_vehicles_from_cfg
 
@@ -655,7 +661,7 @@ def is_contractible(G: nx.DiGraph, node: int, protected: set[int], degree_thresh
     if node in protected or not G.has_node(node):
         return False
     neighbors = (set(G.predecessors(node)) | set(G.successors(node))) - {node}
-    return len(neighbors) == 2 and 2 <= degree_threshold
+    return len(neighbors) <= degree_threshold
 
 
 def contract_graph(G_in: nx.DiGraph, protected: set[int], degree_threshold: int) -> nx.DiGraph:
@@ -1066,16 +1072,91 @@ def classify_relations(
 # Plot
 # ---------------------------------------------------------------------------
 
+def _external_units_outside_model_area(units: gpd.GeoDataFrame, model_area: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Drop connector-unit markers whose centroid lies inside the model polygon (AOI clutter)."""
+    if units.empty or model_area.empty:
+        return units
+    aoi = unary_union(model_area.geometry.values)
+    if aoi is None or aoi.is_empty:
+        return units
+    inside = units.geometry.within(aoi)
+    return units.loc[~inside].copy()
+
+
 def plot_overview(edges_metric: gpd.GeoDataFrame, model_area: gpd.GeoDataFrame, gateways: gpd.GeoDataFrame, units: gpd.GeoDataFrame, out_png: Path) -> None:
+    from matplotlib.lines import Line2D
+
     _ensure_dir(out_png.parent)
-    fig, ax = plt.subplots(figsize=(10, 10))
-    model_area.boundary.plot(ax=ax, linewidth=1)
-    edges_metric.plot(ax=ax, linewidth=0.3)
-    gateways.plot(ax=ax, markersize=30)
-    units.plot(ax=ax, markersize=5)
+    fig_w, fig_h = NETWORK_MAP_EXPORT_FIGSIZE
+    title_pt = max(14.0, min(24.0, float(fig_w) * 1.05))
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor=NETWORK_MAP_PALETTE["figure"])
+    ax.set_facecolor(NETWORK_MAP_PALETTE["figure"])
+
+    model_area.boundary.plot(ax=ax, color=NETWORK_MAP_PALETTE["bbox"], linewidth=3.5, zorder=2)
+    edges_metric.plot(
+        ax=ax,
+        color=NETWORK_MAP_PALETTE["links_after"],
+        linewidth=0.35,
+        alpha=0.92,
+        zorder=1,
+    )
+    # Gateways / units: palette neutrals (no traffic red — matches thesis map style)
+    gateways.plot(ax=ax, color="#423E3A", markersize=36, marker="o", zorder=5)
+    units_out = _external_units_outside_model_area(units, model_area)
+    if not units_out.empty:
+        units_out.plot(ax=ax, color="#70747D", markersize=8, marker="o", alpha=0.88, zorder=4)
+
+    ax.set_title(
+        "Supernetwork overview",
+        color=NETWORK_MAP_PALETTE["title"],
+        fontsize=title_pt,
+        fontweight="bold",
+        pad=18,
+    )
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            color=NETWORK_MAP_PALETTE["links_after"],
+            linewidth=2.5,
+            label="Super-edges",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color=NETWORK_MAP_PALETTE["bbox"],
+            linewidth=2.5,
+            label="Model boundary",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="#423E3A",
+            linestyle="None",
+            markersize=10,
+            label="Gateways",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="#70747D",
+            linestyle="None",
+            markersize=7,
+            label="Connector units",
+        ),
+    ]
+    ax.legend(handles=legend_handles, loc="upper right", framealpha=0.95)
     ax.set_axis_off()
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=200, bbox_inches="tight")
+    fig.savefig(
+        out_png,
+        dpi=NETWORK_MAP_EXPORT_DPI,
+        bbox_inches="tight",
+        facecolor=NETWORK_MAP_PALETTE["figure"],
+        pad_inches=0.05,
+    )
     plt.close(fig)
 
 
@@ -1274,11 +1355,22 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
 
     phase_t = time.perf_counter()
     gateways_join.to_crs(epsg=4326).to_file(gateways_geojson, driver="GeoJSON")
-    units_join.to_crs(epsg=4326).to_file(units_geojson, driver="GeoJSON")
+    units_map = _external_units_outside_model_area(units_join.to_crs(epsg=cfg.metric_epsg), model_area)
+    units_map.to_crs(epsg=4326).to_file(units_geojson, driver="GeoJSON")
     plot_overview(edges_metric, model_area, gateways_join.to_crs(epsg=cfg.metric_epsg), units_join.to_crs(epsg=cfg.metric_epsg), plot_png)
     profile["phases_s"]["write_geo_outputs_and_plot"] = round(time.perf_counter() - phase_t, 3)
 
     # --- Gateway health diagnostics ---
+    through_in_by_gw: Dict[str, float] = {}
+    through_out_by_gw: Dict[str, float] = {}
+    if not through_pairs.empty:
+        for _, tr in through_pairs.iterrows():
+            gw_in = str(tr["gateway_in"])
+            gw_out = str(tr["gateway_out"])
+            vd = float(tr["vehicles_daily"])
+            through_in_by_gw[gw_in] = through_in_by_gw.get(gw_in, 0.0) + vd
+            through_out_by_gw[gw_out] = through_out_by_gw.get(gw_out, 0.0) + vd
+
     gw_health: List[Dict[str, Any]] = []
     gw_health_warnings: List[str] = []
     gw_graph_nodes: Dict[str, int] = {}
@@ -1288,7 +1380,9 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
         snap_dist = float(gw["snap_distance_m"]) if pd.notna(gw.get("snap_distance_m")) else None
         inb = inbound_by_gw.get(name, 0.0)
         outb = outbound_by_gw.get(name, 0.0)
-        total_traffic = inb + outb
+        thr_in = through_in_by_gw.get(name, 0.0)
+        thr_out = through_out_by_gw.get(name, 0.0)
+        total_traffic = inb + outb + thr_in + thr_out
 
         issues: List[str] = []
         if total_traffic == 0:
@@ -1307,6 +1401,8 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
             "snap_distance_m": round(snap_dist, 1) if snap_dist is not None else None,
             "inbound_vehicles_daily": round(inb, 1),
             "outbound_vehicles_daily": round(outb, 1),
+            "through_in_vehicles_daily": round(thr_in, 1),
+            "through_out_vehicles_daily": round(thr_out, 1),
             "total_vehicles_daily": round(total_traffic, 1),
             "issues": issues,
         }
@@ -1318,6 +1414,27 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
         print("\nGateway health warnings:")
         for w in gw_health_warnings:
             print(f"  [WARN] {w}")
+
+    matrix_csv_path = cfg.output_dir / "gateway_through_matrix.csv"
+    matrix_txt_path = cfg.output_dir / "gateway_through_matrix.txt"
+    gw_order = sorted({str(x) for x in gateways_join["gateway_name"].tolist()})
+    if not through_pairs.empty:
+        tp = through_pairs.copy()
+        tp["gateway_in"] = tp["gateway_in"].astype(str)
+        tp["gateway_out"] = tp["gateway_out"].astype(str)
+        pivot = tp.pivot_table(
+            index="gateway_in",
+            columns="gateway_out",
+            values="vehicles_daily",
+            aggfunc="sum",
+            fill_value=0.0,
+        )
+        gw_order = sorted(set(gw_order) | set(pivot.index) | set(pivot.columns))
+        through_matrix = pivot.reindex(index=gw_order, columns=gw_order, fill_value=0.0)
+    else:
+        through_matrix = pd.DataFrame(0.0, index=gw_order, columns=gw_order) if gw_order else pd.DataFrame()
+    through_matrix.to_csv(matrix_csv_path, encoding="utf-8")
+    matrix_txt_path.write_text(through_matrix.to_string() if not through_matrix.empty else "", encoding="utf-8")
 
     summary = {
         "gateway_count": int(len(gateways_join)),
@@ -1349,6 +1466,8 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
             "gateways_geojson": str(gateways_geojson),
             "used_units_geojson": str(units_geojson),
             "plot": str(plot_png),
+            "gateway_through_matrix_csv": str(matrix_csv_path),
+            "gateway_through_matrix_txt": str(matrix_txt_path),
         },
     }
     summary_path = cfg.output_dir / "supernetwork_summary.json"

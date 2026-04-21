@@ -54,7 +54,13 @@ def load_zones_osm_source(
     name = g["name"].fillna("zone") if "name" in g.columns else "zone"
 
     out = gpd.GeoDataFrame(
-        {"zone_id": zone_id, "name": name, "source_rank": rank, "geometry": g.geometry},
+        {
+            "zone_id": zone_id,
+            "name": name,
+            "source_rank": rank,
+            "source_place": place,
+            "geometry": g.geometry,
+        },
         crs="EPSG:4326",
     )
 

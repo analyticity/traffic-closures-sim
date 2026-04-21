@@ -21,9 +21,9 @@ function coordsToLatLngs(coords: [number, number][]): [number, number][] {
 }
 
 function biasColor(ratio: number): string {
-  if (ratio > 1.2) return "#dc2626";
-  if (ratio < 0.8) return "#2563eb";
-  return "#16a34a";
+  if (ratio > 1.2) return "#C0392B";
+  if (ratio < 0.8) return "#148F77";
+  return "#27AE60";
 }
 
 function BiasMarker({ s }: { s: ZoneRouteBiasStation }) {
@@ -88,8 +88,8 @@ export function RouteComparisonMap() {
   return (
     <div className="flex h-full">
       {/* Sidebar */}
-      <div className="w-[380px] flex flex-col border-r bg-white overflow-hidden">
-        <div className="px-3 py-2 border-b space-y-2">
+      <div className="w-[380px] flex flex-col border-r border-gray-200 bg-white overflow-hidden">
+        <div className="px-3 py-2 border-b border-gray-200 space-y-2">
           <div className="text-xs font-semibold text-gray-700">Trasa mezi zónami</div>
 
           <div>
@@ -97,7 +97,7 @@ export function RouteComparisonMap() {
             <select
               value={origin ?? ""}
               onChange={(e) => setOrigin(e.target.value ? Number(e.target.value) : null)}
-              className="w-full border rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              className="w-full border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
               <option value="">— Vyberte zónu —</option>
               {internalZones.length > 0 && (
@@ -125,7 +125,7 @@ export function RouteComparisonMap() {
             <div className="flex-1 border-t border-gray-200" />
             <button
               onClick={swap}
-              className="text-xs text-gray-400 hover:text-indigo-600 transition px-1"
+              className="text-xs text-gray-400 hover:text-gray-800 transition px-1"
               title="Prohodit"
             >
               ⇅
@@ -138,7 +138,7 @@ export function RouteComparisonMap() {
             <select
               value={destination ?? ""}
               onChange={(e) => setDestination(e.target.value ? Number(e.target.value) : null)}
-              className="w-full border rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              className="w-full border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
               <option value="">— Vyberte zónu —</option>
               {internalZones.length > 0 && (
@@ -165,7 +165,7 @@ export function RouteComparisonMap() {
           <button
             onClick={pickRandom}
             disabled={zones.length < 2}
-            className="w-full rounded bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-medium py-1.5 hover:bg-indigo-100 transition disabled:opacity-50"
+            className="w-full rounded bg-gray-100 border border-gray-200 text-gray-700 text-xs font-medium py-1.5 hover:bg-gray-200 transition disabled:opacity-50"
           >
             Náhodná trasa
           </button>
@@ -174,21 +174,20 @@ export function RouteComparisonMap() {
         {zonesLoading && <div className="p-4 text-sm text-gray-400">Načítání zón...</div>}
         {routeLoading && <div className="p-4 text-sm text-gray-400">Počítám trasu...</div>}
         {routeError && (
-          <div className="p-4 text-sm text-red-500">Chyba: {(routeError as Error).message}</div>
+          <div className="p-4 text-sm text-red-600">Chyba: {(routeError as Error).message}</div>
         )}
 
         {routeData && (
           <div className="flex-1 overflow-y-auto p-3 space-y-3 text-xs">
-            {/* Route summary */}
-            <div className="rounded-lg border p-2">
-              <div className="font-semibold text-gray-700 mb-1">
+            <div className="rounded-lg border border-gray-200 p-2">
+              <div className="font-semibold text-gray-800 mb-1">
                 {routeData.origin.name} → {routeData.destination.name}
               </div>
               <table className="w-full text-[11px]">
                 <tbody>
                   <tr>
                     <td className="text-gray-500">Cestovní čas</td>
-                    <td className="text-right font-semibold text-indigo-700">
+                    <td className="text-right font-semibold text-gray-800">
                       {(routeData.path.travel_time / 60).toFixed(1)} min
                     </td>
                   </tr>
@@ -230,10 +229,9 @@ export function RouteComparisonMap() {
               </table>
             </div>
 
-            {/* Streets on route */}
             {routeData.streets.length > 0 && (
               <div>
-                <div className="font-semibold text-gray-700 mb-1">Ulice na trase</div>
+                <div className="font-semibold text-gray-800 mb-1">Ulice na trase</div>
                 <div className="space-y-0.5">
                   {routeData.streets.map((s) => (
                     <div key={s.name} className="flex justify-between text-[11px]">
@@ -245,10 +243,9 @@ export function RouteComparisonMap() {
               </div>
             )}
 
-            {/* Bias stations */}
             {routeData.bias_stations.length > 0 && (
               <div>
-                <div className="font-semibold text-gray-700 mb-1">
+                <div className="font-semibold text-gray-800 mb-1">
                   Pentlogramové body na trase ({routeData.bias_stations.length})
                 </div>
                 <div className="space-y-0.5">
@@ -283,25 +280,22 @@ export function RouteComparisonMap() {
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
 
-          {/* Route path */}
           {pathCoords && (
             <Polyline
               positions={pathCoords}
-              pathOptions={{ color: "#2563eb", weight: 5, opacity: 0.85 }}
+              pathOptions={{ color: "#148F77", weight: 5, opacity: 0.85 }}
             />
           )}
 
-          {/* Bias stations along route */}
           {routeData?.bias_stations.map((s) => (
             <BiasMarker key={s.link_id} s={s} />
           ))}
 
-          {/* Origin marker */}
           {routeData?.origin.coords && (
             <CircleMarker
               center={[routeData.origin.coords[1], routeData.origin.coords[0]]}
               radius={10}
-              pathOptions={{ color: "#fff", fillColor: "#059669", fillOpacity: 0.9, weight: 2 }}
+              pathOptions={{ color: "#fff", fillColor: "#27AE60", fillOpacity: 0.9, weight: 2 }}
             >
               <Tooltip permanent direction="top" offset={[0, -12]}>
                 <span style={{ fontWeight: 600 }}>{routeData.origin.name}</span>
@@ -309,12 +303,11 @@ export function RouteComparisonMap() {
             </CircleMarker>
           )}
 
-          {/* Destination marker */}
           {routeData?.destination.coords && (
             <CircleMarker
               center={[routeData.destination.coords[1], routeData.destination.coords[0]]}
               radius={10}
-              pathOptions={{ color: "#fff", fillColor: "#dc2626", fillOpacity: 0.9, weight: 2 }}
+              pathOptions={{ color: "#fff", fillColor: "#C0392B", fillOpacity: 0.9, weight: 2 }}
             >
               <Tooltip permanent direction="bottom" offset={[0, 12]}>
                 <span style={{ fontWeight: 600 }}>{routeData.destination.name}</span>
@@ -323,34 +316,33 @@ export function RouteComparisonMap() {
           )}
         </MapContainer>
 
-        {/* Legend */}
-        <div className="absolute bottom-6 right-4 z-[1000] rounded-lg bg-white p-3 shadow-lg text-xs">
+        <div className="absolute bottom-6 right-4 z-[1000] rounded-lg bg-white border border-gray-200 p-3 shadow-lg text-xs">
           <div className="font-semibold text-gray-700 mb-2">Legenda</div>
           <div className="flex items-center gap-2 mb-1">
-            <span className="inline-block h-1 w-6 rounded" style={{ background: "#2563eb" }} />
+            <span className="inline-block h-1 w-6 rounded" style={{ background: "#148F77" }} />
             <span>Nejkratší cesta</span>
           </div>
           <div className="flex items-center gap-2 mb-1">
-            <span className="inline-block h-3 w-3 rounded-full" style={{ background: "#059669" }} />
+            <span className="inline-block h-3 w-3 rounded-full" style={{ background: "#27AE60" }} />
             <span>Počátek</span>
           </div>
           <div className="flex items-center gap-2 mb-1">
-            <span className="inline-block h-3 w-3 rounded-full" style={{ background: "#dc2626" }} />
+            <span className="inline-block h-3 w-3 rounded-full" style={{ background: "#C0392B" }} />
             <span>Cíl</span>
           </div>
           <div className="mt-1 pt-1 border-t border-gray-200 font-medium text-gray-600">
             Bias na trase
           </div>
           <div className="flex items-center gap-2 mb-0.5">
-            <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: "#dc2626" }} />
+            <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: "#C0392B" }} />
             <span>Nadhodnocení</span>
           </div>
           <div className="flex items-center gap-2 mb-0.5">
-            <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: "#16a34a" }} />
+            <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: "#27AE60" }} />
             <span>Dobrá shoda</span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: "#2563eb" }} />
+            <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: "#148F77" }} />
             <span>Podhodnocení</span>
           </div>
         </div>

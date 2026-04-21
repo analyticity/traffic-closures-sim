@@ -16,11 +16,12 @@ interface MapState {
   showZones: boolean;
   showCentroids: boolean;
   showModelArea: boolean;
+  showClosures: boolean;
   linkTypes: string[];
   selectedDate: string;
   selectedPeriod: string;
   dayInfo: DayInfo | null;
-  toggleLayer: (layer: "links" | "zones" | "centroids" | "modelArea") => void;
+  toggleLayer: (layer: "links" | "zones" | "centroids" | "modelArea" | "closures") => void;
   toggleLinkType: (t: string) => void;
   setDate: (d: string) => void;
   setPeriod: (p: string) => void;
@@ -37,9 +38,9 @@ function loadSaved(): Partial<MapState> {
 }
 
 function persist(state: Partial<MapState>) {
-  const { showLinks, showZones, showCentroids, showModelArea, linkTypes, selectedDate, selectedPeriod } = state as MapState;
+  const { showLinks, showZones, showCentroids, showModelArea, showClosures, linkTypes, selectedDate, selectedPeriod } = state as MapState;
   localStorage.setItem(STORAGE_KEY, JSON.stringify({
-    showLinks, showZones, showCentroids, showModelArea, linkTypes, selectedDate, selectedPeriod,
+    showLinks, showZones, showCentroids, showModelArea, showClosures, linkTypes, selectedDate, selectedPeriod,
   }));
 }
 
@@ -51,6 +52,7 @@ export const useMapStore = create<MapState>((set) => ({
   showZones: saved.showZones ?? true,
   showCentroids: saved.showCentroids ?? false,
   showModelArea: saved.showModelArea ?? true,
+  showClosures: saved.showClosures ?? true,
   linkTypes: saved.linkTypes ?? [...ALL_LINK_TYPES],
   selectedDate: saved.selectedDate ?? today,
   selectedPeriod: saved.selectedPeriod ?? "daily",
@@ -61,6 +63,7 @@ export const useMapStore = create<MapState>((set) => ({
       const next = layer === "links" ? { ...s, showLinks: !s.showLinks }
         : layer === "zones" ? { ...s, showZones: !s.showZones }
         : layer === "centroids" ? { ...s, showCentroids: !s.showCentroids }
+        : layer === "closures" ? { ...s, showClosures: !s.showClosures }
         : { ...s, showModelArea: !s.showModelArea };
       persist(next);
       return next;

@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { MapContainer, TileLayer, GeoJSON } from "react-leaflet";
 import { useLinks, useZones, useCentroids, useModelArea, useDayInfo } from "../api/hooks";
 import { useMapStore } from "../stores/mapStore";
@@ -7,14 +7,21 @@ import { LinksLayer, ScenarioHighlightLayer } from "../components/map/LinksLayer
 import { DeltaLinksLayer } from "../components/map/DeltaLinksLayer";
 import { ZonesLayer } from "../components/map/ZonesLayer";
 import { CentroidsLayer } from "../components/map/CentroidsLayer";
+import { ClosuresLayer } from "../components/map/ClosuresLayer";
 import { LayerControls } from "../components/map/LayerControls";
 import { Legend } from "../components/map/Legend";
 import { TimeSelector } from "../components/map/TimeSelector";
 import { ScenarioPanel } from "../components/map/ScenarioPanel";
+import { ClosuresPanel } from "../components/map/ClosuresPanel";
 import { ViewToggle } from "../components/map/ViewToggle";
+import { FineZoomControls } from "../components/map/FineZoomControls";
+import { FINE_INTERACTION_MAP_OPTIONS } from "../components/map/fineMapOptions";
 import type { GeoJSONFeatureCollection } from "../types";
+import { Calendar, Construction } from "lucide-react";
 
 const BRNO_CENTER: [number, number] = [49.195, 16.608];
+
+type BottomTab = "date" | "closures";
 
 function filterByLinkTypes(
   data: GeoJSONFeatureCollection,
@@ -30,8 +37,13 @@ function filterByLinkTypes(
 }
 
 export function MapPage() {
-  const { showLinks, showZones, showCentroids, showModelArea, linkTypes, selectedDate, selectedPeriod, setDayInfo } = useMapStore();
+  const { showLinks, showZones, showCentroids, showModelArea, showClosures, linkTypes, selectedDate, selectedPeriod, setDayInfo } = useMapStore();
   const { viewMode, scenarioResults } = useScenarioStore();
+  const [closuresData, setClosuresData] = useState<GeoJSONFeatureCollection | null>(null);
+  const [bottomTab, setBottomTab] = useState<BottomTab>("date");
+  const handleClosuresLoaded = useCallback((data: GeoJSONFeatureCollection | null) => {
+    setClosuresData(data);
+  }, []);
 
   const links = useLinks(linkTypes, selectedDate, selectedPeriod);
   const zones = useZones();
@@ -54,9 +66,17 @@ export function MapPage() {
       ? filteredScenario
       : links.data;
 
+  const closureCount = closuresData?.features.length ?? 0;
+
   return (
     <div className="relative h-full w-full">
-      <MapContainer center={BRNO_CENTER} zoom={12} className="h-full w-full">
+      <MapContainer
+        center={BRNO_CENTER}
+        zoom={12}
+        className="h-full w-full"
+        zoomControl={false}
+        {...FINE_INTERACTION_MAP_OPTIONS}
+      >
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org">OSM</a>'
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -80,6 +100,10 @@ export function MapPage() {
           <ScenarioHighlightLayer data={links.data} />
         )}
         {showCentroids && centroids.data && <CentroidsLayer data={centroids.data} />}
+        {showClosures && closuresData && closuresData.features.length > 0 && (
+          <ClosuresLayer data={closuresData} />
+        )}
+        <FineZoomControls />
       </MapContainer>
 
       <LayerControls />
@@ -87,8 +111,46 @@ export function MapPage() {
       <ViewToggle />
       <ScenarioPanel />
 
-      <div className="absolute bottom-6 left-4 z-[1000] w-56 rounded-lg bg-white p-3 shadow-lg">
-        <TimeSelector />
+      {/* Bottom-left panel: toggle between Datum and Uzavírky */}
+      <div className="absolute bottom-6 left-4 z-[1000] w-56 rounded-lg bg-white shadow-lg overflow-hidden">
+        {/* Tab bar */}
+        <div className="flex border-b border-gray-200">
+          <button
+            onClick={() => setBottomTab("date")}
+            className={`flex flex-1 items-center justify-center gap-1.5 px-2 py-2 text-xs font-medium transition-colors ${
+              bottomTab === "date"
+                ? "bg-white text-blue-600 border-b-2 border-blue-600"
+                : "bg-gray-50 text-gray-500 hover:text-gray-700"
+            }`}
+          >
+            <Calendar size={12} />
+            Datum
+          </button>
+          <button
+            onClick={() => setBottomTab("closures")}
+            className={`flex flex-1 items-center justify-center gap-1.5 px-2 py-2 text-xs font-medium transition-colors ${
+              bottomTab === "closures"
+                ? "bg-white text-orange-600 border-b-2 border-orange-600"
+                : "bg-gray-50 text-gray-500 hover:text-gray-700"
+            }`}
+          >
+            <Construction size={12} />
+            Uzavírky
+            {closureCount > 0 && (
+              <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-orange-500 px-1 text-[9px] font-bold text-white">
+                {closureCount}
+              </span>
+            )}
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="p-3">
+          {bottomTab === "date" && <TimeSelector />}
+          {bottomTab === "closures" && (
+            <ClosuresPanel onClosuresLoaded={handleClosuresLoaded} />
+          )}
+        </div>
       </div>
 
       {(links.isLoading || links.isFetching) && (

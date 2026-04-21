@@ -20,7 +20,7 @@ function PathInfo({ path, color }: { path: CorridorPath; color: string }) {
       <div>
         <div className="font-medium text-gray-700">{path.label}</div>
         <div className="text-[11px] text-gray-500">
-          <span className="font-semibold text-gray-700">
+          <span className="font-semibold text-gray-800">
             {(path.travel_time / 60).toFixed(1)} min
           </span>
           {" "}&middot; {(path.distance / 1000).toFixed(2)} km &middot; {path.n_links} linků
@@ -70,13 +70,13 @@ export function CorridorDiagnosisMap() {
   return (
     <div className="flex h-full">
       {/* Sidebar */}
-      <div className="w-[360px] flex flex-col border-r bg-white overflow-hidden">
-        <div className="px-3 py-2 border-b">
+      <div className="w-[360px] flex flex-col border-r border-gray-200 bg-white overflow-hidden">
+        <div className="px-3 py-2 border-b border-gray-200">
           <div className="text-xs font-semibold text-gray-700 mb-1">Vyberte koridor k diagnostice</div>
           <select
             value={selectedName ?? ""}
             onChange={(e) => setSelectedName(e.target.value || null)}
-            className="w-full border rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+            className="w-full border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
           >
             <option value="">— Vyberte koridor —</option>
             {corridorNames.map((c) => (
@@ -97,15 +97,14 @@ export function CorridorDiagnosisMap() {
         )}
 
         {diagError && (
-          <div className="p-4 text-sm text-red-500">Chyba: {(diagError as Error).message}</div>
+          <div className="p-4 text-sm text-red-600">Chyba: {(diagError as Error).message}</div>
         )}
 
         {diagnosis && (
           <div className="flex-1 overflow-y-auto p-3 space-y-3 text-xs">
-            {/* Stats */}
             {diagnosis.corridor_stats && (
-              <div className="rounded-lg border p-2">
-                <div className="font-semibold text-gray-700 mb-1">{diagnosis.corridor_name}</div>
+              <div className="rounded-lg border border-gray-200 p-2">
+                <div className="font-semibold text-gray-800 mb-1">{diagnosis.corridor_name}</div>
                 <table className="w-full text-[11px]">
                   <tbody>
                     <tr>
@@ -135,19 +134,17 @@ export function CorridorDiagnosisMap() {
               </div>
             )}
 
-            {/* Paths comparison */}
             <div className="space-y-2">
               {diagnosis.free_flow_path && (
-                <PathInfo path={diagnosis.free_flow_path} color="#dc2626" />
+                <PathInfo path={diagnosis.free_flow_path} color="#C0392B" />
               )}
               {diagnosis.via_corridor_path && (
-                <PathInfo path={diagnosis.via_corridor_path} color="#2563eb" />
+                <PathInfo path={diagnosis.via_corridor_path} color="#148F77" />
               )}
             </div>
 
-            {/* Time/distance diffs */}
             {diagnosis.time_diff_pct != null && (
-              <div className="rounded-lg bg-amber-50 border border-amber-200 p-2 text-[11px] text-amber-800">
+              <div className="rounded-lg bg-gray-50 border border-gray-200 p-2 text-[11px] text-gray-600">
                 <div>
                   Travel time: via koridor o{" "}
                   <strong>
@@ -167,8 +164,7 @@ export function CorridorDiagnosisMap() {
               </div>
             )}
 
-            {/* Diagnosis */}
-            <div className="rounded-lg bg-gray-50 border p-2 text-[11px] text-gray-700 leading-relaxed">
+            <div className="rounded-lg bg-gray-100 border border-gray-200 p-2 text-[11px] text-gray-700 leading-relaxed">
               {diagnosis.diagnosis}
             </div>
           </div>
@@ -183,47 +179,43 @@ export function CorridorDiagnosisMap() {
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
 
-          {/* Corridor links (blue, thick) */}
           {diagnosis?.corridor_links && diagnosis.corridor_links.features.length > 0 && (
             <GeoJSON
               key={`corr-links-${selectedName}`}
               data={diagnosis.corridor_links as never}
-              style={{ color: "#6366f1", weight: 7, opacity: 0.4 }}
+              style={{ color: "#8E44AD", weight: 7, opacity: 0.4 }}
             />
           )}
 
-          {/* Free-flow shortest path (red, dashed) */}
           {freeFlowCoords && (
             <Polyline
               positions={freeFlowCoords}
-              pathOptions={{ color: "#dc2626", weight: 4, opacity: 0.85, dashArray: "8 6" }}
+              pathOptions={{ color: "#C0392B", weight: 4, opacity: 0.85, dashArray: "8 6" }}
             />
           )}
 
-          {/* Via-corridor path (blue, solid) */}
           {viaCorridorCoords && (
             <Polyline
               positions={viaCorridorCoords}
-              pathOptions={{ color: "#2563eb", weight: 4, opacity: 0.85 }}
+              pathOptions={{ color: "#148F77", weight: 4, opacity: 0.85 }}
             />
           )}
         </MapContainer>
 
-        {/* Legend */}
-        <div className="absolute bottom-6 right-4 z-[1000] rounded-lg bg-white p-3 shadow-lg text-xs">
+        <div className="absolute bottom-6 right-4 z-[1000] rounded-lg bg-white border border-gray-200 p-3 shadow-lg text-xs">
           <div className="font-semibold text-gray-700 mb-2">Legenda</div>
           <div className="flex items-center gap-2 mb-1">
-            <span className="inline-block h-2 w-6 rounded" style={{ background: "#6366f1", opacity: 0.5 }} />
+            <span className="inline-block h-2 w-6 rounded" style={{ background: "#8E44AD", opacity: 0.5 }} />
             <span>Koridor (linky)</span>
           </div>
           <div className="flex items-center gap-2 mb-1">
-            <span className="inline-block h-1 w-6 rounded" style={{ background: "#2563eb" }} />
+            <span className="inline-block h-1 w-6 rounded" style={{ background: "#148F77" }} />
             <span>Cesta přes koridor</span>
           </div>
           <div className="flex items-center gap-2">
             <span
               className="inline-block h-1 w-6 rounded"
-              style={{ background: "#dc2626", backgroundImage: "repeating-linear-gradient(90deg, #dc2626 0 4px, transparent 4px 8px)" }}
+              style={{ background: "#C0392B", backgroundImage: "repeating-linear-gradient(90deg, #C0392B 0 4px, transparent 4px 8px)" }}
             />
             <span>Nejkratší cesta (model)</span>
           </div>

@@ -6,9 +6,9 @@ import type { BiasClusterProperties, BiasStationProperties } from "../../types";
 const BRNO_CENTER: [number, number] = [49.195, 16.608];
 
 function biasColor(ratio: number): string {
-  if (ratio > 1.2) return "#dc2626";
-  if (ratio < 0.8) return "#2563eb";
-  return "#16a34a";
+  if (ratio > 1.2) return "#C0392B";
+  if (ratio < 0.8) return "#148F77";
+  return "#27AE60";
 }
 
 function biasLabel(ratio: number): string {
@@ -229,17 +229,15 @@ export function BiasMap() {
           ))}
       </MapContainer>
 
-      {/* Legend */}
-      <div className="absolute bottom-6 right-4 z-[1000] rounded-lg bg-white p-3 shadow-lg text-xs">
+      <div className="absolute bottom-6 right-4 z-[1000] rounded-lg bg-white border border-gray-200 p-3 shadow-lg text-xs">
         <div className="font-semibold text-gray-700 mb-2">Odchylka model/pozorování</div>
 
-        {/* Cluster toggle */}
         <label className="flex items-center gap-2 mb-2 cursor-pointer select-none">
           <input
             type="checkbox"
             checked={clustered}
             onChange={(e) => setClustered(e.target.checked)}
-            className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+            className="rounded"
           />
           <span>Clustery (100 m)</span>
         </label>
@@ -247,30 +245,30 @@ export function BiasMap() {
         <div className="flex items-center gap-2 mb-1">
           <span
             className="inline-block h-3 w-3 rounded-full"
-            style={{ background: "#dc2626" }}
+            style={{ background: "#C0392B" }}
           />
           <span>Nadhodnocení (&gt; 120 %)</span>
         </div>
         <div className="flex items-center gap-2 mb-1">
           <span
             className="inline-block h-3 w-3 rounded-full"
-            style={{ background: "#16a34a" }}
+            style={{ background: "#27AE60" }}
           />
           <span>Dobrá shoda (80–120 %)</span>
         </div>
         <div className="flex items-center gap-2 mb-1">
           <span
             className="inline-block h-3 w-3 rounded-full"
-            style={{ background: "#2563eb" }}
+            style={{ background: "#148F77" }}
           />
           <span>Podhodnocení (&lt; 80 %)</span>
         </div>
         {summary && (
           <div className="mt-2 pt-2 border-t border-gray-200 text-gray-500">
             Celkem {summary.total} {clustered ? "clusterů" : "stanic"}:
-            <span style={{ color: "#dc2626" }}> {summary.over}</span> /
-            <span style={{ color: "#16a34a" }}> {summary.good}</span> /
-            <span style={{ color: "#2563eb" }}> {summary.under}</span>
+            <span style={{ color: "#C0392B" }}> {summary.over}</span> /
+            <span style={{ color: "#27AE60" }}> {summary.good}</span> /
+            <span style={{ color: "#148F77" }}> {summary.under}</span>
           </div>
         )}
       </div>
@@ -281,7 +279,7 @@ export function BiasMap() {
         </div>
       )}
       {error && (
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[1100] rounded-lg bg-red-50 border border-red-200 px-4 py-2 shadow-lg text-xs text-red-600">
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[1100] rounded-lg bg-red-50 border border-red-300 px-4 py-2 shadow-lg text-xs text-red-600">
           Chyba: {(error as Error).message}
         </div>
       )}

@@ -3,7 +3,7 @@ import { ALL_LINK_TYPES, useMapStore } from "../../stores/mapStore";
 
 export function LayerControls() {
   const {
-    showLinks, showZones, showCentroids, showModelArea,
+    showLinks, showZones, showCentroids, showModelArea, showClosures,
     linkTypes,
     toggleLayer, toggleLinkType,
   } = useMapStore();
@@ -19,6 +19,7 @@ export function LayerControls() {
           ["zones", "Zóny", showZones],
           ["centroids", "Centroidy", showCentroids],
           ["modelArea", "Oblast modelu", showModelArea],
+          ["closures", "Uzavírky", showClosures],
         ] as const).map(([key, label, on]) => (
           <label key={key} className="flex items-center gap-2 py-0.5">
             <input

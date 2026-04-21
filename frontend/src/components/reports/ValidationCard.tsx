@@ -4,7 +4,7 @@ export function ValidationCard({ data }: { data: ValidationReport }) {
   const p = data.pentlogram;
 
   return (
-    <div className="rounded-lg border bg-white p-6 shadow-sm">
+    <div className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm">
       <h2 className="mb-4 text-lg font-bold text-gray-800">Validace</h2>
 
       {p && (
@@ -24,7 +24,7 @@ export function ValidationCard({ data }: { data: ValidationReport }) {
           <h3 className="mb-2 text-sm font-semibold text-gray-600">CSD Validation</h3>
           <table className="w-full text-xs">
             <thead>
-              <tr className="border-b text-left text-gray-500">
+              <tr className="border-b border-gray-200 text-left text-gray-500">
                 <th className="py-1">Class</th>
                 <th>Sections</th>
                 <th>Mean AADT</th>
@@ -33,7 +33,7 @@ export function ValidationCard({ data }: { data: ValidationReport }) {
             </thead>
             <tbody>
               {data.csd_observed.map((r) => (
-                <tr key={r.road_class} className="border-b">
+                <tr key={r.road_class} className="border-b border-gray-100">
                   <td className="py-1 font-medium">{r.road_class}</td>
                   <td>{r.sections}</td>
                   <td>{Math.round(r.mean_sv).toLocaleString()}</td>
@@ -50,7 +50,7 @@ export function ValidationCard({ data }: { data: ValidationReport }) {
 
 function Stat({ label, value }: { label: string; value: string | number }) {
   return (
-    <div className="rounded-md bg-gray-50 p-3 text-center">
+    <div className="rounded-md bg-gray-100 p-3 text-center">
       <div className="text-xs text-gray-500">{label}</div>
       <div className="text-lg font-semibold text-gray-800">{value}</div>
     </div>

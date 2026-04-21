@@ -5,7 +5,7 @@ import type { CalibrationReport } from "../../types";
 
 export function CalibrationCard({ data }: { data: CalibrationReport }) {
   return (
-    <div className="rounded-lg border bg-white p-6 shadow-sm">
+    <div className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm">
       <h2 className="mb-4 text-lg font-bold text-gray-800">Kalibrace</h2>
 
       <div className="mb-4 grid grid-cols-3 gap-4 text-sm">
@@ -17,20 +17,20 @@ export function CalibrationCard({ data }: { data: CalibrationReport }) {
       <div className="mb-6 h-64">
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={data.history}>
-            <CartesianGrid strokeDasharray="3 3" />
+            <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
             <XAxis dataKey="iteration" label={{ value: "Iterace", position: "bottom" }} />
             <YAxis />
             <Tooltip />
             <Legend />
-            <Line type="monotone" dataKey="geh_lt5_pct" name="GEH<5 %" stroke="#2563eb" strokeWidth={2} />
-            <Line type="monotone" dataKey="geh_lt10_pct" name="GEH<10 %" stroke="#7c3aed" strokeWidth={2} />
+            <Line type="monotone" dataKey="geh_lt5_pct" name="GEH<5 %" stroke="#148F77" strokeWidth={2} />
+            <Line type="monotone" dataKey="geh_lt10_pct" name="GEH<10 %" stroke="#8E44AD" strokeWidth={2} />
           </LineChart>
         </ResponsiveContainer>
       </div>
 
       <table className="w-full text-xs">
         <thead>
-          <tr className="border-b text-left text-gray-500">
+          <tr className="border-b border-gray-200 text-left text-gray-500">
             <th className="py-1">Iter</th>
             <th>Demand</th>
             <th>Assigned</th>
@@ -41,7 +41,7 @@ export function CalibrationCard({ data }: { data: CalibrationReport }) {
         </thead>
         <tbody>
           {data.history.map((h) => (
-            <tr key={h.iteration} className="border-b">
+            <tr key={h.iteration} className="border-b border-gray-100">
               <td className="py-1">{h.iteration}</td>
               <td>{Math.round(h.demand_total).toLocaleString()}</td>
               <td>{Math.round(h.assigned_total).toLocaleString()}</td>
@@ -58,7 +58,7 @@ export function CalibrationCard({ data }: { data: CalibrationReport }) {
 
 function Stat({ label, value }: { label: string; value: string | number | boolean }) {
   return (
-    <div className="rounded-md bg-gray-50 p-3 text-center">
+    <div className="rounded-md bg-gray-100 p-3 text-center">
       <div className="text-xs text-gray-500">{label}</div>
       <div className="text-lg font-semibold text-gray-800">{String(value)}</div>
     </div>

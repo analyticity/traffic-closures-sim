@@ -11,6 +11,10 @@ export interface GeoJSONFeature {
 
 export interface LinkProperties {
   link_id: number;
+  /** 0 = obousměrný úsek v síti, 1 = jen A→B, -1 = jen B→A (viz export sítě) */
+  direction?: number;
+  a_node?: number;
+  b_node?: number;
   link_type: string;
   name: string | null;
   osm_ref?: string | null;
@@ -119,6 +123,8 @@ export interface ScenarioLink {
   direction: "both" | "ab" | "ba";
   closure_type: "full" | "lanes";
   lanes_remaining: number;
+  /** Sloupec `direction` ze sítě při přidání z mapy — jen pro rozhraní (zakázané položky ve výběru směru). */
+  network_direction?: number;
 }
 
 export interface ScenarioRunRequest {
@@ -132,6 +138,28 @@ export interface ScenarioJobStatus {
   started_at: number;
   elapsed_seconds: number;
 }
+
+// ---------------------------------------------------------------------------
+// Closures (date-based)
+// ---------------------------------------------------------------------------
+
+export interface ClosureFeatureProperties {
+  link_id: number;
+  direction: "both" | "ab" | "ba";
+  closure_type: "full" | "lanes";
+  lanes: number;
+  lanes_remaining: number;
+  name: string;
+  link_type: string;
+  severity: "full" | "lane_reduction" | "speed_limit";
+  closure_text: string;
+  start: string;
+  end: string;
+}
+
+// ---------------------------------------------------------------------------
+// Delta / Scenario summary
+// ---------------------------------------------------------------------------
 
 export interface DeltaSummaryLink {
   link_id: number;

@@ -11,11 +11,11 @@ import type { CorridorScore } from "../../types";
 const BRNO_CENTER: [number, number] = [49.195, 16.608];
 
 function biasColor(bias: number): string {
-  if (bias > 20) return "#dc2626";
-  if (bias > 10) return "#f97316";
-  if (bias < -20) return "#2563eb";
-  if (bias < -10) return "#3b82f6";
-  return "#16a34a";
+  if (bias > 20) return "#C0392B";
+  if (bias > 10) return "#CA6F1E";
+  if (bias < -20) return "#148F77";
+  if (bias < -10) return "#1ABC9C";
+  return "#27AE60";
 }
 
 function fmt(n: number): string {
@@ -82,15 +82,15 @@ export function CorridorScorePanel() {
   return (
     <div className="flex h-full">
       {/* Table */}
-      <div className="w-[420px] flex flex-col border-r bg-white overflow-hidden">
-        <div className="flex items-center gap-2 px-3 py-2 border-b text-xs">
+      <div className="w-[420px] flex flex-col border-r border-gray-200 bg-white overflow-hidden">
+        <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-200 text-xs">
           <span className="text-gray-500 font-medium">Řadit:</span>
           {(["bias", "geh", "observed"] as const).map((s) => (
             <button
               key={s}
               onClick={() => setSortBy(s)}
               className={`px-2 py-0.5 rounded transition ${
-                sortBy === s ? "bg-indigo-100 text-indigo-700 font-semibold" : "text-gray-600 hover:bg-gray-100"
+                sortBy === s ? "bg-gray-100 text-gray-800 font-semibold" : "text-gray-500 hover:bg-gray-50"
               }`}
             >
               {s === "bias" ? "|Bias|" : s === "geh" ? "GEH" : "Pozorované"}
@@ -101,14 +101,14 @@ export function CorridorScorePanel() {
 
         <div className="flex-1 overflow-y-auto">
           {isLoading && <div className="p-4 text-sm text-gray-400">Načítání...</div>}
-          {error && <div className="p-4 text-sm text-red-500">Chyba: {(error as Error).message}</div>}
+          {error && <div className="p-4 text-sm text-red-600">Chyba: {(error as Error).message}</div>}
 
           {corridors.map((c) => (
             <button
               key={c.name}
               onClick={() => setSelected(selected === c.name ? null : c.name)}
-              className={`w-full text-left px-3 py-2 border-b border-gray-50 transition text-xs hover:bg-gray-50 ${
-                selected === c.name ? "bg-indigo-50 border-l-2 border-l-indigo-500" : ""
+              className={`w-full text-left px-3 py-2 border-b border-gray-100 transition text-xs hover:bg-gray-50 ${
+                selected === c.name ? "bg-gray-50 border-l-2 border-l-indigo-600" : ""
               }`}
             >
               <div className="flex items-center justify-between">
@@ -126,8 +126,8 @@ export function CorridorScorePanel() {
         </div>
 
         {selectedCorridor && (
-          <div className="border-t bg-gray-50 px-3 py-2 text-xs">
-            <div className="font-semibold text-gray-700 mb-1">{selectedCorridor.name}</div>
+          <div className="border-t border-gray-200 bg-gray-50 px-3 py-2 text-xs">
+            <div className="font-semibold text-gray-800 mb-1">{selectedCorridor.name}</div>
             <table className="w-full text-[11px]">
               <tbody>
                 <tr>
@@ -185,7 +185,6 @@ export function CorridorScorePanel() {
             </GeoJSON>
           )}
 
-          {/* Show all corridors as thin lines when none selected */}
           {!selectedCorridor &&
             corridors.map((c) => (
               <GeoJSON
@@ -200,26 +199,26 @@ export function CorridorScorePanel() {
             ))}
         </MapContainer>
 
-        <div className="absolute bottom-6 right-4 z-[1000] rounded-lg bg-white p-3 shadow-lg text-xs">
+        <div className="absolute bottom-6 right-4 z-[1000] rounded-lg bg-white border border-gray-200 p-3 shadow-lg text-xs">
           <div className="font-semibold text-gray-700 mb-2">Odchylka koridoru</div>
           <div className="flex items-center gap-2 mb-1">
-            <span className="inline-block h-2 w-6 rounded" style={{ background: "#dc2626" }} />
+            <span className="inline-block h-2 w-6 rounded" style={{ background: "#C0392B" }} />
             <span>Nadhodnocení &gt; 20%</span>
           </div>
           <div className="flex items-center gap-2 mb-1">
-            <span className="inline-block h-2 w-6 rounded" style={{ background: "#f97316" }} />
+            <span className="inline-block h-2 w-6 rounded" style={{ background: "#CA6F1E" }} />
             <span>Nadhodnocení 10–20%</span>
           </div>
           <div className="flex items-center gap-2 mb-1">
-            <span className="inline-block h-2 w-6 rounded" style={{ background: "#16a34a" }} />
+            <span className="inline-block h-2 w-6 rounded" style={{ background: "#27AE60" }} />
             <span>Dobrá shoda ±10%</span>
           </div>
           <div className="flex items-center gap-2 mb-1">
-            <span className="inline-block h-2 w-6 rounded" style={{ background: "#3b82f6" }} />
+            <span className="inline-block h-2 w-6 rounded" style={{ background: "#1ABC9C" }} />
             <span>Podhodnocení 10–20%</span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="inline-block h-2 w-6 rounded" style={{ background: "#2563eb" }} />
+            <span className="inline-block h-2 w-6 rounded" style={{ background: "#148F77" }} />
             <span>Podhodnocení &gt; 20%</span>
           </div>
         </div>

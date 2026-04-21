@@ -22,7 +22,7 @@ function LinkRow({ link }: { link: ScenarioLink }) {
           </div>
         </div>
         <button
-          onClick={() => removeLink(link.link_id)}
+          onClick={() => removeLink(link.link_id, link.direction)}
           className="mt-0.5 rounded p-1 text-gray-400 hover:bg-red-50 hover:text-red-500 transition-colors"
           title="Odebrat"
         >
@@ -35,12 +35,20 @@ function LinkRow({ link }: { link: ScenarioLink }) {
           <label className="block text-[10px] font-medium text-gray-500 mb-0.5">Směr</label>
           <select
             value={link.direction}
-            onChange={(e) => updateLink(link.link_id, { direction: e.target.value as ScenarioLink["direction"] })}
+            onChange={(e) =>
+              updateLink(link.link_id, link.direction, {
+                direction: e.target.value as ScenarioLink["direction"],
+              })
+            }
             className="w-full rounded border border-gray-200 bg-white px-1.5 py-1 text-xs text-gray-700"
           >
             <option value="both">Oba směry</option>
-            <option value="ab">A → B</option>
-            <option value="ba">B → A</option>
+            <option value="ab" disabled={link.network_direction === -1}>
+              A → B
+            </option>
+            <option value="ba" disabled={link.network_direction === 1}>
+              B → A
+            </option>
           </select>
         </div>
 
@@ -48,7 +56,11 @@ function LinkRow({ link }: { link: ScenarioLink }) {
           <label className="block text-[10px] font-medium text-gray-500 mb-0.5">Typ</label>
           <select
             value={link.closure_type}
-            onChange={(e) => updateLink(link.link_id, { closure_type: e.target.value as ScenarioLink["closure_type"] })}
+            onChange={(e) =>
+              updateLink(link.link_id, link.direction, {
+                closure_type: e.target.value as ScenarioLink["closure_type"],
+              })
+            }
             className="w-full rounded border border-gray-200 bg-white px-1.5 py-1 text-xs text-gray-700"
           >
             <option value="full">Úplná uzavírka</option>
@@ -67,7 +79,11 @@ function LinkRow({ link }: { link: ScenarioLink }) {
             min={1}
             max={Math.max(link.lanes - 1, 1)}
             value={link.lanes_remaining}
-            onChange={(e) => updateLink(link.link_id, { lanes_remaining: Math.max(1, Math.min(link.lanes - 1, Number(e.target.value))) })}
+            onChange={(e) =>
+              updateLink(link.link_id, link.direction, {
+                lanes_remaining: Math.max(1, Math.min(link.lanes - 1, Number(e.target.value))),
+              })
+            }
             className="w-20 rounded border border-gray-200 bg-white px-1.5 py-1 text-xs text-gray-700"
           />
         </div>
@@ -122,7 +138,7 @@ export function ScenarioPanel() {
           {hasLinks ? (
             <div className="max-h-[50vh] overflow-y-auto px-3 py-1">
               {links.map((link) => (
-                <LinkRow key={link.link_id} link={link} />
+                <LinkRow key={`${link.link_id}-${link.direction}`} link={link} />
               ))}
             </div>
           ) : (

@@ -138,6 +138,20 @@ export const useZoneRoute = (origin: number | null, destination: number | null) 
   });
 
 // ---------------------------------------------------------------------------
+// Closures
+// ---------------------------------------------------------------------------
+
+export const useClosures = (date: string | null) =>
+  useQuery({
+    queryKey: ["closures", date],
+    queryFn: () =>
+      apiFetch<GeoJSONFeatureCollection>(
+        `/api/closures?date=${encodeURIComponent(date!)}`,
+      ),
+    enabled: !!date,
+  });
+
+// ---------------------------------------------------------------------------
 // Scenarios
 // ---------------------------------------------------------------------------
 

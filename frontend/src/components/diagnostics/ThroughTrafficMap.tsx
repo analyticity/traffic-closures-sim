@@ -6,10 +6,10 @@ import type { GeoJSONFeature, ThroughTrafficLinkProperties } from "../../types";
 const BRNO_CENTER: [number, number] = [49.195, 16.608];
 
 function shareColor(share: number): string {
-  if (share > 0.5) return "#dc2626";
-  if (share > 0.2) return "#f97316";
-  if (share > 0.05) return "#eab308";
-  return "#a3a3a3";
+  if (share > 0.5) return "#C0392B";
+  if (share > 0.2) return "#CA6F1E";
+  if (share > 0.05) return "#D4AC0D";
+  return "#A6A6A6";
 }
 
 function shareWeight(throughVol: number, maxVol: number): number {
@@ -37,7 +37,7 @@ export function ThroughTrafficMap() {
   const linkStyle = useMemo(() => {
     return (feature: GeoJSON.Feature | undefined) => {
       const p = feature?.properties as ThroughTrafficLinkProperties | undefined;
-      if (!p) return { color: "#ccc", weight: 2, opacity: 0.5 };
+      if (!p) return { color: "#d1d5db", weight: 2, opacity: 0.5 };
       return {
         color: shareColor(p.through_share),
         weight: shareWeight(p.through_volume, maxThroughVol),
@@ -67,7 +67,7 @@ export function ThroughTrafficMap() {
   }, []);
 
   const screenlineStyle = {
-    color: "#7c3aed",
+    color: "#8E44AD",
     weight: 6,
     opacity: 0.9,
     dashArray: "8 4",
@@ -108,8 +108,8 @@ export function ThroughTrafficMap() {
               center={[coords[1], coords[0]]}
               radius={10}
               pathOptions={{
-                color: "#1e1b4b",
-                fillColor: "#4f46e5",
+                color: "#6C3483",
+                fillColor: "#8E44AD",
                 fillOpacity: 0.9,
                 weight: 2,
               }}
@@ -128,31 +128,30 @@ export function ThroughTrafficMap() {
         })}
       </MapContainer>
 
-      {/* Legend */}
-      <div className="absolute bottom-6 right-4 z-[1000] rounded-lg bg-white p-3 shadow-lg text-xs">
+      <div className="absolute bottom-6 right-4 z-[1000] rounded-lg bg-white border border-gray-200 p-3 shadow-lg text-xs">
         <div className="font-semibold text-gray-700 mb-2">Podíl tranzitní dopravy</div>
         <div className="flex items-center gap-2 mb-1">
-          <span className="inline-block h-2 w-6 rounded" style={{ background: "#dc2626" }} />
+          <span className="inline-block h-2 w-6 rounded" style={{ background: "#C0392B" }} />
           <span>&gt; 50 %</span>
         </div>
         <div className="flex items-center gap-2 mb-1">
-          <span className="inline-block h-2 w-6 rounded" style={{ background: "#f97316" }} />
+          <span className="inline-block h-2 w-6 rounded" style={{ background: "#CA6F1E" }} />
           <span>20–50 %</span>
         </div>
         <div className="flex items-center gap-2 mb-1">
-          <span className="inline-block h-2 w-6 rounded" style={{ background: "#eab308" }} />
+          <span className="inline-block h-2 w-6 rounded" style={{ background: "#D4AC0D" }} />
           <span>5–20 %</span>
         </div>
         <div className="flex items-center gap-2 mb-1">
-          <span className="inline-block h-2 w-6 rounded" style={{ background: "#a3a3a3" }} />
+          <span className="inline-block h-2 w-6 rounded" style={{ background: "#A6A6A6" }} />
           <span>1–5 %</span>
         </div>
         <div className="mt-2 pt-2 border-t border-gray-200 flex items-center gap-2">
-          <span className="inline-block h-2 w-6 rounded" style={{ background: "#7c3aed" }} />
+          <span className="inline-block h-2 w-6 rounded" style={{ background: "#8E44AD" }} />
           <span>Screenline</span>
         </div>
         <div className="flex items-center gap-2 mt-1">
-          <span className="inline-block h-3 w-3 rounded-full" style={{ background: "#4f46e5" }} />
+          <span className="inline-block h-3 w-3 rounded-full" style={{ background: "#8E44AD" }} />
           <span>Gateway</span>
         </div>
       </div>
@@ -163,7 +162,7 @@ export function ThroughTrafficMap() {
         </div>
       )}
       {error && (
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[1100] rounded-lg bg-red-50 border border-red-200 px-4 py-2 shadow-lg text-xs text-red-600">
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[1100] rounded-lg bg-red-50 border border-red-300 px-4 py-2 shadow-lg text-xs text-red-600">
           Chyba: {(error as Error).message}
         </div>
       )}

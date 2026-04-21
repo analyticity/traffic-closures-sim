@@ -5,23 +5,23 @@ import type { GeoJSONFeatureCollection, LinkProperties } from "../../types";
 import { linkDisplayName, VOC_SCALE } from "./LinksLayer";
 
 export const DELTA_SCALE = [
-  { threshold: 50, color: "#b2182b", label: "> +50 %" },
-  { threshold: 20, color: "#ef8a62", label: "+20–50 %" },
-  { threshold: 5, color: "#fddbc7", label: "+5–20 %" },
-  { threshold: -5, color: "#e0e0e0", label: "-5 – +5 %" },
-  { threshold: -20, color: "#d1e5f0", label: "-5 – -20 %" },
-  { threshold: -50, color: "#67a9cf", label: "-20 – -50 %" },
-  { threshold: -Infinity, color: "#2166ac", label: "< -50 %" },
+  { threshold: 50, color: "#C0392B", label: "> +50 %" },
+  { threshold: 20, color: "#CA6F1E", label: "+20–50 %" },
+  { threshold: 5, color: "#D4AC0D", label: "+5–20 %" },
+  { threshold: -5, color: "#A6A6A6", label: "-5 – +5 %" },
+  { threshold: -20, color: "#1ABC9C", label: "-5 – -20 %" },
+  { threshold: -50, color: "#148F77", label: "-20 – -50 %" },
+  { threshold: -Infinity, color: "#27AE60", label: "< -50 %" },
 ] as const;
 
 function getDeltaColor(deltaPct: number): string {
-  if (deltaPct > 50) return "#b2182b";
-  if (deltaPct > 20) return "#ef8a62";
-  if (deltaPct > 5) return "#fddbc7";
-  if (deltaPct > -5) return "#e0e0e0";
-  if (deltaPct > -20) return "#d1e5f0";
-  if (deltaPct > -50) return "#67a9cf";
-  return "#2166ac";
+  if (deltaPct > 50) return "#C0392B";
+  if (deltaPct > 20) return "#CA6F1E";
+  if (deltaPct > 5) return "#D4AC0D";
+  if (deltaPct > -5) return "#A6A6A6";
+  if (deltaPct > -20) return "#1ABC9C";
+  if (deltaPct > -50) return "#148F77";
+  return "#27AE60";
 }
 
 function deltaStyle(feature: GeoJSON.Feature | undefined) {
@@ -48,8 +48,8 @@ function signedFmt(n: number | null | undefined, decimals = 0): string {
 }
 
 function changeColor(val: number): string {
-  if (val > 0) return "#dc2626";
-  if (val < 0) return "#2563eb";
+  if (val > 0) return "#C0392B";
+  if (val < 0) return "#148F77";
   return "#6b7280";
 }
 

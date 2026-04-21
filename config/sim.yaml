@@ -236,17 +236,36 @@ calibration:
   core_name: "wd_daily"
   model_time_period: "daily"
 
+  # Which observed count source to use for calibration.
+  #   "pentlogram" — Brno-specific ArcGIS pentlogram (default).
+  #   "csd_split"  — Split CSD data into calibration/validation subsets.
+  #                   Use for cities without pentlogram.
+  count_source: "csd_split"
+
+  # CSD-split settings (only used when count_source == "csd_split").
+  # Both subsets always contain all road classes so calibration can fix
+  # inter-class volume imbalances (motorway vs trunk vs secondary etc.).
+  csd_split:
+    # "alternating" — round-robin within each road number; geographically
+    #                 adjacent sections end up in different sets.
+    # "stratified"  — random split preserving road_class proportions.
+    # "spatial"     — urban sections for calibration, rural for validation.
+    #                 Falls back to alternating if all sections are urban/rural.
+    strategy: "alternating"
+    calib_share: 0.65       # must be in (0, 1)
+    random_seed: 42
+
   gateway_calibration:
     enabled: true
     observed_path: "data/cache/gateway_counts_2025.parquet"
-    damping: 0.08
-    min_factor: 0.90
-    max_factor: 1.10
+    damping: 0.18
+    min_factor: 0.70
+    max_factor: 1.40
 
   match_buffer_m: 50.0
   match_direction_aware: true
   match_conflict_resolution: "nearest"
-  count_target: "car_only"
+  count_target: "motor_total"
   aggregate_corridor: true
   save_skims: true
   supply_tuning: { enabled: false }
@@ -376,17 +395,10 @@ datasets:
       usage:
         supernetwork_places: "grouped_point_centroids"
 
-    closures_ndic:
+    closures_pg:
       enabled: true
-      provider: "arcgis_feature_service"
-      service_url: "https://gis.brno.cz/ags3/rest/services/PUBLIC/uzavirky_ndic/MapServer"
-      layer_id: 0
-      out_path: "data/sources/brno/closures/uzavirky_ndic.geojson"
-      output: { out_epsg: 5514 }
-      query:
-        where: "1=1"
-        out_fields: ["*"]
-        geometry_clip: { enabled: false }
+      provider: "postgres_closures"
+      table: "restrictions"
       usage:
         calibration_target: "baseline_closures"
 
@@ -396,9 +408,16 @@ datasets:
       url: "https://download.geofabrik.de/europe/czech-republic-latest.osm.pbf"
       out_path: "data/sources/osm/czech-republic-latest.osm.pbf"
 
+closures_db:
+  host: "REDACTED_HOST"
+  port: 5432
+  dbname: "traffic"
+  user: "admin"
+  password: "admin"
+
 baseline_closures:
   enabled: true
-  source_path: "data/cache/closures_ndic.parquet"
+  source_path: "data/cache/closures.parquet"
   matching:
     max_distance_m: 150
     require_road_ref_match: false
@@ -406,7 +425,15 @@ baseline_closures:
     full:           { capacity_factor: 0.05, speed_factor: 0.1 }
     lane_reduction: { capacity_factor: 0.5,  speed_factor: 0.7 }
     speed_limit:    { capacity_factor: 1.0,  speed_factor: 0.5 }
-  measurement_period: null
+  # Closure periods for different pipeline phases.
+  # - measurement_period: applied when building/updating the network (baseline closures).
+  # - calibration_period: applied at the start of calibrate (must match count data year).
+  #   With count_source "csd_split", use the CSD survey year (2025) for both.
+  # - validation_period: used by validate; keep aligned with held-out CSD / reports.
+  # After validation, closures are stripped for a clean final assignment.
+  measurement_period:   { start: "2025-01-01", end: "2025-12-31" }
+  calibration_period: { start: "2025-01-01", end: "2025-12-31" }
+  validation_period:  { start: "2025-01-01", end: "2025-12-31" }
 
 api:
   host: "0.0.0.0"

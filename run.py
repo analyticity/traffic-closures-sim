@@ -6,9 +6,9 @@ Workflow:
   0) clean              – delete generated data, start fresh
   1) check              – verify AequilibraE project bootstrap
   2) build-network      – import OSM network into AequilibraE
-  3) normalize-network  – clean / normalise link attributes (+ apply closures if enabled)
-  4) build-zones        – create TAZ zones + centroid connectors
-  5) fetch-data         – download & preprocess external datasets (incl. closures)
+  3) fetch-data         – download & preprocess external datasets (incl. closures)
+  4) normalize-network  – clean / normalise link attributes (+ apply closures if enabled)
+  5) build-zones        – create TAZ zones + centroid connectors (auto-remaps population)
   6) build-supernetwork – national coarse net → gateway lookups & through pairs
   7) build-demand        – seed OD matrix (SLDB, gateways, synthetic segments)
   8) assign-warm-skims  – optional short assign; always saves skims.aem for distribute
@@ -35,6 +35,7 @@ import argparse
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
+from sim.telemetry import setup_logging
 from sim.io_project import load_config, resolve_project_database_path
 from sim.network_pipeline import build_network_from_osm
 from sim.network_normalization import normalize_and_export_network, strip_closures
@@ -144,6 +145,8 @@ def run_check(config_path: str) -> None:
 
 
 def main() -> None:
+    setup_logging()
+
     ap = argparse.ArgumentParser(
         description="Simulation pipeline – run individual steps or the full chain.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

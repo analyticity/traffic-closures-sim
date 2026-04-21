@@ -2,19 +2,23 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-import yaml
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from enum import Enum as PyEnum
+from pydantic import BaseModel, Field, model_validator
 from sim.io_project import get_metric_epsg, load_config, resolve_project_database_path
 from sim._metrics import aggregate_daily_volumes
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Data layer (lazy-loaded singletons)
@@ -22,7 +26,9 @@ from sim._metrics import aggregate_daily_volumes
 
 _cfg: Dict[str, Any] = {}
 _links_gdf: Optional[gpd.GeoDataFrame] = None
+_links_gdf_mtime: float = 0.0
 _nodes_gdf: Optional[gpd.GeoDataFrame] = None
+_nodes_gdf_mtime: float = 0.0
 
 
 def _out(section: str) -> Path:
@@ -56,10 +62,27 @@ def _read_json(path: Path) -> Any:
     return _sanitize_nan(data)
 
 
+def invalidate_cache() -> None:
+    """Drop cached data so the next request reloads from disk."""
+    global _links_gdf, _links_gdf_mtime, _nodes_gdf, _nodes_gdf_mtime
+    _links_gdf = None
+    _links_gdf_mtime = 0.0
+    _nodes_gdf = None
+    _nodes_gdf_mtime = 0.0
+    logger.info("API cache invalidated")
+
+
 def _get_links() -> gpd.GeoDataFrame:
-    """Load network links merged with assignment volumes (cached)."""
-    global _links_gdf
-    if _links_gdf is not None:
+    """Load network links merged with assignment volumes (cached).
+
+    The cache is invalidated automatically when the assignment results
+    file on disk is newer than the cached version.
+    """
+    global _links_gdf, _links_gdf_mtime
+
+    vol_path = _out("demand") / "assignment_results.parquet"
+    current_mtime = vol_path.stat().st_mtime if vol_path.exists() else 0.0
+    if _links_gdf is not None and current_mtime <= _links_gdf_mtime:
         return _links_gdf
 
     gpkg_path = _out("network") / "network_links.gpkg"
@@ -96,7 +119,6 @@ def _get_links() -> gpd.GeoDataFrame:
             else:
                 links[attr] = links[[ab, ba]].max(axis=1)
 
-    vol_path = _out("demand") / "assignment_results.parquet"
     if vol_path.exists():
         vols = pd.read_parquet(str(vol_path))
         vol_cols = ["link_id"] + [c for c in vols.columns if c != "link_id"]
@@ -108,18 +130,22 @@ def _get_links() -> gpd.GeoDataFrame:
         links = links.set_crs(epsg=4326, allow_override=True)
 
     _links_gdf = links
+    _links_gdf_mtime = current_mtime
     return _links_gdf
 
 
 def _get_nodes() -> gpd.GeoDataFrame:
-    global _nodes_gdf
-    if _nodes_gdf is not None:
-        return _nodes_gdf
+    global _nodes_gdf, _nodes_gdf_mtime
 
     path = _out("network") / "network_nodes.parquet"
     if not path.exists():
         raise HTTPException(404, "network_nodes.parquet not found.")
+    current_mtime = path.stat().st_mtime
+    if _nodes_gdf is not None and current_mtime <= _nodes_gdf_mtime:
+        return _nodes_gdf
+
     _nodes_gdf = gpd.read_parquet(str(path))
+    _nodes_gdf_mtime = current_mtime
     return _nodes_gdf
 
 
@@ -143,9 +169,14 @@ app = FastAPI(
     description="API for simulation results and scenario what-if analysis.",
 )
 
+_cors_origins = os.environ.get(
+    "CORS_ALLOWED_ORIGINS",
+    "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173",
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -155,15 +186,46 @@ app.add_middleware(
 # Pydantic models for scenario API
 # ---------------------------------------------------------------------------
 
+class Direction(str, PyEnum):
+    AB = "ab"
+    BA = "ba"
+    BOTH = "both"
+
+class ClosureType(str, PyEnum):
+    FULL = "full"
+    LANES = "lanes"
+
 class ScenarioLinkInput(BaseModel):
-    link_id: int
-    direction: str = "both"
-    closure_type: str = "full"
-    lanes: int = 2
-    lanes_remaining: int = 1
+    link_id: int = Field(gt=0)
+    direction: Direction = Direction.BOTH
+    closure_type: ClosureType = ClosureType.FULL
+    lanes: int = Field(ge=1, default=2)
+    lanes_remaining: int = Field(ge=0, default=1)
+
+    @model_validator(mode="after")
+    def validate_lanes(self):
+        if self.lanes_remaining > self.lanes:
+            raise ValueError(
+                f"lanes_remaining ({self.lanes_remaining}) cannot exceed "
+                f"lanes ({self.lanes})"
+            )
+        return self
 
 class ScenarioRunRequest(BaseModel):
     links: List[ScenarioLinkInput]
+
+    @model_validator(mode="after")
+    def deduplicate_links(self):
+        seen = set()
+        unique = []
+        for link in self.links:
+            key = (link.link_id, link.direction)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(link)
+        self.links = unique
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +261,7 @@ def get_links(
         gdf = gdf[gdf["link_type"].isin(types)]
 
     keep = ["link_id", "link_type", "name", "osm_ref", "speed", "capacity", "lanes", "distance",
+            "direction", "a_node", "b_node",
             "wd_daily_tot", "wd_daily_ab", "wd_daily_ba",
             "VOC_max", "VOC_AB", "VOC_BA",
             "peak_hour_vol_AB", "peak_hour_vol_BA", "K_factor", "LOS_max",
@@ -351,31 +414,39 @@ def scenario_status(scenario_id: str):
 @app.get("/api/scenarios/{scenario_id}/results")
 def scenario_results(scenario_id: str):
     from sim.scenarios import get_job
+    from sim.scenario_state import JobStatus
 
     job = get_job(scenario_id)
     if job is None:
         raise HTTPException(404, f"Scenario job {scenario_id} not found.")
-    if job.status == "running":
+    if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
         raise HTTPException(409, "Scenario is still running.")
-    if job.status == "error":
-        raise HTTPException(500, f"Scenario failed: {job.error}")
-    return JSONResponse(job.geojson)
+    if job.status in (JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.TIMED_OUT):
+        raise HTTPException(500, f"Scenario failed: {job.error or job.status.name}")
+    geojson = job.load_geojson()
+    if geojson is None:
+        raise HTTPException(500, "Scenario results not found on disk.")
+    return JSONResponse(geojson)
 
 
 @app.get("/api/scenarios/{scenario_id}/delta-summary")
 def scenario_delta_summary(scenario_id: str):
     """Lightweight summary of delta (difference) between scenario and baseline."""
     from sim.scenarios import get_job
+    from sim.scenario_state import JobStatus
 
     job = get_job(scenario_id)
     if job is None:
         raise HTTPException(404, f"Scenario job {scenario_id} not found.")
-    if job.status == "running":
+    if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
         raise HTTPException(409, "Scenario is still running.")
-    if job.status == "error":
-        raise HTTPException(500, f"Scenario failed: {job.error}")
+    if job.status in (JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.TIMED_OUT):
+        raise HTTPException(500, f"Scenario failed: {job.error or job.status.name}")
 
-    features = job.geojson.get("features", [])
+    geojson = job.load_geojson()
+    if geojson is None:
+        raise HTTPException(500, "Scenario results not found on disk.")
+    features = geojson.get("features", [])
     affected = []
     for f in features:
         p = f.get("properties", {})
@@ -412,6 +483,66 @@ def scenario_delta_summary(scenario_id: str):
         "max_decrease": min(decrease, key=lambda x: x["delta_vol"]) if decrease else None,
         "top_affected": top,
     })
+
+
+# ---------------------------------------------------------------------------
+# Closures (date-based)
+# ---------------------------------------------------------------------------
+
+
+class ClosureScenarioRequest(BaseModel):
+    date: str = Field(..., description="ISO date YYYY-MM-DD")
+
+
+@app.get("/api/closures")
+def get_closures(date: str = Query(..., description="ISO date YYYY-MM-DD")):
+    """Return closures active on a given date, matched to network links."""
+    from sim.closure_scenarios import closures_geojson_for_date
+
+    try:
+        link_gdf = _get_links()
+    except HTTPException:
+        link_gdf = None
+    geojson = closures_geojson_for_date(date, _cfg, link_gdf)
+    return JSONResponse(geojson)
+
+
+@app.post("/api/closures/run-scenario")
+def run_closure_scenario(req: ClosureScenarioRequest):
+    """Create and run a scenario from all closures active on a date.
+
+    Calls the standard scenario pipeline (full equilibrium assignment) so
+    the resulting link volumes are valid.
+    """
+    from sim.closure_scenarios import closures_for_date
+    from sim.scenarios import submit_scenario
+
+    try:
+        baseline_gdf = _get_links()
+    except HTTPException:
+        raise HTTPException(500, "Baseline network not available.")
+
+    items = closures_for_date(req.date, _cfg, baseline_gdf)
+    if not items:
+        raise HTTPException(404, f"No closures found for date {req.date}.")
+
+    scenario_links = [
+        {
+            "link_id": it["link_id"],
+            "direction": it["direction"],
+            "closure_type": it["closure_type"],
+            "lanes": it["lanes"],
+            "lanes_remaining": it["lanes_remaining"],
+        }
+        for it in items
+    ]
+
+    job = submit_scenario(
+        scenario_links=scenario_links,
+        cfg=_cfg,
+        baseline_links_gdf=baseline_gdf,
+    )
+    return JSONResponse(job.to_status_dict(), status_code=202)
 
 
 # ---------------------------------------------------------------------------
@@ -608,14 +739,14 @@ def diagnostics_through_traffic():
             gw_gdf = gw_gdf.to_crs(epsg=4326)
         gateways_geojson = json.loads(gw_gdf[["gateway_name", "graph_node", "geometry"]].to_json())
 
-    sl_path = Path((_cfg.get("calibration") or {}).get("screenlines_path", "config/screenlines.yaml"))
+    from sim.screenlines import load_screenlines, resolve_screenline_links
+
+    sl_path = str((_cfg.get("calibration") or {}).get("screenlines_path", "config/screenlines.yaml"))
+    screenline_defs = load_screenlines(sl_path)
     screenline_ids: List[int] = []
-    if sl_path.exists():
-        with open(sl_path) as f:
-            sl_cfg = yaml.safe_load(f)
-        for sl in sl_cfg.get("screenlines", []):
-            for lnk in sl.get("links", []):
-                screenline_ids.append(int(lnk["link_id"]))
+    for sl_def in screenline_defs:
+        resolved = resolve_screenline_links(sl_def, links_gdf)
+        screenline_ids.extend(lid for lid, _ in resolved)
 
     sl_features = []
     if screenline_ids:

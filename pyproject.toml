@@ -17,7 +17,20 @@ dependencies = [
   "openpyxl>=3.1",
   "aequilibrae>=1.1.4",
   "fastapi>=0.100",
-  "uvicorn>=0.20"
+  "uvicorn>=0.20",
+  "psycopg2-binary>=2.9"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+  "integration: full pipeline tests requiring network access and heavy dependencies",
 ]
 
 [tool.ruff]

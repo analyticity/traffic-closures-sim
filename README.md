@@ -13,9 +13,9 @@ The pipeline supports the following workflow:
 0. **clean** – remove generated data and start from a clean state  
 1. **check** – verify that the AequilibraE project is correctly bootstrapped  
 2. **build-network** – import the road network from OpenStreetMap  
-3. **normalize-network** – clean and normalize network attributes; optionally apply baseline road closures  
-4. **build-zones** – create TAZ zones, external gateway zones, and centroid connectors  
-5. **fetch-data** – download and preprocess external datasets (optional; `datasets.enabled`)  
+3. **fetch-data** – download and preprocess external datasets (closures, counts, population, etc.)  
+4. **normalize-network** – clean and normalize network attributes; optionally apply baseline road closures  
+5. **build-zones** – create TAZ zones, external gateway zones, and centroid connectors; auto-remaps population  
 6. **build-supernetwork** – coarse national network for external / through traffic at gateways  
 7. **build-demand** – build the seed OD matrix (commuting, gateways, synthetic segments)  
 8. **assign-warm-skims** – optional short assignment that always saves `skims.aem` for trip distribution  
@@ -62,8 +62,7 @@ python run.py check
 python run.py build-network
 python run.py fetch-data                # downloads closures, counts, CSD, population
 python run.py normalize-network         # applies baseline closures if configured
-python run.py build-zones
-python run.py fetch-data                # re-run: population is now mapped to zones
+python run.py build-zones               # auto-remaps population to zones
 python run.py build-supernetwork
 python run.py build-demand
 python run.py assign-warm-skims
@@ -79,7 +78,7 @@ python run.py serve
 
 In practice, not every run has to execute all steps. Once intermediate artifacts are generated, later steps can usually be rerun independently.
 
-**Why `fetch-data` appears twice.** The first run downloads road closures (needed by `normalize-network`) and other external datasets. However, the population-to-zone mapping (`zone_population.parquet`) requires `zones.geojson` from `build-zones`. The second run re-processes population with proper zone IDs; previously downloaded files are cached and not re-downloaded.
+**Population auto-remap.** `fetch-data` downloads population data and produces `zone_population.parquet`. If zones do not exist yet at that point, the parquet uses a fallback `zone_id=0`. When `build-zones` runs later, it detects this stale fallback and automatically regenerates `zone_population.parquet` with correct zone IDs — no second `fetch-data` call is needed.
 
 **Skim-driven trip distribution.** The first run of `distribute` has no `skims.aem` unless you assigned traffic first. With `demand.distribution.impedance: auto` (default), gravity/IPF then uses **Euclidean distance** between zone centroids. To use **network travel times** as impedance, run **`assign-warm-skims`** (or a full `assign` with `calibration.save_skims: true`) **before** `distribute`, then `distribute`, then run **`assign` again** for production link volumes on the IPF-adjusted matrix. A warm pass overwrites `assignment_results.parquet` with an intermediate result; the final assignment pass replaces it.
 

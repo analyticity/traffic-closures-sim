@@ -1,137 +1,133 @@
 # Screenline / cordon definitions for gateway and corridor validation.
 #
+# Each screenline is defined by a WKT cut-line (geometry_wkt) in WGS84 that
+# crosses the road corridor at the desired cross-section.  Links are resolved
+# dynamically at runtime by intersecting the cut-line with the network,
+# filtered by optional attribute constraints (filter).
+#
+# This approach is immune to link_id changes caused by network re-imports.
+#
 # direction: 1 = a→b only, -1 = b→a only, 0 = both directions summed
 # type: "screenline" | "cordon" | "radial"
+# expected_links: optional sanity check — warns if resolved count differs
 #
-# CSD 2025 observed AADT values (cars only, column "O") are noted per
-# screenline.  The automatic evaluation reads observed counts from the
-# pentlogram-matched data — for boundary links outside pentlogram
-# coverage, observed_total will be 0 and the "ratio" field is not
-# meaningful; compare modeled_total against the CSD reference instead.
-#
-# Each screenline uses a SINGLE representative link at the cross-section
-# to avoid double-counting traffic on sequential links in the same corridor.
+# CSD 2025 observed AADT values (cars only) are noted per screenline.
+# The evaluation reads observed counts from pentlogram-matched data;
+# for boundary links outside pentlogram coverage, observed_total will be 0
+# and the code falls back to observed_aadt_cars from this config.
 
 screenlines:
+
+  # === Major radial gateways (model boundary) ===
+
   - name: "D1_west"
     description: "D1 motorway western model boundary (CSD 6-8670: Devět křížů → Ostrovačice)"
     type: "radial"
     observed_aadt_cars: 36985
     observed_aadt_all: 58191
-    links:
-      # link 116153: 249524→249530, motorway ref=D1, direction=0 (bidir, 1255m)
-      # D1_NW gateway link — the active carriageway; the parallel carriageway
-      # (links 3142/3143/3141...) dead-ends at node 251664 and carries no
-      # westbound through-traffic.
-      - link_id: 116153
-        direction: 0
+    geometry_wkt: "LINESTRING(16.4505 49.1896, 16.4505 49.1904)"
+    filter:
+      osm_ref_norm: "602"
+    expected_links: 2
 
   - name: "D1_east"
     description: "D1 motorway eastern model boundary (CSD 6-8810: Holubice → Rousínov)"
     type: "radial"
     observed_aadt_cars: 44152
     observed_aadt_all: 58936
-    links:
-      # link 3660: 20590→20592, motorway ref=D1, direction=0 (bidir)
-      # At the D1_E gateway anchor nodes — captures full corridor cross-section.
-      # Old link 390 was 7 km west past the D1/I50 junction, missing 40k of traffic.
-      - link_id: 3660
-        direction: 0
+    geometry_wkt: "LINESTRING(16.8085 49.18205, 16.8105 49.18205)"
+    filter:
+      osm_highway: "motorway"
+      osm_ref_norm: "D1"
+    expected_links: 1
 
   - name: "D2_south"
     description: "D2 motorway southern model boundary (CSD 6-8710: Brno,Chrlice → Blučina)"
     type: "radial"
     observed_aadt_cars: 26394
     observed_aadt_all: 41320
-    links:
-      # link 120221: 19481→336207, motorway ref=D2, direction=0 (bidir)
-      # At the D2_S gateway anchor — captures bidirectional flow.
-      # Old link 495 was one-way (dir=1), measuring only one carriageway.
-      - link_id: 120221
-        direction: 0
+    geometry_wkt: "LINESTRING(16.6660 49.0610, 16.6690 49.0625)"
+    filter:
+      osm_highway: "motorway"
+      osm_ref_norm: "D2"
+    expected_links: 2
 
   - name: "I43_north"
     description: "I/43 primary road northern boundary (CSD 6-0359: Kuřim → hr. Brno-venkov/Blansko)"
     type: "radial"
     observed_aadt_cars: 20455
     observed_aadt_all: 24265
-    links:
-      # link 20690: 171958→251868, primary ref=43 (the active I43 corridor link
-      # carrying ~31k veh/day; old link 143363 was bypassed by centroid connectors
-      # attached to both its endpoints)
-      - link_id: 20690
-        direction: 0
+    geometry_wkt: "LINESTRING(16.5480 49.3480, 16.5540 49.3500)"
+    filter:
+      osm_highway: "primary"
+      osm_ref_norm: "43"
+    expected_links: 1
 
   - name: "I52_south"
     description: "D52 motorway southern model boundary (CSD 6-0216: hr. Brno-město → × s 152)"
     type: "radial"
     observed_aadt_cars: 39022
     observed_aadt_all: 50911
-    links:
-      # D52 has two one-way carriageways; both must be summed for AADT.
-      # link 44451: 61609→401715, motorway ref=D52, dir=1 (~9.8k, carriageway A)
-      - link_id: 44451
-        direction: 0
-      # link 139989: 401713→401712, motorway ref=D52, dir=1 (~8.9k, carriageway B)
-      - link_id: 139989
-        direction: 0
+    geometry_wkt: "LINESTRING(16.5430 49.0530, 16.5470 49.0560)"
+    filter:
+      osm_ref_norm: "D52"
+    expected_links: 2
 
-  # --- Secondary / tertiary corridors ---
-  # These give calibration information about non-motorway roads,
-  # preventing the loop from over-optimizing trunk/motorway fit.
+  # === Inner-city corridors ===
 
   - name: "Koliste_radial"
     description: "Koliště secondary ring road (inner city, bidirectional)"
     type: "radial"
     observed_aadt_cars: 46000
-    links:
-      # link 81811: 116873→12339, secondary 'Koliště', direction=0 (bidir, 20m)
-      - link_id: 81811
-        direction: 0
+    geometry_wkt: "LINESTRING(16.6125 49.1992, 16.6125 49.1980)"
+    filter:
+      name: "Koliště"
+    expected_links: 1
 
   - name: "Dornych_radial"
-    description: "Dornych primary corridor (south-east radial)"
+    description: "Dornych primary corridor (south-east radial, dual carriageway)"
     type: "radial"
     observed_aadt_cars: 38000
-    links:
-      # link 42986: 20734→46224, primary 'Dornych', direction=0 (bidir, 295m)
-      - link_id: 42986
-        direction: 0
+    geometry_wkt: "LINESTRING(16.6195 49.1875, 16.6195 49.1865)"
+    filter:
+      name: "Dornych"
+    expected_links: 2
 
   - name: "Krenova_radial"
     description: "Křenová tertiary corridor (east-west through centre)"
     type: "radial"
     observed_aadt_cars: 22000
-    links:
-      # link 44204: 409070→421703, tertiary 'Křenová', direction=0 (bidir, 93m)
-      - link_id: 44204
-        direction: 0
+    geometry_wkt: "LINESTRING(16.6220 49.1920, 16.6220 49.1900)"
+    filter:
+      name: "Křenová"
+    expected_links: 1
 
-  # --- Additional corridors for ODME spatial control ---
+  # === Additional corridors for ODME spatial control ===
 
   - name: "Zabovreska"
-    description: "Žabovřeská trunk corridor (one carriageway, pentlogram)"
+    description: "Žabovřeská trunk corridor (pentlogram)"
     type: "radial"
     observed_aadt_cars: 50000
-    links:
-      # link 85543: 225290→10556, trunk 'Žabovřeská', dir=1 (one-way)
-      - link_id: 85543
-        direction: 0
+    geometry_wkt: "LINESTRING(16.5810 49.2190, 16.5850 49.2215)"
+    filter:
+      osm_ref_norm: "640"
+    expected_links: 1
 
   - name: "Husovicky_tunel"
-    description: "Husovický tunel trunk corridor (one carriageway, pentlogram)"
+    description: "Husovický tunel trunk corridor (dual carriageway, pentlogram)"
     type: "radial"
     observed_aadt_cars: 22000
-    links:
-      # link 2652: 18009→67806, trunk 'Husovický tunel', dir=1 (one-way)
-      - link_id: 2652
-        direction: 0
+    geometry_wkt: "LINESTRING(16.6290 49.2155, 16.6330 49.2185)"
+    filter:
+      osm_highway: "trunk"
+      osm_ref_norm: "42"
+    expected_links: 2
 
   - name: "Kounicova"
     description: "Kounicova tertiary corridor (inner city, pentlogram)"
     type: "radial"
     observed_aadt_cars: 11000
-    links:
-      # link 42808: 23006→166051, tertiary 'Kounicova', dir=0 (bidir)
-      - link_id: 42808
-        direction: 0
+    geometry_wkt: "LINESTRING(16.5960 49.2090, 16.5930 49.2095)"
+    filter:
+      name: "Kounicova"
+    expected_links: 1

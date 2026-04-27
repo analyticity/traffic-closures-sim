@@ -15,7 +15,6 @@ import json
 import logging
 import threading
 import time
-import traceback
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -28,7 +27,6 @@ from aequilibrae import Project
 from aequilibrae.matrix import AequilibraeMatrix
 
 from sim.assignment import build_graph, execute_assignment, fix_node_ids
-from sim.io_project import load_config
 from sim._metrics import aggregate_daily_volumes
 from sim.scenario_state import JobStatus, transition_job
 
@@ -40,9 +38,7 @@ CLOSURE_TRAVEL_TIME = 99_999.0
 _SCENARIO_OUTPUT_DIR = Path("outputs/scenarios")
 
 
-# ---------------------------------------------------------------------------
-# Graph modification
-# ---------------------------------------------------------------------------
+# --- Graph modification ---
 
 def apply_scenario_to_graph(graph, scenario_links: List[Dict[str, Any]]) -> None:
     """Modify *graph* in-place for a list of scenario link changes.
@@ -83,9 +79,7 @@ def apply_scenario_to_graph(graph, scenario_links: List[Dict[str, Any]]) -> None
             gdf.loc[mask, "capacity"] = gdf.loc[mask, "capacity"] * ratio
 
 
-# ---------------------------------------------------------------------------
-# Job management
-# ---------------------------------------------------------------------------
+# --- Job management ---
 
 @dataclass
 class ScenarioJob:
@@ -135,7 +129,6 @@ _jobs_lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=1)
 
 JOB_TTL_SECONDS = 3600
-JOB_TIMEOUT_SECONDS = 1800
 
 
 def _prune_old_jobs() -> None:
@@ -154,9 +147,7 @@ def _prune_old_jobs() -> None:
                     pass
 
 
-# ---------------------------------------------------------------------------
-# Background worker
-# ---------------------------------------------------------------------------
+# --- Background worker ---
 
 def _run_scenario_worker(
     job: ScenarioJob,
@@ -318,9 +309,7 @@ def _build_scenario_geojson(
     return json.loads(gdf.to_json())
 
 
-# ---------------------------------------------------------------------------
-# Public helpers (called by api.py)
-# ---------------------------------------------------------------------------
+# --- Public helpers ---
 
 def submit_scenario(
     scenario_links: List[Dict[str, Any]],
@@ -346,16 +335,3 @@ def get_job(job_id: str) -> Optional[ScenarioJob]:
         return _jobs.get(job_id)
 
 
-def cancel_job(job_id: str) -> bool:
-    """Attempt to cancel a queued job. Returns True if cancelled."""
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-        if job is None:
-            return False
-        if job.status != JobStatus.QUEUED:
-            return False
-        if job._future and job._future.cancel():
-            job._set_status(JobStatus.CANCELLED)
-            job.finished_at = time.time()
-            return True
-    return False

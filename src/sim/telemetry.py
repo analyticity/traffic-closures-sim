@@ -1,13 +1,11 @@
-"""Logging configuration and run-level correlation IDs.
+"""Logging configuration with structured context injection.
 
-Replaces ad-hoc ``print()`` calls with structured logging that supports
-hierarchical loggers, severity levels, and correlation identifiers
-(``run_id``, ``iteration``) for calibration audit trails.
+Configures root-level logging and injects ``run_id`` / ``iteration``
+context variables into every log record for calibration audit trails.
 """
 from __future__ import annotations
 
 import logging
-import uuid
 from contextvars import ContextVar
 
 run_id_var: ContextVar[str] = ContextVar("run_id", default="")
@@ -37,14 +35,3 @@ def setup_logging(level: int = logging.INFO) -> None:
     if not root.handlers:
         root.addHandler(handler)
     root.setLevel(level)
-
-
-def new_run_id() -> str:
-    """Generate and activate a new run correlation ID."""
-    rid = uuid.uuid4().hex[:12]
-    run_id_var.set(rid)
-    return rid
-
-
-def set_iteration(it: int) -> None:
-    iteration_var.set(it)

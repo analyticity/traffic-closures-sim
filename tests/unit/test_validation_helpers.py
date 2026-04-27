@@ -124,7 +124,10 @@ class TestComputeValidationBenchmarks:
         assert result["jt_within_tolerance_pct"] == pytest.approx(200 / 3, rel=0.01)
 
     def test_screenline_max_error(self):
-        sl = {"SL1": {"ratio": 1.20}, "SL2": {"ratio": 0.85}}
+        sl = {
+            "SL1": {"ratio": 1.20, "observed_total": 1000},
+            "SL2": {"ratio": 0.85, "observed_total": 2000},
+        }
         result = compute_validation_benchmarks(
             self._good_stats(), sl, [],
             model_time_period="daily",

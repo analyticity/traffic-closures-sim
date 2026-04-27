@@ -491,3 +491,35 @@ class TestCsdCompatibleLinkTypes:
     def test_each_class_includes_own_type(self):
         for cls in ("motorway", "trunk", "secondary", "tertiary"):
             assert cls in _CSD_COMPATIBLE_LINK_TYPES[cls]
+
+
+# ---------------------------------------------------------------------------
+# normalize_csd_count_columns (class-breakdown XLSX → sv / o / tv)
+# ---------------------------------------------------------------------------
+
+class TestNormalizeCsdCountColumns:
+    def test_maps_total_s_and_light_l(self):
+        from sim.fetch_datasets import normalize_csd_count_columns
+
+        df = pd.DataFrame({
+            "sil": ["4-0131", "4-0132"],
+            "s": [10000, 20000],
+            "l": [8000, 15000],
+            "t": [1500, 3500],
+            "m": [500, 1500],
+        })
+        out = normalize_csd_count_columns(df)
+        assert out["sv"].tolist() == [10000, 20000]
+        assert out["o"].tolist() == [8000, 15000]
+        # Heavy column sums T (+ PN/TN/A/AL); motorcycles stay in ``sv`` only.
+        assert out["tv"].tolist()[0] == pytest.approx(1500.0)
+        assert out["tv"].tolist()[1] == pytest.approx(3500.0)
+
+    def test_preserves_official_sv_o_tv(self):
+        from sim.fetch_datasets import normalize_csd_count_columns
+
+        df = pd.DataFrame({"sil": ["13"], "sv": [12000.0], "o": [9000.0], "tv": [3000.0]})
+        out = normalize_csd_count_columns(df)
+        assert float(out["sv"].iloc[0]) == 12000.0
+        assert float(out["o"].iloc[0]) == 9000.0
+        assert float(out["tv"].iloc[0]) == 3000.0

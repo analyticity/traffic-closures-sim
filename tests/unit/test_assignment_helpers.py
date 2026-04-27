@@ -53,7 +53,7 @@ class TestResolveVdfParams:
         """per_link requested but link_type missing => falls to global default."""
         bpr = {"per_link": True, "alpha": 0.2, "beta": 5.0}
         result = _resolve_vdf_params(bpr, ["link_id"])
-        assert result == {"alpha": 0.15, "beta": 4.0}
+        assert result == {"alpha": 0.85, "beta": 4.0}
 
     def test_per_link_false_custom(self):
         bpr = {"per_link": False, "alpha": 0.2, "beta": 5.0}
@@ -62,7 +62,7 @@ class TestResolveVdfParams:
 
     def test_fallback_uses_standard_bpr_alpha(self):
         result = _resolve_vdf_params(None, [])
-        assert result["alpha"] == pytest.approx(0.15)
+        assert result["alpha"] == pytest.approx(0.85)
         assert result["beta"] == pytest.approx(4.0)
 
     def test_bpr_with_defaults(self):

@@ -10,23 +10,24 @@ The pipeline is executed through a single runner script, where each step represe
 
 The pipeline supports the following workflow:
 
-0. **clean** – remove generated data and start from a clean state  
-1. **check** – verify that the AequilibraE project is correctly bootstrapped  
-2. **build-network** – import the road network from OpenStreetMap  
-3. **fetch-data** – download and preprocess external datasets (closures, counts, population, etc.)  
-4. **normalize-network** – clean and normalize network attributes; optionally apply baseline road closures  
-5. **build-zones** – create TAZ zones, external gateway zones, and centroid connectors; auto-remaps population  
-6. **build-supernetwork** – coarse national network for external / through traffic at gateways  
-7. **build-demand** – build the seed OD matrix (commuting, gateways, synthetic segments)  
-8. **assign-warm-skims** – optional short assignment that always saves `skims.aem` for trip distribution  
-9. **distribute** – gravity calibration + IPF on the seed matrix (network skims or Euclidean; see below)  
-10. **assign** – full traffic assignment on the detailed network  
-11. **calibrate** / **calibrate-odme** – iterative demand scaling vs. link counts (pentlogram)  
-12. **tune-supply** – optional outer loop on supply-side factors after demand calibration  
-13. **validate** – independent checks vs. CSD (not used in calibration)  
-14. **learn-profile** – temporal day-type factors from CSD  
-15. **strip-closures** – restore pre-closure network attributes (clean baseline after validation)  
-16. **serve** – read-only REST API for results  
+0. **init-city** – generate a minimal config directory for a new city (interactive or CLI)  
+1. **clean** – remove generated data and start from a clean state  
+2. **check** – verify that the AequilibraE project is correctly bootstrapped  
+3. **build-network** – import the road network from OpenStreetMap  
+4. **fetch-data** – download and preprocess external datasets (closures, counts, population, etc.)  
+5. **normalize-network** – clean and normalize network attributes; optionally apply baseline road closures  
+6. **build-zones** – create TAZ zones, external gateway zones, and centroid connectors; auto-remaps population  
+7. **build-supernetwork** – coarse national network for external / through traffic at gateways  
+8. **build-demand** – build the seed OD matrix (commuting, gateways, synthetic segments)  
+9. **assign-warm-skims** – optional short assignment that always saves `skims.aem` for trip distribution  
+10. **distribute** – gravity calibration + IPF on the seed matrix (network skims or Euclidean; see below)  
+11. **assign** – full traffic assignment on the detailed network  
+12. **calibrate** / **calibrate-odme** – iterative demand scaling vs. link counts (default: CSD 2025; optional pentlogram)  
+13. **tune-supply** – optional outer loop on supply-side factors after demand calibration  
+14. **validate** – independent checks vs. CSD (not used in calibration)  
+15. **learn-profile** – temporal day-type factors from CSD  
+16. **strip-closures** – restore pre-closure network attributes (clean baseline after validation)  
+17. **serve** – read-only REST API for results  
 
 ---
 
@@ -35,45 +36,167 @@ The pipeline supports the following workflow:
 The pipeline is controlled by the main runner script:
 
 ```bash
-python run.py --config config/sim.yaml <step>
+python run.py --config config/brno/sim.yaml <step>
 ```
 
 Example:
 
 ```bash
-python run.py --config config/sim.yaml build-network
+python run.py --config config/brno/sim.yaml build-network
 ```
 
 If `--config` is not provided, the default configuration file is:
 
 ```bash
-config/sim.yaml
+config/brno/sim.yaml
 ```
+
+---
+
+## Multi-City Configuration
+
+The pipeline is designed to run for **any Czech city** without code changes.
+Each city has its own directory under `config/` containing only city-specific
+values; all methodology defaults (speeds, capacities, BPR parameters, Czech
+national datasets) are built into the code.
+
+```
+config/
+  brno/           # Brno-specific configs
+    sim.yaml
+    locale.yaml
+    screenlines.yaml
+    network_normalization.yaml
+  most/           # Most-specific configs
+    sim.yaml
+    locale.yaml
+    screenlines.yaml
+  experiments.yaml  # shared tuning policy
+```
+
+### Adding a new city
+
+The fastest way is to use the built-in config generator:
+
+```bash
+# Interactive — answers a few questions (city, district, region, trip estimate):
+python scripts/generate_city_config.py
+
+# Or non-interactive:
+python scripts/generate_city_config.py \
+    --city "Olomouc" \
+    --okres "Olomouc" \
+    --kraj "Olomoucký kraj" \
+    --trips 20000
+```
+
+This creates `config/olomouc/sim.yaml`, `locale.yaml`, and `screenlines.yaml`.
+The generator is also available as a pipeline step:
+
+```bash
+python run.py init-city
+```
+
+### What goes into a city config
+
+A minimal `sim.yaml` (~40 lines) only contains values unique to that city:
+
+| Key | Purpose | Example |
+|-----|---------|---------|
+| `project_path` | AequilibraE project directory | `project/olomouc_aeq` |
+| `osm.place_name` | OSM Nominatim query for the network extent | `Olomouc, Czechia` |
+| `osm.buffer_km` | *(optional)* When using `place_name` without `model_bbox`, buffer the geocoded polygon by this many km for import/trim (default `0` = no extra buffer; e.g. `2` for a 2 km belt) | `2` |
+| `zoning.sources` | Admin boundaries for TAZ zones | `Okres Olomouc, Czechia` |
+| `zoning.external_gateways.whitelist` | Explicit gateway roads (empty = auto-discover) | `[]` |
+| `demand.segments.external_local.total_daily_trips` | Scale of external traffic | `20000` |
+| `datasets.enabled` | Turn off all dataset fetching when `false` (omit or `true` to run `fetch-data`) | `true` |
+| `datasets.sources.commuting_sldb2021.filter` | SLDB commuting district filter | `Olomouc` |
+| `datasets.sources.validation_csd2025_v2.usage.area_filter.region_hint` | CSD region | `Olomoucký kraj` |
+
+Everything else — BPR alpha/beta tables, daily capacity factors, normalization
+defaults, multi-class settings, Czech dataset URLs, holidays, calibration
+parameters — comes from code defaults and does not need to appear in YAML.
+
+### Running the pipeline for a specific city
+
+Always pass `--config` pointing to the city's `sim.yaml`:
+
+```bash
+# Brno (default if --config is omitted):
+python run.py --config config/brno/sim.yaml build-network
+
+# Most:
+python run.py --config config/most/sim.yaml build-network
+
+# A new city:
+python run.py --config config/olomouc/sim.yaml build-network
+```
+
+### Data layout and separation
+
+Data is automatically separated per city. The city slug is derived from the
+config directory name (e.g. `config/brno/` → `brno`). All derived paths are
+namespaced under that slug:
+
+```
+data/
+  sources/                    # shared national downloads (never deleted by clean)
+    osm/                      #   czech-republic-latest.osm.pbf  (~900 MB)
+    csu/sldb2021/             #   commuting CSV + derived ``*_full_cr.parquet`` (same for all cities)
+    rsd/csd2025/              #   traffic count XLSX + derived ``v2_csd2025.parquet``
+    cz/places/                #   RUIAN ZIP + derived ``cz_place_centroids.parquet``
+    brno/intensity/           #   optional city-specific sources (e.g. pentlogram GeoJSON)
+  brno/                       # Brno-specific derived data
+    cache/                    #   filtered parquets, closures, centroids, manifest
+      supernetwork/           #   national graph cache for through-traffic
+    demand/                   #   od_matrix.aem
+  most/                       # Most-specific derived data
+    cache/
+      supernetwork/
+    demand/
+outputs/
+  brno/baseline/              # Brno outputs (network, zones, maps, demand, supernetwork)
+  most/baseline/              # Most outputs
+project/
+  brno_aeq/                   # AequilibraE project (already city-specific)
+  most_aeq/
+```
+
+Running `clean` for one city only removes its `data/<city>/`, `outputs/<city>/`,
+and `project/<city>_aeq/` directories. Shared downloads in `data/sources/` are
+preserved.
+
+National derived files (full-CR SLDB, CSD parquet, RUIAN centroids) are written
+next to their downloads under `data/sources/` so one `fetch-data` run serves
+every city; only city-filtered commuting parquet and other model artefacts live
+under `data/<city>/cache/`.
 
 ---
 
 ## Typical Full Workflow
 
-A standard end-to-end workflow usually looks like this:
+A standard end-to-end workflow for a city looks like this:
 
 ```bash
-python run.py clean
-python run.py check
-python run.py build-network
-python run.py fetch-data                # downloads closures, counts, CSD, population
-python run.py normalize-network         # applies baseline closures if configured
-python run.py build-zones               # auto-remaps population to zones
-python run.py build-supernetwork
-python run.py build-demand
-python run.py assign-warm-skims
-python run.py distribute
-python run.py assign
-python run.py calibrate                 # or calibrate-odme for ODME method
-python run.py tune-supply
-python run.py validate
-python run.py learn-profile
-python run.py strip-closures            # remove closures for clean baseline
-python run.py serve
+CFG=config/brno/sim.yaml          # change to your city
+
+python run.py --config $CFG clean
+python run.py --config $CFG check
+python run.py --config $CFG build-network
+python run.py --config $CFG fetch-data                # downloads closures, counts, CSD, population
+python run.py --config $CFG normalize-network         # applies baseline closures if configured
+python run.py --config $CFG build-zones               # auto-remaps population to zones
+python run.py --config $CFG build-supernetwork
+python run.py --config $CFG build-demand
+python run.py --config $CFG assign-warm-skims
+python run.py --config $CFG distribute
+python run.py --config $CFG assign
+python run.py --config $CFG calibrate                 # or calibrate-odme for ODME method
+python run.py --config $CFG tune-supply
+python run.py --config $CFG validate
+python run.py --config $CFG learn-profile
+python run.py --config $CFG strip-closures            # remove closures for clean baseline
+python run.py --config $CFG serve
 ```
 
 In practice, not every run has to execute all steps. Once intermediate artifacts are generated, later steps can usually be rerun independently.
@@ -88,18 +211,23 @@ In practice, not every run has to execute all steps. Once intermediate artifacts
 
 ### 1. `clean`
 
-Deletes generated data so the next run starts from scratch.
+Deletes **city-specific** generated data so the next run starts from scratch.
+
+```bash
+python run.py --config config/brno/sim.yaml clean          # city data only
+python run.py --config config/brno/sim.yaml --force clean   # + shared sources
+```
 
 This step removes:
 
-* the AequilibraE project directory
-* output files
-* cached data
-* generated demand data
-* generated zone data
-* downloaded source data
+* the AequilibraE project directory (`project/<city>_aeq/`)
+* city-specific outputs (`outputs/<city>/`)
+* city-specific cache and demand data (`data/<city>/`)
 
-Use this step when you want a completely fresh rebuild of the model.
+**Shared national data** in `data/sources/` (OSM PBF ~900 MB, SLDB, CSD,
+RUIAN) is **preserved by default** — it does not need to be re-downloaded when
+cleaning a single city. Use `--force` to also remove `data/sources/` when you
+truly need a from-scratch state including re-downloading all sources.
 
 ---
 
@@ -121,6 +249,8 @@ The model bbox in config is used for maps and metadata; the full OSM extract is 
 
 **`network.isolated_components`** (enabled by default) keeps only the largest undirected connected component by link count and deletes all other fragments, then prunes orphan nodes. Set `enabled: false` to retain every disconnected subgraph from the extract.
 
+**`osm.buffer_km`** (optional, default `0`): Only applies when the network is built from **`osm.place_name`** and you do **not** set `model_bbox` / `osm.bbox`. If **`buffer_km` > 0**, the place is geocoded to a polygon, then buffered by that many kilometres (in a metric CRS) to define the **model extent**; the OSM download area adds a fixed **5 km** margin on top for connectivity, after which the usual urban-core trim still runs. If **`buffer_km` is 0** (default), the importer uses the place polygon / name query without this configurable outer buffer.
+
 ---
 
 ### 4. `normalize-network`
@@ -138,11 +268,11 @@ Typical tasks in this phase include:
 
 This step is important because raw OSM data is usually not directly suitable for assignment.
 
-**Baseline closures** (`baseline_closures` in `config/sim.yaml`): when enabled, road closures from the Police ČR XML feed (fetched by `fetch-data`) are spatially matched to network links. Affected links receive reduced capacity and speed (via a configurable `capacity_reduction_factor`). Original values are stored in `_preclosure_*` columns so they can be restored later by `strip-closures`.
+**Baseline closures** (`baseline_closures` in the city's `sim.yaml`): when enabled, road closures from the Police ČR XML feed (fetched by `fetch-data`) are spatially matched to network links. Affected links receive reduced capacity and speed (via a configurable `capacity_reduction_factor`). Original values are stored in `_preclosure_*` columns so they can be restored later by `strip-closures`.
 
 **Configuration**
 
-* `network.normalization_config` in `config/sim.yaml` points to a YAML file (default: `config/network_normalization.yaml`) with:
+* `network.normalization_config` in the city's `sim.yaml` points to a YAML file (e.g. `config/brno/network_normalization.yaml`) with:
   * `normalization.defaults` — per–`link_type` fallbacks for speed, lanes, and capacity per lane when OSM/AequilibraE leaves gaps
   * `normalization.thresholds` — global floors (minimum speed/capacity/travel time, generic capacity per lane, fallback speed)
   * `experiment_profiles` — named sets of speed caps/floors, capacity multipliers, and time penalties; `network.experiment_profile` selects one (`baseline` applies no extra tweaks)
@@ -185,6 +315,8 @@ Downloads and preprocesses external datasets required by the model.
 
 These datasets may include demand, count, validation, temporal reference, or road closure inputs (e.g. Police ČR XML feed). The step prepares them into a consistent internal format for the following phases.
 
+Set `datasets.enabled: false` in `sim.yaml` only if you want to skip this step entirely (default is to run whenever `fetch-data` is invoked).
+
 ---
 
 ### 7. `build-supernetwork`
@@ -218,7 +350,7 @@ When `demand.sldb.external_processing.enabled` is true, the runner checks for su
 
 Optional shorter traffic assignment whose main purpose is to write **`skims.aem`** under `demand.output_dir` for use as impedance in `distribute`.
 
-* Uses `assignment.warm_skim_pass` in `config/sim.yaml` for `algorithm`, `max_iter`, and `rgap_target` (defaults are lighter than full `calibrate` / `assign` settings).
+* Uses `assignment.warm_skim_pass` in the city's `sim.yaml` for `algorithm`, `max_iter`, and `rgap_target` (defaults are lighter than full `calibrate` / `assign` settings).
 * Always saves skims (`save_skims` is forced on for this step).
 * Writes `assignment_results.parquet` like `assign`; treat it as an intermediate artifact if you run a full `assign` afterward.
 
@@ -271,7 +403,7 @@ The objective is to reduce the difference between simulated and observed traffic
 
 Two methods are available:
 
-* **`calibrate`** — iterative demand scaling vs. link counts (pentlogram data)
+* **`calibrate`** — iterative demand scaling vs. link counts (default **CSD 2025** via `calibration.count_source: csd_split`; set `pentlogram` to use the Brno ArcGIS layer instead)
 * **`calibrate-odme`** — origin-destination matrix estimation (ODME) against link counts
 
 **Configuration (excerpt)**
@@ -327,12 +459,17 @@ This makes the processed results accessible through an API, which is useful for:
 
 This step assumes the model outputs already exist.
 
+Always pass the **same** `sim.yaml` as for the pipeline (e.g. `python run.py --config config/most/sim.yaml serve`), so the API reads `outputs/<city>/…`. The runner’s default `--config` is **`config/brno/sim.yaml`**, so `serve` without `--config` will look under `outputs/brno/…` even if you built another city.
+
+If you start the app with **`uvicorn sim.api:app`** instead, set **`SIM_CONFIG`** to that file (defaults to `config/brno/sim.yaml`), e.g. `SIM_CONFIG=config/most/sim.yaml uvicorn sim.api:app`, and run from the repository root.
+
 ---
 
 ## Command-Line Interface
 
 The runner exposes the following steps:
 
+* `init-city`
 * `clean`
 * `check`
 * `build-network`
@@ -361,7 +498,7 @@ python run.py <step>
 With explicit config:
 
 ```bash
-python run.py --config config/sim.yaml <step>
+python run.py --config config/brno/sim.yaml <step>
 ```
 
 ---
@@ -380,7 +517,7 @@ python scripts/full_pipeline_audit.py
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `--config` | `config/sim.yaml` | Config passed to every `run.py` step |
+| `--config` | `config/brno/sim.yaml` | Config passed to every `run.py` step |
 | `--out-root` | `outputs/audit/full_pipeline_audit` | Directory for all audit outputs (under repo root) |
 | `--timeout-s` | `1200` | Per-step timeout in seconds (heavy steps use longer overrides inside the script) |
 | `--stop-on-fail` | off | Stop after the first step with status `fail` or `blocked` instead of continuing |
@@ -392,7 +529,7 @@ python scripts/full_pipeline_audit.py
 * `config_snapshot.yaml` — copy of the config used for the run
 * `magic_constants_inventory.csv`, `metrics_consistency_report.md`, `data_driven_refactor_proposal.md`, `unused_policy_keys.md`, `before_after_compare.json` — auxiliary reports used for consistency / documentation reviews
 
-The list of steps and expected artifact paths is maintained in the script; it assumes layout consistent with the default paths in `config/sim.yaml` (for example the AequilibraE project under `project_path`). After a successful `clean`, the audit directory may be removed and is recreated as the run continues.
+The list of steps and expected artifact paths is maintained in the script; it assumes layout consistent with the default paths in the city's `sim.yaml` (for example the AequilibraE project under `project_path`). After a successful `clean`, the audit directory may be removed and is recreated as the run continues.
 
 ---
 
@@ -419,7 +556,7 @@ This keeps iteration fast and avoids recomputing expensive earlier phases unnece
 
 * Many steps depend on outputs generated by previous steps.
 * The pipeline is designed to support both full rebuilds and partial reruns.
-* The primary configuration is in `config/sim.yaml`. Supplementary configs: `config/network_normalization.yaml` (speed/capacity defaults), `config/screenlines.yaml` (calibration/validation count stations), `config/locale.yaml` (localization).
+* Each city has its own config directory (e.g. `config/brno/`, `config/most/`). See **Multi-City Configuration** above for details and the config generator.
 * The script inserts `src/` into `sys.path`, so project modules are loaded directly from the source tree.
 * Each `run.py` invocation accepts exactly one step: `python run.py build-demand`. Chain calls in a shell script or run them sequentially.
 

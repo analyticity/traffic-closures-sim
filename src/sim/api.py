@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -62,6 +63,70 @@ def _read_json(path: Path) -> Any:
     return _sanitize_nan(data)
 
 
+def _map_center_lat_lng() -> Optional[tuple[float, float]]:
+    """Centroid of model area (or centroids) in WGS84 for Leaflet ``[lat, lng]``."""
+    zones_out = _out("zones")
+    metric_epsg = int(get_metric_epsg(_cfg)) if _cfg else 5514
+
+    def _centroid_from_gdf(gdf: gpd.GeoDataFrame) -> Optional[tuple[float, float]]:
+        if gdf is None or gdf.empty:
+            return None
+        g = gdf.copy()
+        if g.crs is None:
+            g = g.set_crs(epsg=metric_epsg, allow_override=True)
+        g = g.to_crs(epsg=4326)
+        union = g.geometry.unary_union
+        if union is None or union.is_empty:
+            return None
+        c = union.centroid
+        return (float(c.y), float(c.x))
+
+    for name in ("model_area.geojson", "centroids.geojson"):
+        path = zones_out / name
+        if not path.exists():
+            continue
+        try:
+            gdf = gpd.read_file(path)
+            out = _centroid_from_gdf(gdf)
+            if out:
+                return out
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not derive map center from %s: %s", path, exc)
+    return None
+
+
+def _model_meta_payload() -> Dict[str, Any]:
+    """Labels and default map view for the UI (multi-city aware)."""
+    meta_cfg = (_cfg.get("_meta") or {}) if _cfg else {}
+    city_slug = str(meta_cfg.get("city_slug", "") or "").strip()
+    osm = (_cfg.get("osm") or {}) if _cfg else {}
+    place_name = str(osm.get("place_name", "") or "").strip()
+    if place_name:
+        title_short = place_name.split(",")[0].strip()
+    elif city_slug:
+        title_short = city_slug.replace("_", " ").replace("-", " ").title()
+    else:
+        title_short = "Model"
+
+    center = _map_center_lat_lng()
+    if center is None:
+        center = (49.75, 15.47)
+
+    bc_cfg = (_cfg.get("baseline_closures") or {}) if _cfg else {}
+    cache_dir = str(Path((_cfg or {}).get("datasets", {}).get("cache_dir", "data/cache")))
+    closures_path = Path(bc_cfg.get("source_path", f"{cache_dir}/closures.parquet"))
+
+    return {
+        "place_name": place_name,
+        "city_slug": city_slug,
+        "title_short": title_short,
+        "map_center": {"lat": center[0], "lng": center[1]},
+        "features": {
+            "has_closures": closures_path.exists(),
+        },
+    }
+
+
 def invalidate_cache() -> None:
     """Drop cached data so the next request reloads from disk."""
     global _links_gdf, _links_gdf_mtime, _nodes_gdf, _nodes_gdf_mtime
@@ -89,7 +154,15 @@ def _get_links() -> gpd.GeoDataFrame:
     net_path = _out("network") / "network_links.parquet"
     geojson_path = _out("network") / "network_links.geojson"
     if not gpkg_path.exists() and not net_path.exists() and not geojson_path.exists():
-        raise HTTPException(404, "network_links not found. Run normalize-network first.")
+        net_dir = _out("network")
+        raise HTTPException(
+            404,
+            f"network_links not found under {net_dir}. "
+            "Run normalize-network for this model, and start the API with the same city config "
+            "(e.g. `python run.py --config config/most/sim.yaml serve`). "
+            "If you use `uvicorn sim.api:app`, set `SIM_CONFIG=config/most/sim.yaml` "
+            "and run from the project root.",
+        )
 
     if gpkg_path.exists():
         links = gpd.read_file(gpkg_path)
@@ -163,10 +236,35 @@ def _gdf_to_geojson(gdf: gpd.GeoDataFrame) -> dict:
 _api_title = "Traffic Simulation API"
 _api_version = "0.2.0"
 
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Load ``sim.yaml`` when the app is started via ``uvicorn`` (not via ``run.py serve``).
+
+    ``run.py … serve`` calls :func:`start_server`, which sets ``_cfg`` before uvicorn starts.
+    If ``_cfg`` is still empty here, read ``SIM_CONFIG`` (default ``config/brno/sim.yaml``)
+    so paths like ``network.output_dir`` resolve to the correct city.
+    """
+    global _cfg
+    if _cfg:
+        logger.info("API using config already set by start_server (%s)", _cfg.get("_meta", {}).get("config_path"))
+    else:
+        config_path = os.environ.get("SIM_CONFIG", "config/brno/sim.yaml")
+        logger.info("API loading config from %s (override with SIM_CONFIG=…)", config_path)
+        _cfg = load_config(config_path)
+        osm = _cfg.get("osm") or {}
+        place = str(osm.get("place_name", "") or "").strip()
+        if place:
+            short = place.split(",")[0].strip()
+            app.title = f"{short} — API simulace dopravy"
+    yield
+
+
 app = FastAPI(
     title=_api_title,
     version=_api_version,
     description="API for simulation results and scenario what-if analysis.",
+    lifespan=_lifespan,
 )
 
 _cors_origins = os.environ.get(
@@ -316,6 +414,12 @@ def get_model_area():
         raise HTTPException(404, "model_area.geojson not found")
     gdf = gpd.read_file(path)
     return JSONResponse(_gdf_to_geojson(gdf))
+
+
+@app.get("/api/meta")
+def get_model_meta():
+    """City name / slug and default map center from the loaded sim config and zones."""
+    return JSONResponse(_model_meta_payload())
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +653,46 @@ def run_closure_scenario(req: ClosureScenarioRequest):
 # Diagnostics
 # ---------------------------------------------------------------------------
 
+_MATCHING_DIAG_BIAS_COLS = ("link_id", "observed_car", "_corridor_volume")
+
+
+def _diag_truthy(s: pd.Series) -> pd.Series:
+    """Treat CSV booleans / 0-1 / strings as truth values."""
+    if pd.api.types.is_bool_dtype(s):
+        return s
+    if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
+        return s.fillna(0).astype(int) != 0
+    return s.astype(str).str.lower().isin(("true", "1", "yes", "t"))
+
+
+def _diag_falsy(s: pd.Series) -> pd.Series:
+    """Opposite of truthy (for ``_excluded``: keep rows that are not excluded)."""
+    if pd.api.types.is_bool_dtype(s):
+        return ~s
+    if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
+        return s.fillna(0).astype(int) == 0
+    return ~s.astype(str).str.lower().isin(("true", "1", "yes", "t"))
+
+
+def _filter_matching_diag_bias(df: pd.DataFrame) -> pd.DataFrame:
+    """Rows with matched link + observed + modeled corridor volume.
+
+    ``matching_diagnostics.csv`` from a city without pentlogram matches (or
+    before any link matched) may omit ``link_id`` / ``_corridor_volume``; return
+    an empty frame instead of raising ``KeyError`` in callers.
+    """
+    if not all(c in df.columns for c in _MATCHING_DIAG_BIAS_COLS):
+        return pd.DataFrame(columns=list(_MATCHING_DIAG_BIAS_COLS))
+
+    out = df.copy()
+    if "_matched" in out.columns:
+        out = out[_diag_truthy(out["_matched"])]
+    if "_excluded" in out.columns:
+        out = out[_diag_falsy(out["_excluded"])]
+    out = out.dropna(subset=list(_MATCHING_DIAG_BIAS_COLS))
+    out["link_id"] = out["link_id"].astype(int)
+    return out
+
 
 @app.get("/api/diagnostics/bias")
 def diagnostics_bias(
@@ -560,10 +704,15 @@ def diagnostics_bias(
     if not diag_path.exists():
         raise HTTPException(404, "matching_diagnostics.csv not found. Run calibrate first.")
 
-    df = pd.read_csv(diag_path)
-    df = df[(df["_matched"] == True) & (df["_excluded"] == False)].copy()
-    df = df.dropna(subset=["link_id", "observed_car", "_corridor_volume"])
-    df["link_id"] = df["link_id"].astype(int)
+    df = _filter_matching_diag_bias(pd.read_csv(diag_path))
+    if df.empty:
+        return JSONResponse({
+            "type": "FeatureCollection",
+            "features": [],
+            "warning": "No link-matched count stations (missing link_id / _corridor_volume in "
+            "matching_diagnostics.csv, or no rows passed filters). "
+            "Bias map needs calibration with matched observations (CSD or pentlogram, linked to network).",
+        })
 
     links = _get_links()
     link_geom = links[["link_id", "geometry"]].drop_duplicates("link_id")
@@ -697,6 +846,19 @@ def diagnostics_through_traffic():
         raise HTTPException(404, "assignment_results.parquet not found.")
 
     vols = pd.read_parquet(str(vol_path))
+    if "wd_daily_external_through_tot" not in vols.columns:
+        return JSONResponse({
+            "links": {"type": "FeatureCollection", "features": []},
+            "gateways": {"type": "FeatureCollection", "features": []},
+            "screenlines": {"type": "FeatureCollection", "features": []},
+            "warning": "No external-through volume column in assignment results.",
+        })
+    if "total_vehicles_tot" not in vols.columns:
+        local_col = next((c for c in ("wd_daily_local_tot", "wd_daily_tot") if c in vols.columns), None)
+        if local_col:
+            vols["total_vehicles_tot"] = vols[local_col] + vols["wd_daily_external_through_tot"]
+        else:
+            vols["total_vehicles_tot"] = vols["wd_daily_external_through_tot"]
     vols = vols[["link_id", "wd_daily_external_through_tot", "total_vehicles_tot"]].copy()
     vols["through_share"] = np.where(
         vols["total_vehicles_tot"] > 0,
@@ -741,7 +903,9 @@ def diagnostics_through_traffic():
 
     from sim.screenlines import load_screenlines, resolve_screenline_links
 
-    sl_path = str((_cfg.get("calibration") or {}).get("screenlines_path", "config/screenlines.yaml"))
+    _config_dir = _cfg.get("_meta", {}).get("base_dir", "")
+    _default_sl = str(Path(_config_dir) / "screenlines.yaml") if _config_dir else "config/brno/screenlines.yaml"
+    sl_path = str((_cfg.get("calibration") or {}).get("screenlines_path", _default_sl))
     screenline_defs = load_screenlines(sl_path)
     screenline_ids: List[int] = []
     for sl_def in screenline_defs:
@@ -769,12 +933,19 @@ def diagnostics_corridors():
     if not diag_path.exists():
         raise HTTPException(404, "matching_diagnostics.csv not found. Run calibrate first.")
 
-    df = pd.read_csv(diag_path)
-    df = df[(df["_matched"] == True) & (df["_excluded"] == False)].copy()
-    df = df.dropna(subset=["link_id", "observed_car", "_corridor_volume"])
-    df["link_id"] = df["link_id"].astype(int)
+    df = _filter_matching_diag_bias(pd.read_csv(diag_path))
+    if df.empty:
+        return JSONResponse({
+            "corridors": [],
+            "warning": "No link-matched count stations — see matching_diagnostics.csv "
+            "(needs link_id, _corridor_volume, matched CSD or pentlogram).",
+        })
 
-    df["name"] = df["name"].fillna("")
+    if "name" not in df.columns:
+        df = df.copy()
+        df["name"] = ""
+    else:
+        df["name"] = df["name"].fillna("")
 
     links = _get_links()
     link_cols = ["link_id", "geometry"]
@@ -914,6 +1085,8 @@ def _build_network_graph(links_gdf: gpd.GeoDataFrame):
 
     G = nx.DiGraph()
     for _, row in links_gdf.iterrows():
+        if pd.isna(row.get("a_node")) or pd.isna(row.get("b_node")):
+            continue
         a, b = int(row["a_node"]), int(row["b_node"])
         lid = int(row["link_id"])
         geom = row["geometry"]
@@ -1037,10 +1210,8 @@ def diagnostics_corridor_diagnosis(
     diag_path = _out("demand") / "matching_diagnostics.csv"
     corridor_stats = None
     if diag_path.exists():
-        df = pd.read_csv(diag_path)
-        df = df[(df["_matched"] == True) & (df["_excluded"] == False)].copy()
-        df = df.dropna(subset=["link_id", "observed_car", "_corridor_volume"])
-        cdf = df[df["name"].fillna("") == name]
+        df = _filter_matching_diag_bias(pd.read_csv(diag_path))
+        cdf = df[df["name"].fillna("") == name] if not df.empty and "name" in df.columns else pd.DataFrame()
         if not cdf.empty:
             s_obs = float(cdf["observed_car"].sum())
             s_mod = float(cdf["_corridor_volume"].sum())
@@ -1268,11 +1439,8 @@ def diagnostics_zone_route(
     diag_path = _out("demand") / "matching_diagnostics.csv"
     bias_on_route: list = []
     if diag_path.exists():
-        df = pd.read_csv(diag_path)
-        df = df[(df["_matched"] == True) & (df["_excluded"] == False)].copy()
-        df = df.dropna(subset=["link_id", "observed_car", "_corridor_volume"])
-        df["link_id"] = df["link_id"].astype(int)
-        route_diag = df[df["link_id"].isin(set(path_link_ids))]
+        df = _filter_matching_diag_bias(pd.read_csv(diag_path))
+        route_diag = df[df["link_id"].isin(set(path_link_ids))] if not df.empty else pd.DataFrame()
         for _, r in route_diag.iterrows():
             obs = float(r["observed_car"])
             mod = float(r["_corridor_volume"])
@@ -1490,7 +1658,7 @@ def diagnostics_routes():
 # Server start
 # ---------------------------------------------------------------------------
 
-def start_server(config_path: str = "config/sim.yaml") -> None:
+def start_server(config_path: str = "config/brno/sim.yaml") -> None:
     """Load config and start uvicorn."""
     import uvicorn
 
@@ -1501,10 +1669,14 @@ def start_server(config_path: str = "config/sim.yaml") -> None:
     host = str(api_cfg.get("host", "0.0.0.0"))
     port = int(api_cfg.get("port", 8000))
 
-    place = _cfg.get("place_name", "")
+    osm = _cfg.get("osm") or {}
+    place = str(osm.get("place_name", "") or "").strip()
     if place:
-        app.title = f"{place} Traffic Simulation API"
+        short = place.split(",")[0].strip()
+        app.title = f"{short} — API simulace dopravy"
 
     print(f"Starting API server on {host}:{port}")
     print(f"Docs: http://{host}:{port}/docs")
+    print(f"Loaded sim config: {_cfg.get('_meta', {}).get('config_path')}")
+    print(f"Network link files expected under: {_out('network')}")
     uvicorn.run(app, host=host, port=port)

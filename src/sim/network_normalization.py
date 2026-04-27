@@ -14,7 +14,20 @@ from aequilibrae import Project
 from sim.aequilibrae_paths import resolve_project_database_path
 from sim.io_project import get_metric_epsg, load_config
 
+from sim.defaults import NETWORK_NORM_DEFAULTS
+
 _MAJOR_ROAD_TYPES = frozenset({"motorway", "motorway_link", "trunk", "trunk_link"})
+
+# ---------------------------------------------------------------------------
+# Czech-Republic normalization defaults (from centralized defaults.py).
+# YAML values (if provided) merge on top of these.
+# ---------------------------------------------------------------------------
+
+_NORM_DEFS = NETWORK_NORM_DEFAULTS["normalization"]
+_DEFAULT_THRESHOLDS: Dict[str, float] = _NORM_DEFS["thresholds"]
+_DEFAULT_SPEED_BY_LINK_TYPE: Dict[str, float] = _NORM_DEFS["defaults"]["speed_by_link_type"]
+_DEFAULT_LANES_BY_LINK_TYPE: Dict[str, int] = _NORM_DEFS["defaults"]["lanes_by_link_type"]
+_DEFAULT_CAPACITY_PER_LANE: Dict[str, int] = _NORM_DEFS["defaults"]["capacity_per_lane_by_link_type"]
 
 
 def _resolved_experiment_profile(network_cfg: dict, experiment_profile: str) -> dict:
@@ -35,18 +48,16 @@ def _resolved_experiment_profile(network_cfg: dict, experiment_profile: str) -> 
 
 
 def _normalization_defaults(network_cfg: dict) -> tuple[dict, dict]:
-    norm = network_cfg.get("normalization")
-    if not isinstance(norm, dict) or not isinstance(norm.get("defaults"), dict):
-        raise ValueError(
-            "network.normalization.defaults is missing. Set network.normalization_config in "
-            "sim.yaml (see config/network_normalization.yaml) or define network.normalization "
-            "inline."
-        )
-    defaults = norm["defaults"]
-    for key in ("speed_by_link_type", "lanes_by_link_type", "capacity_per_lane_by_link_type"):
-        if key not in defaults or not isinstance(defaults[key], dict):
-            raise ValueError(f"network.normalization.defaults.{key} must be a mapping")
-    thresholds = norm.get("thresholds") if isinstance(norm.get("thresholds"), dict) else {}
+    norm = network_cfg.get("normalization") or {}
+    yaml_defaults = norm.get("defaults") if isinstance(norm.get("defaults"), dict) else {}
+
+    defaults = {
+        "speed_by_link_type": {**_DEFAULT_SPEED_BY_LINK_TYPE, **(yaml_defaults.get("speed_by_link_type") or {})},
+        "lanes_by_link_type": {**_DEFAULT_LANES_BY_LINK_TYPE, **(yaml_defaults.get("lanes_by_link_type") or {})},
+        "capacity_per_lane_by_link_type": {**_DEFAULT_CAPACITY_PER_LANE, **(yaml_defaults.get("capacity_per_lane_by_link_type") or {})},
+    }
+    yaml_thresh = norm.get("thresholds") if isinstance(norm.get("thresholds"), dict) else {}
+    thresholds = {**_DEFAULT_THRESHOLDS, **yaml_thresh}
     return defaults, thresholds
 
 
@@ -74,8 +85,12 @@ def _apply_speed_caps(links: pd.DataFrame, speed_caps: dict) -> None:
         m = _lt_mask(links, lt)
         if not m.any():
             continue
+        before_ab = links.loc[m, "speed_ab"].mean()
         links.loc[m, "speed_ab"] = np.minimum(links.loc[m, "speed_ab"], cap)
         links.loc[m, "speed_ba"] = np.minimum(links.loc[m, "speed_ba"], cap)
+        after_ab = links.loc[m, "speed_ab"].mean()
+        if before_ab != after_ab:
+            print(f"  speed_cap {lt}: {before_ab:.1f} → {after_ab:.1f} km/h (cap={cap})")
 
 
 def _apply_capacity_factors(links: pd.DataFrame, capacity_factors: dict) -> None:
@@ -219,6 +234,40 @@ def normalize_network_attributes(
         print(f"  Reclassified {n_constr} construction links "
               f"({int(hw_1lane.sum())} motorway_link, {int(hw_multi.sum())} trunk_link, "
               f"{int(still_constr.sum())} residential)")
+
+    # Apply per-road link_type overrides from experiment profile.
+    # Fixes OSM misclassifications (e.g. trunk roads tagged as secondary).
+    lt_overrides = profile.get("link_type_overrides") or []
+    if lt_overrides and "osm_ref_norm" in links.columns:
+        for ovr in lt_overrides:
+            match_spec = ovr.get("match") or {}
+            new_lt = ovr.get("set_link_type")
+            if not match_spec or not new_lt:
+                continue
+            mask = pd.Series(True, index=links.index)
+            for col, val in match_spec.items():
+                if col in links.columns:
+                    mask &= links[col].astype(str).str.lower() == str(val).lower()
+                else:
+                    mask[:] = False
+            n_ovr = int(mask.sum())
+            if n_ovr > 0:
+                _ensure_link_types_registered(project, {new_lt})
+                links.loc[mask, "link_type"] = new_lt
+                print(f"  Reclassified {n_ovr} links matching {match_spec} → {new_lt}")
+                min_spd = ovr.get("min_speed")
+                if min_spd is not None:
+                    min_spd = float(min_spd)
+                    spd_ab = pd.to_numeric(links.loc[mask, "speed_ab"], errors="coerce")
+                    spd_ba = pd.to_numeric(links.loc[mask, "speed_ba"], errors="coerce")
+                    n_raised = int((spd_ab < min_spd).sum())
+                    links.loc[mask, "speed_ab"] = np.where(
+                        spd_ab.isna(), min_spd, np.maximum(spd_ab, min_spd)
+                    )
+                    links.loc[mask, "speed_ba"] = np.where(
+                        spd_ba.isna(), min_spd, np.maximum(spd_ba, min_spd)
+                    )
+                    print(f"    Applied min_speed={min_spd} km/h ({n_raised} links raised)")
 
     # Remove crossing links (pedestrian crossing markup, not a road segment).
     crossing_mask = links["link_type"].astype(str) == "crossing"
@@ -639,6 +688,7 @@ def repair_divided_highway_dead_ends(
     node_major: Dict[int, list] = defaultdict(list)
     node_nonmajor: Dict[int, int] = defaultdict(int)
     link_ref: Dict[int, str] = {}
+    link_lt: Dict[int, str] = {}
 
     _IGNORE = _MAJOR_ROAD_TYPES | {"centroid_connector"}
 
@@ -647,6 +697,7 @@ def repair_divided_highway_dead_ends(
         if lt_str in _MAJOR_ROAD_TYPES:
             node_major[a].append(lid)
             node_major[b].append(lid)
+            link_lt[int(lid)] = lt_str
             if ref:
                 link_ref[lid] = str(ref)
         elif lt_str not in _IGNORE:
@@ -705,10 +756,12 @@ def repair_divided_highway_dead_ends(
     from pyproj import Geod
     geod = Geod(ellps="WGS84")
 
-    # 4) For each dead-end node, get its road ref
+    # 4) For each dead-end node, get its road ref and link_type (for new connector link)
     dead_ref: Dict[int, str] = {}
+    dead_lt: Dict[int, str] = {}
     for nid, lid in dead_ends.items():
         dead_ref[nid] = link_ref.get(lid, "")
+        dead_lt[nid] = link_lt.get(int(lid), "motorway")
 
     # 5) Greedy pair matching: match closest same-ref dead-end pairs
     remaining = set(dead_ends.keys()) & set(node_coords.keys())
@@ -750,12 +803,23 @@ def repair_divided_highway_dead_ends(
         return {"connected_pairs": 0, "new_link_ids": []}
 
     # 6) Create connecting links via AequilibraE API (needs exclusive DB access)
+    lt_needed = {dead_lt.get(n1, "motorway") for n1, _, _, _ in pairs_to_create}
+    lt_needed |= {dead_lt.get(n2, "motorway") for _, n2, _, _ in pairs_to_create}
+    _ensure_link_types_registered(project, lt_needed)
+
     new_link_ids: list = []
     connected_pairs: list = []
 
     for n1, n2, dist, ref in pairs_to_create:
         c1, c2 = node_coords[n1], node_coords[n2]
-        tt = (dist / 1000.0) / 130.0 * 3600.0 if dist > 0 else 0.01
+        lt_use = dead_lt.get(n1, dead_lt.get(n2, "motorway"))
+        if dead_lt.get(n1) and dead_lt.get(n2) and dead_lt[n1] != dead_lt[n2]:
+            lt_use = dead_lt[n1]
+
+        spd = 130.0 if lt_use in ("motorway", "motorway_link") else 90.0
+        cap_lane = 2200.0 if lt_use in ("motorway", "motorway_link") else 1800.0
+        lanes = 3 if lt_use in ("motorway", "motorway_link") else 2
+        tt = (dist / 1000.0) / max(spd, 1.0) * 3600.0 if dist > 0 else 0.01
 
         links_api = project.network.links
         new_link = links_api.new()
@@ -763,28 +827,34 @@ def repair_divided_highway_dead_ends(
         new_link.direction = 0
         new_link.distance = dist
         new_link.modes = "tc"
-        new_link.link_type = "motorway"
-        new_link.speed_ab = 130
-        new_link.speed_ba = 130
-        new_link.capacity_ab = 6600
-        new_link.capacity_ba = 6600
-        new_link.lanes_ab = 3
-        new_link.lanes_ba = 3
+        new_link.link_type = lt_use
+        new_link.speed_ab = spd
+        new_link.speed_ba = spd
+        new_link.capacity_ab = cap_lane * lanes
+        new_link.capacity_ba = cap_lane * lanes
+        new_link.lanes_ab = lanes
+        new_link.lanes_ba = lanes
         new_link.travel_time_ab = tt
         new_link.travel_time_ba = tt
         new_link.save()
 
         new_link_ids.append(new_link.link_id)
         connected_pairs.append((n1, n2, round(dist, 1), ref))
-        print(f"  Connected {ref} dead-end pair: {n1} ↔ {n2} ({dist:.0f}m) → link {new_link.link_id}")
+        print(
+            f"  Connected {ref} dead-end pair: {n1} ↔ {n2} ({dist:.0f}m) → link {new_link.link_id} "
+            f"({lt_use})",
+        )
 
     # 7) Update osm_ref and node IDs via SQL (AequilibraE API doesn't expose these)
     conn2 = sqlite3.connect(str(db_path))
     for lid, (n1, n2, _, ref) in zip(new_link_ids, pairs_to_create):
+        lt_use = dead_lt.get(n1, dead_lt.get(n2, "motorway"))
+        if dead_lt.get(n1) and dead_lt.get(n2) and dead_lt[n1] != dead_lt[n2]:
+            lt_use = dead_lt[n1]
         conn2.execute(
             "UPDATE links SET a_node=?, b_node=?, osm_ref=?, osm_ref_norm=?, "
-            "osm_highway='motorway' WHERE link_id=?",
-            (n1, n2, ref, ref, lid),
+            "osm_highway=? WHERE link_id=?",
+            (n1, n2, ref, ref, lt_use, lid),
         )
     conn2.commit()
     conn2.close()
@@ -1048,12 +1118,19 @@ def load_closures(
     source_path: Path,
     *,
     measurement_period: Optional[Dict[str, str]] = None,
+    status_whitelist: Optional[list] = None,
 ) -> List[Dict[str, Any]]:
     """Load closures from parquet or legacy JSON.
 
     Returns a list of dicts, each with at least ``lon``, ``lat``,
     ``severity`` (``"full"`` / ``"lane_reduction"`` / ``"speed_limit"``),
     and optionally ``start``, ``end``, ``road_ref``.
+
+    Parameters
+    ----------
+    status_whitelist : list, optional
+        If provided, only closures whose ``status`` value (case-insensitive)
+        is in this list are returned.
     """
     if not source_path.exists():
         print(f"  Closures file not found: {source_path} — skipping")
@@ -1093,6 +1170,18 @@ def load_closures(
     else:
         print(f"  Loaded {total} closures (no temporal filter)")
 
+    if status_whitelist:
+        allowed = {str(s).strip().lower() for s in status_whitelist}
+        before = len(closures)
+        closures = [
+            c for c in closures
+            if str(c.get("status", "")).strip().lower() in allowed
+        ]
+        print(
+            f"  Status filter ({', '.join(sorted(allowed))}): "
+            f"{before} -> {len(closures)} closures"
+        )
+
     return closures
 
 
@@ -1119,7 +1208,7 @@ def apply_baseline_closures(
     bc_cfg = cfg.get("baseline_closures") or {}
     match_cfg = bc_cfg.get("matching") or {}
     severity_map = bc_cfg.get("severity_map") or {}
-    max_dist_m = float(match_cfg.get("max_distance_m", 150))
+    max_dist_m = float(match_cfg.get("max_distance_m", 50))
     require_ref = bool(match_cfg.get("require_road_ref_match", False))
     metric_epsg = int(cfg.get("crs_epsg", 5514))
 
@@ -1128,9 +1217,15 @@ def apply_baseline_closures(
 
     for col in ("_preclosure_capacity_ab", "_preclosure_capacity_ba",
                 "_preclosure_speed_ab", "_preclosure_speed_ba"):
+        src = col.replace("_preclosure_", "")
         if col not in links.columns:
-            src = col.replace("_preclosure_", "")
             links[col] = links[src].copy()
+        else:
+            # Fill NaN preclosure values (e.g. centroid connectors that were
+            # never part of a previous closure cycle) from current values.
+            nan_mask = links[col].isna()
+            if nan_mask.any():
+                links.loc[nan_mask, col] = links.loc[nan_mask, src]
 
     closure_pts = gpd.GeoDataFrame(
         closures,
@@ -1143,6 +1238,15 @@ def apply_baseline_closures(
         if link_gdf.crs is None:
             link_gdf = link_gdf.set_crs(epsg=metric_epsg)
         elif link_gdf.crs.to_epsg() != metric_epsg:
+            link_gdf = link_gdf.to_crs(epsg=metric_epsg)
+
+        # Detect CRS mismatch: if link coordinates look like WGS84 degrees
+        # (typical range 0–180) but CRS is metric, reproject from 4326.
+        sample_x = link_gdf.geometry.iloc[0].coords[0][0] if len(link_gdf) > 0 else 0
+        if link_gdf.crs and link_gdf.crs.to_epsg() == metric_epsg and abs(sample_x) < 360:
+            print(f"  WARNING: link coords look like WGS84 (x={sample_x:.4f}) "
+                  f"but CRS is EPSG:{metric_epsg} — reprojecting from 4326")
+            link_gdf = link_gdf.set_crs(epsg=4326, allow_override=True)
             link_gdf = link_gdf.to_crs(epsg=metric_epsg)
     else:
         link_gdf = None
@@ -1180,7 +1284,16 @@ def apply_baseline_closures(
         print("  WARNING: No link geometries available for spatial closure matching")
 
     if not affected_link_ids:
-        print("  No closures matched to network links")
+        # Diagnostic: report coordinate ranges to aid CRS debugging
+        if link_gdf is not None and len(closure_pts) > 0:
+            lb = link_gdf.total_bounds
+            cb = closure_pts.total_bounds
+            print(f"  No closures matched to network links "
+                  f"(link bounds=[{lb[0]:.0f},{lb[1]:.0f},{lb[2]:.0f},{lb[3]:.0f}], "
+                  f"closure bounds=[{cb[0]:.0f},{cb[1]:.0f},{cb[2]:.0f},{cb[3]:.0f}], "
+                  f"buffer={max_dist_m}m)")
+        else:
+            print("  No closures matched to network links")
         return links
 
     for lid, sev in affected_link_ids.items():
@@ -1203,6 +1316,20 @@ def apply_baseline_closures(
                 sub = mask & (links[spd_col] > 0)
                 links.loc[sub, tt_col] = links.loc[sub, "distance"] * 3.6 / links.loc[sub, spd_col]
 
+    # Ensure no NaN capacity/speed survives (connectors, missing data, etc.)
+    min_cap = 50.0
+    min_spd = 5.0
+    for col in ("capacity_ab", "capacity_ba"):
+        n_nan = int(links[col].isna().sum())
+        if n_nan:
+            links[col] = links[col].fillna(min_cap)
+            print(f"  WARNING: filled {n_nan} NaN values in {col} with {min_cap}")
+    for col in ("speed_ab", "speed_ba"):
+        n_nan = int(links[col].isna().sum())
+        if n_nan:
+            links[col] = links[col].fillna(min_spd)
+            print(f"  WARNING: filled {n_nan} NaN values in {col} with {min_spd}")
+
     full_count = sum(1 for s in affected_link_ids.values() if s == "full")
     partial_count = len(affected_link_ids) - full_count
     print(f"  Applied {len(affected_link_ids)} baseline closures ({full_count} full, {partial_count} partial)")
@@ -1210,7 +1337,7 @@ def apply_baseline_closures(
 
 
 def strip_closures(
-    config_path: str | Path = "config/sim.yaml",
+    config_path: str | Path = "config/brno/sim.yaml",
 ) -> None:
     """Restore pre-closure capacity/speed/travel_time in the project DB.
 
@@ -1302,7 +1429,7 @@ def strip_closures(
 
 
 def swap_db_closures(
-    config_path: str | Path = "config/sim.yaml",
+    config_path: str | Path = "config/brno/sim.yaml",
     measurement_period: Optional[Dict[str, str]] = None,
 ) -> int:
     """Strip existing closures from the DB and optionally apply new ones.
@@ -1361,8 +1488,14 @@ def swap_db_closures(
 
     # --- Step 2: apply closures for the given period ---
     bc_cfg = cfg.get("baseline_closures") or {}
-    source_path = Path(bc_cfg.get("source_path", "data/cache/closures.parquet"))
-    closures = load_closures(source_path, measurement_period=measurement_period)
+    _cache = str(Path(cfg.get("datasets", {}).get("cache_dir", "data/cache")))
+    source_path = Path(bc_cfg.get("source_path", f"{_cache}/closures.parquet"))
+    status_wl = bc_cfg.get("status_whitelist")
+    closures = load_closures(
+        source_path,
+        measurement_period=measurement_period,
+        status_whitelist=status_wl,
+    )
     if not closures:
         print(f"  swap_db_closures: no closures for period {measurement_period}")
         return 0
@@ -1382,23 +1515,30 @@ def swap_db_closures(
         for pcol in preclosure_cols:
             if pcol not in existing:
                 cur.execute(f"ALTER TABLE links ADD COLUMN {pcol} REAL")
+        def _safe_float(val, fallback=50.0):
+            v = float(val)
+            return v if v == v else fallback  # NaN != NaN
+
         for _, row in links_gdf.iterrows():
+            cap_ab = _safe_float(row["capacity_ab"])
+            cap_ba = _safe_float(row["capacity_ba"])
+            spd_ab = _safe_float(row["speed_ab"], 5.0)
+            spd_ba = _safe_float(row["speed_ba"], 5.0)
+            tt_ab = _safe_float(row["travel_time_ab"], 0.01)
+            tt_ba = _safe_float(row["travel_time_ba"], 0.01)
+            pc_cap_ab = _safe_float(row.get("_preclosure_capacity_ab", cap_ab), cap_ab)
+            pc_cap_ba = _safe_float(row.get("_preclosure_capacity_ba", cap_ba), cap_ba)
+            pc_spd_ab = _safe_float(row.get("_preclosure_speed_ab", spd_ab), spd_ab)
+            pc_spd_ba = _safe_float(row.get("_preclosure_speed_ba", spd_ba), spd_ba)
             cur.execute(
                 "UPDATE links SET capacity_ab=?, capacity_ba=?, speed_ab=?, speed_ba=?, "
                 "travel_time_ab=?, travel_time_ba=?, "
                 "_preclosure_capacity_ab=?, _preclosure_capacity_ba=?, "
                 "_preclosure_speed_ab=?, _preclosure_speed_ba=? "
                 "WHERE link_id=?",
-                (
-                    float(row["capacity_ab"]), float(row["capacity_ba"]),
-                    float(row["speed_ab"]), float(row["speed_ba"]),
-                    float(row["travel_time_ab"]), float(row["travel_time_ba"]),
-                    float(row.get("_preclosure_capacity_ab", row["capacity_ab"])),
-                    float(row.get("_preclosure_capacity_ba", row["capacity_ba"])),
-                    float(row.get("_preclosure_speed_ab", row["speed_ab"])),
-                    float(row.get("_preclosure_speed_ba", row["speed_ba"])),
-                    int(row["link_id"]),
-                ),
+                (cap_ab, cap_ba, spd_ab, spd_ba, tt_ab, tt_ba,
+                 pc_cap_ab, pc_cap_ba, pc_spd_ab, pc_spd_ba,
+                 int(row["link_id"])),
             )
         conn.commit()
         conn.close()
@@ -1406,12 +1546,19 @@ def swap_db_closures(
         project.close()
 
     n = len(closures)
-    print(f"  swap_db_closures: applied {n} closures for period {measurement_period}")
+    # Count how many links actually had closure effects applied
+    n_affected = sum(
+        1 for _, row in links_gdf.iterrows()
+        if "_preclosure_capacity_ab" in row.index
+        and row.get("capacity_ab") != row.get("_preclosure_capacity_ab")
+    ) if "_preclosure_capacity_ab" in links_gdf.columns else 0
+    print(f"  swap_db_closures: applied {n} closures for period {measurement_period}"
+          f" ({n_affected} links affected)")
     return n
 
 
 def normalize_and_export_network(
-    config_path: str | Path = "config/sim.yaml",
+    config_path: str | Path = "config/brno/sim.yaml",
     outputs_dir: str | Path | None = None,
 ) -> None:
     """
@@ -1460,17 +1607,20 @@ def normalize_and_export_network(
             conn_tmp = sqlite3.connect(str(db_path))
             for new_lid in divided_info["new_link_ids"]:
                 row = conn_tmp.execute(
-                    "SELECT link_id, speed_ab, capacity_ab, lanes_ab, distance "
+                    "SELECT link_id, speed_ab, capacity_ab, lanes_ab, distance, link_type "
                     "FROM links WHERE link_id=?", (new_lid,)
                 ).fetchone()
                 if row:
+                    spd = float(row[1]) if row[1] else 0.0
+                    dist_m = float(row[4])
+                    tt = (dist_m / 1000.0 / spd * 3600.0) if spd else 0.0
                     new_row = pd.DataFrame([{
-                        "link_id": row[0], "link_type": "motorway",
+                        "link_id": row[0], "link_type": str(row[5] or "motorway"),
                         "direction": 0, "speed_ab": row[1], "speed_ba": row[1],
                         "capacity_ab": row[2], "capacity_ba": row[2],
                         "lanes_ab": row[3], "lanes_ba": row[3],
-                        "travel_time_ab": (row[4] / 1000 / row[1] * 3600) if row[1] else 0,
-                        "travel_time_ba": (row[4] / 1000 / row[1] * 3600) if row[1] else 0,
+                        "travel_time_ab": tt,
+                        "travel_time_ba": tt,
                         "distance": row[4],
                     }])
                     links = pd.concat([links, new_row], ignore_index=True)
@@ -1487,10 +1637,12 @@ def normalize_and_export_network(
         bc_cfg = cfg.get("baseline_closures") or {}
         if bc_cfg.get("enabled", False):
             print("\n=== BASELINE CLOSURES ===")
-            source_path = Path(bc_cfg.get("source_path", "data/cache/closures.parquet"))
+            _cache2 = str(Path(cfg.get("datasets", {}).get("cache_dir", "data/cache")))
+            source_path = Path(bc_cfg.get("source_path", f"{_cache2}/closures.parquet"))
             closures = load_closures(
                 source_path,
                 measurement_period=bc_cfg.get("measurement_period"),
+                status_whitelist=bc_cfg.get("status_whitelist"),
             )
             if closures:
                 links = apply_baseline_closures(links, closures, cfg)
@@ -1506,23 +1658,29 @@ def normalize_and_export_network(
                                  "_preclosure_speed_ab", "_preclosure_speed_ba"):
                         if pcol not in existing:
                             cur.execute(f"ALTER TABLE links ADD COLUMN {pcol} REAL")
+                    def _sf(val, fb=50.0):
+                        v = float(val)
+                        return v if v == v else fb
+
                     for _, row in links.iterrows():
+                        ca = _sf(row["capacity_ab"])
+                        cb = _sf(row["capacity_ba"])
+                        sa = _sf(row["speed_ab"], 5.0)
+                        sb = _sf(row["speed_ba"], 5.0)
+                        ta = _sf(row["travel_time_ab"], 0.01)
+                        tb = _sf(row["travel_time_ba"], 0.01)
                         cur.execute(
                             "UPDATE links SET capacity_ab=?, capacity_ba=?, speed_ab=?, speed_ba=?, "
                             "travel_time_ab=?, travel_time_ba=?, "
                             "_preclosure_capacity_ab=?, _preclosure_capacity_ba=?, "
                             "_preclosure_speed_ab=?, _preclosure_speed_ba=? "
                             "WHERE link_id=?",
-                            (
-                                float(row["capacity_ab"]), float(row["capacity_ba"]),
-                                float(row["speed_ab"]), float(row["speed_ba"]),
-                                float(row["travel_time_ab"]), float(row["travel_time_ba"]),
-                                float(row.get("_preclosure_capacity_ab", row["capacity_ab"])),
-                                float(row.get("_preclosure_capacity_ba", row["capacity_ba"])),
-                                float(row.get("_preclosure_speed_ab", row["speed_ab"])),
-                                float(row.get("_preclosure_speed_ba", row["speed_ba"])),
-                                int(row["link_id"]),
-                            ),
+                            (ca, cb, sa, sb, ta, tb,
+                             _sf(row.get("_preclosure_capacity_ab", ca), ca),
+                             _sf(row.get("_preclosure_capacity_ba", cb), cb),
+                             _sf(row.get("_preclosure_speed_ab", sa), sa),
+                             _sf(row.get("_preclosure_speed_ba", sb), sb),
+                             int(row["link_id"])),
                         )
                     conn.commit()
                     conn.close()

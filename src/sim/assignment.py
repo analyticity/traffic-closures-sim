@@ -30,9 +30,66 @@ from aequilibrae import Project
 from aequilibrae.matrix import AequilibraeMatrix
 from aequilibrae.paths import TrafficAssignment, TrafficClass
 
+from sim.defaults import SIM_DEFAULTS
 from sim.io_project import load_config
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Methodology defaults – sourced from centralized defaults.py.
+# YAML overrides merge on top via load_config.
+# ---------------------------------------------------------------------------
+
+_BPR_DEFAULTS = SIM_DEFAULTS["assignment"]["bpr"]
+_DEFAULT_BPR_BY_LINK_TYPE: Dict[str, Dict[str, float]] = _BPR_DEFAULTS["by_link_type"]
+_DEFAULT_DAILY_CAP_FACTOR: Dict[str, Any] = _BPR_DEFAULTS["daily_capacity_factor"]
+_DEFAULT_MULTI_CLASS = SIM_DEFAULTS["assignment"]["multi_class"]["classes"]
+
+
+def _apply_bpr_defaults(bpr_params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge YAML BPR overrides on top of built-in defaults."""
+    base: Dict[str, Any] = {
+        "vdf_function": _BPR_DEFAULTS["vdf_function"],
+        "per_link": _BPR_DEFAULTS["per_link"],
+        "alpha_default": _BPR_DEFAULTS["alpha_default"],
+        "beta_default": _BPR_DEFAULTS["beta_default"],
+        "daily_capacity_factor": dict(_DEFAULT_DAILY_CAP_FACTOR),
+        "by_link_type": {k: dict(v) for k, v in _DEFAULT_BPR_BY_LINK_TYPE.items()},
+    }
+    if not bpr_params:
+        return base
+    merged = dict(base)
+    for key, val in bpr_params.items():
+        if key == "by_link_type" and isinstance(val, dict):
+            merged_lt = {k: dict(v) for k, v in _DEFAULT_BPR_BY_LINK_TYPE.items()}
+            for lt, lt_val in val.items():
+                if lt in merged_lt and isinstance(lt_val, dict):
+                    merged_lt[lt].update(lt_val)
+                else:
+                    merged_lt[lt] = lt_val
+            merged["by_link_type"] = merged_lt
+        elif key == "daily_capacity_factor" and isinstance(val, dict):
+            merged_dcf = dict(_DEFAULT_DAILY_CAP_FACTOR)
+            for dk, dv in val.items():
+                if dk == "by_link_type" and isinstance(dv, dict):
+                    merged_dcf_lt = dict(_DEFAULT_DAILY_CAP_FACTOR.get("by_link_type", {}))
+                    merged_dcf_lt.update(dv)
+                    merged_dcf["by_link_type"] = merged_dcf_lt
+                else:
+                    merged_dcf[dk] = dv
+            merged["daily_capacity_factor"] = merged_dcf
+        else:
+            merged[key] = val
+    return merged
+
+
+def _resolve_multi_class(mc_cfg: Optional[Dict[str, Any]]) -> Optional[list]:
+    """Return multi-class list, using built-in defaults when YAML omits classes."""
+    if mc_cfg is None:
+        mc_cfg = {}
+    if not mc_cfg.get("enabled", True):
+        return None
+    return list(mc_cfg.get("classes", _DEFAULT_MULTI_CLASS))
 
 
 def resolve_daily_cap_factor_default(bpr_cfg: dict) -> float:
@@ -152,7 +209,7 @@ def build_graph(
 
     if bpr_parameters and bpr_parameters.get("per_link") and "link_type" in gdf.columns:
         by_lt = bpr_parameters.get("by_link_type") or {}
-        a_default = float(bpr_parameters.get("alpha_default", 0.15))
+        a_default = float(bpr_parameters.get("alpha_default", 0.85))
         b_default = float(bpr_parameters.get("beta_default", 4.0))
         lt_series = gdf["link_type"].astype(str)
         gdf["alpha"] = lt_series.map(
@@ -174,6 +231,12 @@ def build_graph(
         dcf_by_lt = {}
 
     if "capacity" in gdf.columns:
+        n_nan = int(gdf["capacity"].isna().sum())
+        if n_nan:
+            import warnings
+            warnings.warn(f"Graph has {n_nan} links with NaN capacity — filling with 50*dcf")
+            gdf["capacity"] = gdf["capacity"].fillna(50.0)
+
         if dcf_by_lt and "link_type" in gdf.columns:
             lt_s = gdf["link_type"].astype(str)
             dcf_series = lt_s.map(
@@ -198,10 +261,10 @@ def _resolve_vdf_params(
         return {"alpha": "alpha", "beta": "beta"}
     if bpr_parameters and not bpr_parameters.get("per_link"):
         return {
-            "alpha": float(bpr_parameters.get("alpha_default", bpr_parameters.get("alpha", 0.15))),
+            "alpha": float(bpr_parameters.get("alpha_default", bpr_parameters.get("alpha", 0.85))),
             "beta": float(bpr_parameters.get("beta_default", bpr_parameters.get("beta", 4.0))),
         }
-    return {"alpha": 0.15, "beta": 4.0}
+    return {"alpha": 0.85, "beta": 4.0}
 
 
 def _resolve_time_field(graph) -> str:
@@ -532,13 +595,13 @@ def _run_assignment_pass(
     logger.info(f"   Core '{core_name}': {mat.zones} zones, demand={total_demand:,.0f}")
 
     gc_cfg = assign_cfg.get("generalized_cost") or {}
-    gc_enabled = bool(gc_cfg.get("enabled", False))
-    gc_field = str(gc_cfg["fixed_cost_field"]) if gc_enabled and "fixed_cost_field" in gc_cfg else None
-    gc_mult = float(gc_cfg.get("fixed_cost_multiplier", 0.0)) if gc_enabled else 0.0
+    gc_enabled = bool(gc_cfg.get("enabled", True))
+    gc_field = str(gc_cfg.get("fixed_cost_field", "distance")) if gc_enabled else None
+    gc_mult = float(gc_cfg.get("fixed_cost_multiplier", 0.006)) if gc_enabled else 0.0
     gc_vot = float(gc_cfg.get("vot", 1.0))
-    bpr_params = dict(assign_cfg.get("bpr") or {}) or None
+    bpr_params = _apply_bpr_defaults(assign_cfg.get("bpr") or {})
     mc_cfg = assign_cfg.get("multi_class") or {}
-    multi_classes = list(mc_cfg["classes"]) if mc_cfg.get("enabled") and "classes" in mc_cfg else None
+    multi_classes = _resolve_multi_class(mc_cfg)
 
     logger.info(f"\n3) Running {algorithm.upper()} ...")
     project = Project()
@@ -605,7 +668,7 @@ def _run_assignment_pass(
             )
 
 
-def run_assignment(config_path: str | Path = "config/sim.yaml") -> None:
+def run_assignment(config_path: str | Path = "config/brno/sim.yaml") -> None:
     cfg = load_config(config_path)
     calib_cfg = cfg.get("calibration") or {}
     algorithm = str(calib_cfg.get("algorithm", "bfw"))
@@ -622,7 +685,7 @@ def run_assignment(config_path: str | Path = "config/sim.yaml") -> None:
     )
 
 
-def run_warm_skim_assignment(config_path: str | Path = "config/sim.yaml") -> None:
+def run_warm_skim_assignment(config_path: str | Path = "config/brno/sim.yaml") -> None:
     """Shorter assignment pass with skims always saved, for impedance before ``distribute``."""
     cfg = load_config(config_path)
     warm = (cfg.get("assignment") or {}).get("warm_skim_pass") or {}

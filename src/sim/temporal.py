@@ -6,9 +6,10 @@ derived from observed traffic counts.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import pandas as pd
 
@@ -16,9 +17,9 @@ from sim.defaults import LOCALE_DEFAULTS
 from sim.fetch_datasets import ensure_csd2025_validation_parquet, normalize_csd_count_columns
 from sim.io_project import load_config, load_locale
 
-# ---------------------------------------------------------------------------
-# Day classification
-# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+# --- Day classification ---
 
 _DEFAULT_HOLIDAYS_MD = [tuple(pair) for pair in LOCALE_DEFAULTS["holidays_md"]]
 
@@ -54,9 +55,7 @@ def classify_day(d: date | str, cfg: Dict[str, Any] | None = None) -> str:
     return "sunday"
 
 
-# ---------------------------------------------------------------------------
-# Learn profile from CSD2020
-# ---------------------------------------------------------------------------
+# --- Learn profile from CSD ---
 
 def _classify_csd_road(sil: str) -> str:
     """Classify CSD road code to coarse class.
@@ -177,17 +176,18 @@ def learn_day_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "temporal_profile.json"
     out_path.write_text(json.dumps(profile, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"Temporal profile saved: {out_path}")
-    print(f"  Day factors: {day_factors}")
-    print(f"  Period shares: day={day_share:.1%} evening={evening_share:.1%} night={night_share:.1%}")
-    print(f"  Road classes: {list(by_class.keys())}")
+    logger.info("Temporal profile saved: %s", out_path)
+    logger.info("  Day factors: %s", day_factors)
+    logger.info(
+        "  Period shares: day=%.1f%% evening=%.1f%% night=%.1f%%",
+        day_share * 100, evening_share * 100, night_share * 100,
+    )
+    logger.info("  Road classes: %s", list(by_class.keys()))
 
     return profile
 
 
-# ---------------------------------------------------------------------------
-# Query helpers
-# ---------------------------------------------------------------------------
+# --- Query helpers ---
 
 def load_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Load the learned temporal profile from disk."""
@@ -259,11 +259,9 @@ def day_info(d: date | str, profile: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
+# --- CLI entry point ---
 
 def run_learn_profile(config_path: str | Path = "config/brno/sim.yaml") -> None:
     cfg = load_config(config_path)
-    print("=== LEARN TEMPORAL PROFILE ===")
+    logger.info("Learning temporal profile")
     learn_day_profile(cfg)

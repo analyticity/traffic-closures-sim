@@ -34,6 +34,7 @@ SIM_DEFAULTS: Dict[str, Any] = {
     "api": {
         "host": "0.0.0.0",
         "port": 8000,
+        "fallback_map_center": [49.75, 15.47],
     },
 
     # ------------------------------------------------------------------
@@ -47,6 +48,17 @@ SIM_DEFAULTS: Dict[str, Any] = {
         },
         "isolated_components": {
             "enabled": True,
+        },
+        "map_export": {
+            "dpi": 400,
+            "figsize": [15.0, 15.0],
+            "palette": {
+                "figure": "#FFFFFF",
+                "title": "#000000",
+                "links_before": "#70747D",
+                "links_after": "#545454",
+                "bbox": "#3A4442",
+            },
         },
     },
 
@@ -257,6 +269,7 @@ SIM_DEFAULTS: Dict[str, Any] = {
             "ipf_max_iter": 200,
             "ipf_tolerance": 0.001,
             "blend_alpha": 0.7,
+            "uniform_impedance_fallback": 5000.0,
         },
     },
 
@@ -330,6 +343,32 @@ SIM_DEFAULTS: Dict[str, Any] = {
             "convergence_tol": 0.001,
             "global_residual_damping": 0.25,
         },
+
+        "matching": {
+            "corridor_score_weights": {"distance": 0.30, "bearing": 0.30, "name": 0.40},
+            "road_class_weights": {
+                "motorway": 1.00, "trunk": 0.95, "primary": 0.90,
+                "secondary": 0.75, "tertiary": 0.55, "residential": 0.30,
+                "other": 0.20,
+            },
+            "link_type_penalty": 0.6,
+            "min_vol_for_csd_lw": 100,
+            "synthetic_objectid_base": 8_000_000,
+        },
+
+        "benchmarks": {
+            "geh_lt5_pass_pct": 85.0,
+            "jt_pass_pct": 85.0,
+        },
+
+        "screenline_factors": {
+            "ratio_max": 5.0,
+            "ratio_min": 0.2,
+            "clip_min": 0.5,
+            "clip_max": 2.0,
+            "global_min": 0.8,
+            "global_max": 1.25,
+        },
     },
 
     # ------------------------------------------------------------------
@@ -342,6 +381,14 @@ SIM_DEFAULTS: Dict[str, Any] = {
             "timeout_s": 60,
             "retries": 3,
             "user_agent": "simulation-pipeline/1.0",
+        },
+        "closures_db": {
+            "host": "REDACTED_HOST",
+            "port": 5432,
+            "dbname": "traffic",
+            "user": "",
+            "password": "",
+            "bbox_margin_deg": 0.02,
         },
     },
 

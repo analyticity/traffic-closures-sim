@@ -22,9 +22,7 @@ from sim._metrics import compute_geh
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
+# --- Data structures ---
 
 @dataclass
 class ScreenlineDef:
@@ -67,9 +65,7 @@ class ScreenlineResult:
         }
 
 
-# ---------------------------------------------------------------------------
-# Loader
-# ---------------------------------------------------------------------------
+# --- Loader ---
 
 def load_screenlines(config_path: str | Path) -> List[ScreenlineDef]:
     """Load screenline definitions from YAML."""
@@ -121,9 +117,7 @@ def load_screenlines(config_path: str | Path) -> List[ScreenlineDef]:
     return result
 
 
-# ---------------------------------------------------------------------------
-# Link resolver (explicit + geometry)
-# ---------------------------------------------------------------------------
+# --- Link resolver ---
 
 def _match_attr_filter(row: pd.Series, attr_filter: Dict[str, str]) -> bool:
     """Check if a link row matches ALL attribute filter constraints.
@@ -329,9 +323,7 @@ def resolve_screenline_links(
     return resolved
 
 
-# ---------------------------------------------------------------------------
-# Evaluator
-# ---------------------------------------------------------------------------
+# --- Evaluator ---
 
 def _get_link_volume(
     vol_df: pd.DataFrame,
@@ -459,9 +451,7 @@ def evaluate_all_screenlines(
     return results
 
 
-# ---------------------------------------------------------------------------
-# Auto-generation from gateway metadata + CSD data
-# ---------------------------------------------------------------------------
+# --- Auto-generation from gateway metadata + CSD data ---
 
 def auto_generate_screenlines(
     cfg: Dict[str, Any],

@@ -53,9 +53,7 @@ logger = logging.getLogger(__name__)
 
 from sim.calibration_state import CalibrationRun
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# --- Helpers ---
 
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
@@ -78,10 +76,15 @@ _SCREENLINE_TO_GATEWAY = {
     "I52_south": "I52_S",
 }
 
+_MAJOR_ROAD_TYPES = frozenset({
+    "trunk", "trunk_link", "motorway", "motorway_link", "primary", "primary_link",
+})
+_MAJOR_ROAD_TYPES_STRICT = frozenset({
+    "trunk", "trunk_link", "motorway", "motorway_link",
+})
 
-# ---------------------------------------------------------------------------
-# Gateway calibration helpers
-# ---------------------------------------------------------------------------
+
+# --- Gateway calibration helpers ---
 
 def _load_gateway_zone_map(
     cfg: Dict[str, Any],
@@ -267,9 +270,7 @@ def _compute_gateway_modeled_volumes(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Observed data loaders
-# ---------------------------------------------------------------------------
+# --- Observed data loaders ---
 
 def load_pentlogram(cfg: Dict[str, Any]) -> gpd.GeoDataFrame:
     geojson_path = Path(_get(
@@ -664,9 +665,7 @@ def _filter_csd_by_model_area_region(
     return df
 
 
-# ---------------------------------------------------------------------------
-# Spatial matching
-# ---------------------------------------------------------------------------
+# --- Spatial matching ---
 
 def _load_network_links(project_dir: Path) -> gpd.GeoDataFrame:
     project = Project()
@@ -799,7 +798,8 @@ def _aggregate_corridor_volumes(
             if matched_name and cand_name and matched_name == cand_name:
                 name_score = 1.0
 
-            score = 0.30 * dist_score + 0.30 * bearing_score + 0.40 * name_score
+            _csw = _SIM_DEFAULTS["calibration"]["matching"]["corridor_score_weights"]
+            score = _csw["distance"] * dist_score + _csw["bearing"] * bearing_score + _csw["name"] * name_score
             if score > best_score:
                 best_score = score
                 best_vol = float(link_vol[ci])
@@ -972,7 +972,7 @@ def match_counts_to_links(
             q = 0.25 * (1.0 - dn) + 0.25 * (1.0 - bp) + 0.25 * rw + 0.25 * vb
 
             if lt.endswith("_link") and _TYPE_FAMILY.get(lt) in cand_families:
-                q *= 0.6
+                q *= _SIM_DEFAULTS["calibration"]["matching"]["link_type_penalty"]
 
             if q > best_q:
                 best_q = q
@@ -1003,9 +1003,8 @@ def match_counts_to_links(
 
         if n_conflicts > 0 and conflict_resolution == "nearest":
             obs_col_for_sort = "observed_car" if "observed_car" in joined.columns else None
-            _MAJOR_TYPES = {"trunk", "trunk_link", "motorway", "motorway_link", "primary", "primary_link"}
             is_major = (
-                joined["link_type"].astype(str).isin(_MAJOR_TYPES)
+                joined["link_type"].astype(str).isin(_MAJOR_ROAD_TYPES)
                 if "link_type" in joined.columns
                 else pd.Series(False, index=joined.index)
             )
@@ -1048,9 +1047,8 @@ def match_counts_to_links(
         # E.g. a 9k pentlogram segment from a road below a bridge matched
         # to a 62k trunk link above — clearly a spatial mis-match.
         if "link_type" in joined.columns:
-            _MAJOR_EX = {"trunk", "trunk_link", "motorway", "motorway_link"}
             lt_str = joined["link_type"].astype(str)
-            is_major = lt_str.isin(_MAJOR_EX)
+            is_major = lt_str.isin(_MAJOR_ROAD_TYPES_STRICT)
             obs_car = pd.to_numeric(
                 joined["observed_car"] if "observed_car" in joined.columns else 0,
                 errors="coerce",
@@ -1122,18 +1120,6 @@ def match_counts_to_links(
                 & (_obs_for_conf > 0)
                 & (vol_vals / _obs_for_conf.clip(lower=1) > 2.0)
             )
-            # Debug: show per-row conditions for low_conf
-            for _i, _row in joined.iterrows():
-                _ns = few_sections.loc[_i]
-                _vv = vol_vals.loc[_i]
-                _oc = _obs_for_conf.loc[_i]
-                _road = _row.get("csd_road", _row.get("osm_ref", "?"))
-                if _ns < 3 and _vv > 0 and _oc > 0:
-                    logger.info(
-                        "    low_conf candidate: road=%s sect=%.0f vol=%.0f obs=%.0f "
-                        "vol/obs=%.2f excluded=%s",
-                        _road, _ns, _vv, _oc, _vv / max(_oc, 1), _row["_excluded"],
-                    )
             n_lc = int(low_conf.sum())
             if n_lc > 0:
                 joined.loc[low_conf, "_excluded"] = True
@@ -1163,8 +1149,7 @@ def match_counts_to_links(
     # per direction and misses the mismatch.
     corr_col = "_corridor_volume" if "_corridor_volume" in joined.columns else None
     if corr_col and "link_type" in joined.columns:
-        _MAJOR_POST = {"trunk", "trunk_link", "motorway", "motorway_link"}
-        is_major_p = joined["link_type"].astype(str).isin(_MAJOR_POST)
+        is_major_p = joined["link_type"].astype(str).isin(_MAJOR_ROAD_TYPES_STRICT)
         obs_car_p = pd.to_numeric(
             joined["observed_car"] if "observed_car" in joined.columns else 0,
             errors="coerce",
@@ -1309,9 +1294,7 @@ def _export_matching_diagnostics(
     logger.info(f"  Matching diagnostics: {out_path} ({len(diag)} rows)")
 
 
-# ---------------------------------------------------------------------------
-# Statistics: GEH, R², RMSE
-# ---------------------------------------------------------------------------
+# --- Statistics: GEH, R², RMSE ---
 
 from sim._metrics import compute_geh  # noqa: E402 — re-exported for backward compat
 
@@ -1523,9 +1506,7 @@ def compute_class_volume_breakdown(
 
 
 
-# ---------------------------------------------------------------------------
-# Aggregate CSD helpers (for validation)
-# ---------------------------------------------------------------------------
+# --- Aggregate CSD helpers (for validation) ---
 
 def _classify_csd_road(sil: str) -> str:
     s = str(sil).strip().upper()
@@ -1562,9 +1543,7 @@ def aggregate_model_by_class(links: gpd.GeoDataFrame, vol_col: str) -> pd.DataFr
     ).reset_index()
 
 
-# ---------------------------------------------------------------------------
-# CSD split for calibration / validation
-# ---------------------------------------------------------------------------
+# --- CSD split for calibration / validation ---
 
 def split_csd_for_calibration(
     csd: pd.DataFrame,
@@ -1756,7 +1735,7 @@ def load_csd_as_link_counts(
             first = top_tier.iloc[0]
         lid = first.get("link_id", matched_links.index[0])
         rows.append({
-            "objectid": 8_000_000 + len(rows),
+            "objectid": _SIM_DEFAULTS["calibration"]["matching"]["synthetic_objectid_base"] + len(rows),
             "link_id": lid,
             "geometry": first.geometry,
             "name": str(first.get("name", "") or ""),
@@ -1785,9 +1764,7 @@ def load_csd_as_link_counts(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Journey time validation
-# ---------------------------------------------------------------------------
+# --- Journey time validation ---
 
 _CAR_LINK_TYPES_FOR_SPEED = frozenset({
     "motorway", "motorway_link", "trunk", "trunk_link",
@@ -1796,7 +1773,7 @@ _CAR_LINK_TYPES_FOR_SPEED = frozenset({
     "living_street",
 })
 
-from sim.defaults import LOCALE_DEFAULTS as _LOCALE_DEFAULTS
+from sim.defaults import LOCALE_DEFAULTS as _LOCALE_DEFAULTS, SIM_DEFAULTS as _SIM_DEFAULTS
 
 _CZECH_REFERENCE_SPEEDS: Dict[str, float] = {
     **{k: float(v) for k, v in _LOCALE_DEFAULTS["reference_speeds"].items()},
@@ -1883,9 +1860,7 @@ def validate_journey_times(
     return results
 
 
-# ---------------------------------------------------------------------------
-# Supply parameter tuning (outer loop)
-# ---------------------------------------------------------------------------
+# --- Supply parameter tuning (outer loop) ---
 
 @dataclass
 class SupplyParams:
@@ -2154,9 +2129,7 @@ def run_supply_tuning(config_path: str | Path = "config/brno/sim.yaml") -> None:
     run_calibration(config_path)
 
 
-# ---------------------------------------------------------------------------
-# Convergence helpers
-# ---------------------------------------------------------------------------
+# --- Convergence helpers ---
 
 def _check_final_convergence(
     history: List[Dict[str, Any]],
@@ -2190,9 +2163,7 @@ def _check_final_convergence(
     return float(final.get("geh_lt5_pct", 0)) >= geh_target
 
 
-# ---------------------------------------------------------------------------
-# ODME – Spiess gradient OD matrix estimation
-# ---------------------------------------------------------------------------
+# --- ODME – Spiess gradient OD matrix estimation ---
 
 def _sr_val(sr: Any, key: str) -> float:
     """Extract a numeric value from a screenline result (dict or dataclass)."""
@@ -2976,9 +2947,7 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
         logger.info(f"  Final assignment: {out_path}")
 
 
-# ---------------------------------------------------------------------------
-# Legacy iterative calibration
-# ---------------------------------------------------------------------------
+# --- Legacy iterative calibration ---
 
 def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
     """FSM iterative calibration: assign → compare → scale → repeat."""
@@ -3693,9 +3662,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
         logger.info(f"Final assignment: {out_path}")
 
 
-# ---------------------------------------------------------------------------
-# Independent validation (CSD)
-# ---------------------------------------------------------------------------
+# --- Independent validation (CSD) ---
 
 _CSD_COMPATIBLE_LINK_TYPES: dict = {
     "motorway": {"motorway", "motorway_link"},
@@ -3704,7 +3671,7 @@ _CSD_COMPATIBLE_LINK_TYPES: dict = {
     "tertiary": {"tertiary", "tertiary_link", "secondary", "secondary_link", "unclassified", "residential"},
 }
 
-_MIN_VOL_FOR_CSD_LW = 100  # boundary links with < 100 veh/day are artifacts
+_MIN_VOL_FOR_CSD_LW = _SIM_DEFAULTS["calibration"]["matching"]["min_vol_for_csd_lw"]
 
 
 def match_csd_to_links(
@@ -4303,9 +4270,7 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
         logger.info("  Clean (closure-free) assignment saved.")
 
 
-# ---------------------------------------------------------------------------
-# Lightweight diagnostics refresh (no assignment, no calibration)
-# ---------------------------------------------------------------------------
+# --- Lightweight diagnostics refresh (no assignment, no calibration) ---
 
 def run_match_diagnostics(config_path: str | Path = "config/brno/sim.yaml") -> None:
     """Regenerate matching_diagnostics.csv from existing assignment results.

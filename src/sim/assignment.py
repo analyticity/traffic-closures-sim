@@ -35,10 +35,7 @@ from sim.io_project import load_config
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Methodology defaults – sourced from centralized defaults.py.
-# YAML overrides merge on top via load_config.
-# ---------------------------------------------------------------------------
+# --- Methodology defaults ---
 
 _BPR_DEFAULTS = SIM_DEFAULTS["assignment"]["bpr"]
 _DEFAULT_BPR_BY_LINK_TYPE: Dict[str, Dict[str, float]] = _BPR_DEFAULTS["by_link_type"]
@@ -100,9 +97,7 @@ def resolve_daily_cap_factor_default(bpr_cfg: dict) -> float:
     return float(dcf_raw)
 
 
-# ---------------------------------------------------------------------------
-# Pre-flight checks
-# ---------------------------------------------------------------------------
+# --- Pre-flight checks ---
 
 def _check_connectors(project_dir: Path) -> Dict[str, Any]:
     """Verify that centroid connectors actually reach the road network."""
@@ -167,9 +162,7 @@ def fix_node_ids(project_dir: Path) -> int:
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Graph builder (cacheable across iterations)
-# ---------------------------------------------------------------------------
+# --- Graph builder ---
 
 def build_graph(
     project: Project,
@@ -233,7 +226,6 @@ def build_graph(
     if "capacity" in gdf.columns:
         n_nan = int(gdf["capacity"].isna().sum())
         if n_nan:
-            import warnings
             warnings.warn(f"Graph has {n_nan} links with NaN capacity — filling with 50*dcf")
             gdf["capacity"] = gdf["capacity"].fillna(50.0)
 
@@ -277,9 +269,7 @@ def _resolve_time_field(graph) -> str:
     return time_field
 
 
-# ---------------------------------------------------------------------------
-# Low-level assignment (reusable by calibration loop)
-# ---------------------------------------------------------------------------
+# --- Low-level assignment ---
 
 def execute_assignment(
     project: Project,
@@ -544,9 +534,7 @@ def _detect_volume_col(df: pd.DataFrame) -> str | None:
     )
 
 
-# ---------------------------------------------------------------------------
-# CLI entry-point
-# ---------------------------------------------------------------------------
+# --- CLI entry-point ---
 
 def _run_assignment_pass(
     config_path: str | Path,
@@ -720,9 +708,7 @@ def run_warm_skim_assignment(config_path: str | Path = "config/brno/sim.yaml") -
             warnings.showwarning = old_showwarning
 
 
-# ---------------------------------------------------------------------------
-# Temporal assignment (date + period)
-# ---------------------------------------------------------------------------
+# --- Temporal assignment ---
 
 def run_temporal_assignment(
     config_path: str | Path,

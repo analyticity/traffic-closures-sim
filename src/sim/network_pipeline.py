@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import shutil
@@ -18,21 +19,15 @@ from aequilibrae import Project
 from shapely.geometry import box
 
 from sim.aequilibrae_paths import resolve_project_database_path
+from sim.defaults import SIM_DEFAULTS
 from sim.io_project import get_metric_epsg, load_config
 
-# Palette for PNG map exports (thesis UI / print).
-# Full set: #000000 #3A4442 #423E3A #545454 #5E6762 #70747D #878D85 #A6A6A6 #B2B4AB #DFDCD3 #E8E4D9 #FFFFFF
-NETWORK_MAP_PALETTE = {
-    "figure": "#FFFFFF",
-    "title": "#000000",
-    "links_before": "#70747D",
-    "links_after": "#545454",
-    "bbox": "#3A4442",
-}
+logger = logging.getLogger(__name__)
 
-# Print-oriented exports (~15 in × 400 DPI ≈ 6000 px edge — fine for ~¼ A1 at 300 DPI)
-NETWORK_MAP_EXPORT_DPI = 400
-NETWORK_MAP_EXPORT_FIGSIZE: Tuple[float, float] = (15.0, 15.0)
+_MAP_CFG = SIM_DEFAULTS["network"]["map_export"]
+NETWORK_MAP_PALETTE: Dict[str, str] = _MAP_CFG["palette"]
+NETWORK_MAP_EXPORT_DPI: int = _MAP_CFG["dpi"]
+NETWORK_MAP_EXPORT_FIGSIZE: Tuple[float, float] = tuple(_MAP_CFG["figsize"])
 
 
 def _save_network_links_map_png(
@@ -245,9 +240,7 @@ def create_or_open_project(project_dir: Path) -> Project:
     return project
 
 
-# ----------------------------
-# CRS helpers
-# ----------------------------
+# --- CRS helpers ---
 
 def _guess_crs_from_coords(geoms: gpd.GeoSeries, fallback_epsg: int = 5514) -> str:
     """
@@ -351,9 +344,7 @@ def _native_bbox_from_wgs84_bbox(
     return minx, miny, maxx, maxy
 
 
-# ----------------------------
-# Deterministic trimming
-# ----------------------------
+# --- Deterministic trimming ---
 
 def compute_bbox_from_links_raw(project: Project) -> Tuple[float, float, float, float]:
     """
@@ -507,9 +498,7 @@ def trim_network_to_bbox_raw(
     return {"nodes_deleted": nodes_deleted, "links_deleted": links_deleted}
 
 
-# ----------------------------
-# Non-drivable link removal (OSM highway → link_type)
-# ----------------------------
+# --- Non-drivable link removal (OSM highway → link_type) ---
 
 # link_type values that are not motor-vehicle roads; keep configurable via sim.yaml
 DEFAULT_EXCLUDED_HIGHWAY_LINK_TYPES = frozenset(
@@ -708,9 +697,7 @@ def remove_disconnected_components_keep_largest(
     }
 
 
-# ----------------------------
-# OSM enrichment helpers
-# ----------------------------
+# --- OSM enrichment helpers ---
 
 def _normalize_ref(value: Any) -> str:
     text = str(value or "").upper().strip()
@@ -982,7 +969,7 @@ def enrich_links_from_osm(
         }
 
     if "osm_id" not in links_df.columns:
-        print("⚠ links table has no osm_id column -> OSM enrichment skipped")
+        logger.warning("links table has no osm_id column; OSM enrichment skipped")
         return {
             "total_links": int(len(links_df)),
             "matched_osm_id": 0,
@@ -1002,7 +989,7 @@ def enrich_links_from_osm(
         effective_bbox = _network_bbox_wgs84_from_project(project, crs_epsg_hint)
         download_source = "project_extent"
     except Exception as e:
-        print(f"⚠ could not derive enrichment bbox from current project extent: {e}")
+        logger.warning("could not derive enrichment bbox from current project extent: %s", e)
         if bbox_cfg:
             effective_bbox = tuple(float(x) for x in bbox_cfg)
             download_source = "config_bbox"
@@ -1017,11 +1004,11 @@ def enrich_links_from_osm(
             raise RuntimeError("Could not determine any OSM download area for enrichment")
 
     if effective_bbox is not None:
-        print("OSM enrichment bbox (WGS84):", effective_bbox)
+        logger.info("OSM enrichment download area (WGS84): %s", effective_bbox)
     elif enrich_polygon is not None:
-        print("OSM enrichment area: buffered polygon bounds =", enrich_polygon.bounds)
+        logger.info("OSM enrichment download area (buffered polygon): %s", enrich_polygon.bounds)
     else:
-        print("OSM enrichment area: place_name =", place_name)
+        logger.info("OSM enrichment download area: place_name=%s", place_name)
 
     edges = _download_osm_drive_edges(
         place_name=place_name if (effective_bbox is None and enrich_polygon is None) else None,
@@ -1059,7 +1046,6 @@ def enrich_links_from_osm(
     db_path = _project_db_path(project_dir)
     conn = sqlite3.connect(str(db_path), timeout=30.0)
     try:
-        # Clear old enrichment first, so reruns don't keep stale values
         conn.execute(
             """
             UPDATE links
@@ -1092,7 +1078,7 @@ def enrich_links_from_osm(
         pass
 
     if not updates:
-        print("⚠ no link matched OSM attributes by osm_id")
+        logger.warning("no link matched OSM attributes by osm_id")
 
     corridor_fill_stats = _fill_missing_refs_from_named_corridors(project, project_dir)
 
@@ -1118,9 +1104,7 @@ def enrich_links_from_osm(
     }
 
 
-# ----------------------------
-# Main
-# ----------------------------
+# --- Main ---
 
 def build_network_from_osm(
     config_path: str | Path = "config/brno/sim.yaml",
@@ -1135,7 +1119,7 @@ def build_network_from_osm(
 
     osm_cfg = cfg.get("osm", {}) or {}
     place_name: Optional[str] = osm_cfg.get("place_name")
-    bbox_cfg = cfg.get("model_bbox") or osm_cfg.get("bbox")  # [west, south, east, north] in WGS84
+    bbox_cfg = cfg.get("model_bbox") or osm_cfg.get("bbox")
     buffer_km = float(osm_cfg.get("buffer_km", 0))
 
     if not bbox_cfg and not place_name:
@@ -1151,15 +1135,18 @@ def build_network_from_osm(
     model_bbox_polygon = None
     if place_name and buffer_km > 0 and not bbox_cfg:
         download_km = buffer_km + _CONNECTIVITY_MARGIN_KM
-        print(
-            f"Geocoding '{place_name}' and buffering by {buffer_km} km "
-            f"(+{_CONNECTIVITY_MARGIN_KM} km connectivity margin → {download_km} km download) …"
+        logger.info(
+            "Geocoding %r, buffer %s km (+ %s km connectivity margin -> %s km download)",
+            place_name,
+            buffer_km,
+            _CONNECTIVITY_MARGIN_KM,
+            download_km,
         )
         place_poly = _geocode_place(place_name)
         model_bbox_polygon = box(*_buffer_polygon_km(place_poly, buffer_km, crs_epsg_hint).bounds)
         buffered_polygon = box(*_buffer_polygon_km(place_poly, download_km, crs_epsg_hint).bounds)
-        print(f"  model bbox  (WGS84): {model_bbox_polygon.bounds}")
-        print(f"  download bbox (WGS84): {buffered_polygon.bounds}")
+        logger.info("model bbox (WGS84): %s", model_bbox_polygon.bounds)
+        logger.info("download bbox (WGS84): %s", buffered_polygon.bounds)
 
     project = create_or_open_project(project_dir)
 
@@ -1174,9 +1161,9 @@ def build_network_from_osm(
             buf_box = box(*buffered_polygon.bounds)
             coverage = net_box.area / buf_box.area if buf_box.area > 0 else 1.0
             if coverage < 0.95:
-                print(
-                    f"Existing network covers only {coverage:.0%} of the buffered area "
-                    f"– rebuilding project from scratch …"
+                logger.info(
+                    "Existing network covers only %s of buffered area; rebuilding project from scratch",
+                    format(coverage, ".0%"),
                 )
                 project.close()
                 shutil.rmtree(project_dir)
@@ -1184,9 +1171,12 @@ def build_network_from_osm(
                 links_before = 0
                 nodes_before = 0
             else:
-                print("Existing network already covers the buffered area – skipping rebuild.")
+                logger.info("Existing network already covers the buffered area; skipping rebuild")
         except Exception as e:
-            print(f"⚠ could not check network extent vs buffer ({e}), keeping existing network")
+            logger.warning(
+                "could not check network extent vs buffer (%s), keeping existing network",
+                e,
+            )
 
     # --- Build network (only if empty) ---
     osm_imported_this_run = False
@@ -1196,29 +1186,28 @@ def build_network_from_osm(
             west, south, east, north = [float(x) for x in bbox_cfg]
             model_area = box(west, south, east, north)
             project.network.create_from_osm(model_area=model_area)
-            print(f"Network created from model_bbox (WGS84): {bbox_cfg}")
+            logger.info("Network created from model_bbox (WGS84): %s", bbox_cfg)
         elif buffered_polygon is not None:
             project.network.create_from_osm(model_area=buffered_polygon)
-            print(f"Network created from place_name '{place_name}' + {buffer_km} km buffer")
+            logger.info("Network from place_name %r + %s km buffer", place_name, buffer_km)
         else:
             project.network.create_from_osm(place_name=place_name)
-            print(f"Network created from place_name: {place_name}")
+            logger.info("Network created from place_name: %s", place_name)
 
     # --- Bbox for maps / metadata only (no link deletion) ---
     if bbox_cfg:
         bbox_native = _native_bbox_from_wgs84_bbox(project, bbox_cfg, crs_epsg_hint)
         bbox_wgs84_used = tuple(float(x) for x in bbox_cfg)
-        print("Reference bbox from config (WGS84):", bbox_wgs84_used)
-        print("Reference bbox (native):", bbox_native)
+        logger.info("Reference bbox from config (WGS84): %s", bbox_wgs84_used)
+        logger.info("Reference bbox (native): %s", bbox_native)
     else:
         bbox_native = compute_bbox_from_links_raw(project)
         bbox_wgs84_used = None
-        print("Network extent bbox (native):", bbox_native)
+        logger.info("Network extent bbox (native): %s", bbox_native)
 
     out_dir = Path(outputs_dir)
     _ensure_dir(out_dir)
 
-    # Raw-import map only when OSM was pulled this run (otherwise DB already processed).
     if osm_imported_this_run:
         try:
             links_df_pre = project.network.links.data
@@ -1237,13 +1226,13 @@ def build_network_from_osm(
                     title="Network after OSM import (before filters & trim)",
                     links_color=NETWORK_MAP_PALETTE["links_before"],
                 )
-                print(f"Wrote (pre-processing map): {png_before}")
+                logger.info("Wrote (pre-processing map): %s", png_before)
         except Exception as e:
-            print(f"⚠ could not write pre-processing map ({e})")
+            logger.warning("could not write pre-processing map (%s)", e)
     else:
-        print(
-            "Skipping links_native_before_processing.png (network loaded from existing project; "
-            "delete project DB to regenerate fresh OSM import snapshot)"
+        logger.info(
+            "Skipping %s (loaded existing project; delete project DB to regenerate)",
+            "links_native_before_processing.png",
         )
 
     trim_stats = {"nodes_deleted": 0, "links_deleted": 0}
@@ -1258,9 +1247,10 @@ def build_network_from_osm(
         else:
             excluded = set(DEFAULT_EXCLUDED_HIGHWAY_LINK_TYPES)
         require_car = bool(dn.get("require_mode_car", True))
-        print(
-            "Drivable-network filter: "
-            f"{len(excluded)} excluded link_type values, require_mode_car={require_car}"
+        logger.info(
+            "Drivable-network filter: %s excluded link_type values, require_mode_car=%s",
+            len(excluded),
+            require_car,
         )
         drivable_stats = remove_non_drivable_links(
             project,
@@ -1268,20 +1258,18 @@ def build_network_from_osm(
             excluded_link_types=excluded,
             require_mode_car=require_car,
         )
-        print("  removed links:", drivable_stats.get("links_removed", 0))
-        print("  pruned orphan nodes:", drivable_stats.get("nodes_pruned", 0))
+        logger.info("  removed links: %s", drivable_stats.get("links_removed", 0))
+        logger.info("  pruned orphan nodes: %s", drivable_stats.get("nodes_pruned", 0))
 
     iso = (cfg.get("network") or {}).get("isolated_components") or {}
     isolated_stats: Dict[str, Any] = {}
     if iso.get("enabled", True):
-        print("Largest-component filter: removing disconnected subgraphs")
+        logger.info("Largest-component filter: removing disconnected subgraphs")
         isolated_stats = remove_disconnected_components_keep_largest(project, project_dir)
-        print(
-            "  components (before):",
+        logger.info(
+            "  components (before): %s | removed links: %s | pruned orphan nodes: %s",
             isolated_stats.get("components", 0),
-            "| removed links:",
             isolated_stats.get("links_removed", 0),
-            "| pruned orphan nodes:",
             isolated_stats.get("nodes_pruned", 0),
         )
 
@@ -1300,20 +1288,21 @@ def build_network_from_osm(
             max(trim_bbox[2], model_trim[2]),
             max(trim_bbox[3], model_trim[3]),
         )
-    print(f"Trimming network to urban-core bbox (native): {trim_bbox}")
+    logger.info("Trimming network to urban-core bbox (native): %s", trim_bbox)
     trim_stats = trim_network_to_bbox_raw(project, trim_bbox, project_dir)
-    print(f"  trimmed: {trim_stats['links_deleted']} links, {trim_stats['nodes_deleted']} nodes")
+    logger.info("  trimmed: %s links, %s nodes", trim_stats["links_deleted"], trim_stats["nodes_deleted"])
     if trim_stats["links_deleted"] > 0 and iso.get("enabled", True):
-        print("  re-running isolated-component filter after trim …")
+        logger.info("  re-running isolated-component filter after trim")
         iso2 = remove_disconnected_components_keep_largest(project, project_dir)
         trim_stats["post_trim_iso_links_removed"] = iso2.get("links_removed", 0)
         trim_stats["post_trim_iso_nodes_pruned"] = iso2.get("nodes_pruned", 0)
-        print(
-            f"  post-trim components: {iso2.get('components', 0)} "
-            f"| removed links: {iso2.get('links_removed', 0)}"
+        logger.info(
+            "  post-trim components: %s | removed links: %s",
+            iso2.get("components", 0),
+            iso2.get("links_removed", 0),
         )
     bbox_native = compute_bbox_from_links_raw(project)
-    print(f"  final network extent (native): {bbox_native}")
+    logger.info("  final network extent (native): %s", bbox_native)
 
     # --- OSM enrichment of links ---
     enrich_stats = enrich_links_from_osm(
@@ -1324,7 +1313,7 @@ def build_network_from_osm(
         bbox_cfg=bbox_cfg,
         buffered_polygon=buffered_polygon,
     )
-    print("OSM enrichment:", enrich_stats)
+    logger.info("OSM enrichment: %s", enrich_stats)
 
     # --- Visual verification artifacts ---
     links_n = project.network.count_links()
@@ -1357,7 +1346,6 @@ def build_network_from_osm(
         encoding="utf-8",
     )
 
-    # Prepare GDFs for plotting/export
     links_df = project.network.links.data
     links_gdf_native = gpd.GeoDataFrame(links_df, geometry="geometry", crs=getattr(links_df, "crs", None))
     bbox_poly_native = box(*bbox_native)
@@ -1372,7 +1360,6 @@ def build_network_from_osm(
         links_color=NETWORK_MAP_PALETTE["links_after"],
     )
 
-    # Export GeoJSON (native coords)
     geojson_path_native = out_dir / "links_native.geojson"
     bbox_geojson_path_native = out_dir / "model_bbox_native.geojson"
 
@@ -1388,7 +1375,6 @@ def build_network_from_osm(
     links_gdf_native[available_cols].to_file(geojson_path_native, driver="GeoJSON")
     bbox_gdf_native.to_file(bbox_geojson_path_native, driver="GeoJSON")
 
-    # Optional: WGS84 export
     links_gdf_plot = links_gdf_native.copy()
     if links_gdf_plot.crs is None:
         links_gdf_plot = _as_gdf(links_gdf_plot, crs_epsg_hint)
@@ -1419,23 +1405,33 @@ def build_network_from_osm(
         bbox_geojson_path_wgs84 = out_dir / "model_bbox_wgs84.geojson"
         links_wgs84[available_cols].to_file(geojson_path_wgs84, driver="GeoJSON")
         bbox_wgs84.to_file(bbox_geojson_path_wgs84, driver="GeoJSON")
+        wgs_files = [
+            out_dir / "links_wgs84.png",
+            out_dir / "links_wgs84.geojson",
+            out_dir / "model_bbox_wgs84.geojson",
+        ]
+    else:
+        wgs_files = []
 
-    print("=== NETWORK BUILD DONE ===")
-    print("Project:", project_dir.resolve())
-    print("Nodes:", nodes_n, "Links:", links_n)
-    print("Bbox used for map artifacts (native):", bbox_native)
+    logger.info(
+        "Network build done: project=%s nodes=%s links=%s bbox_native=%s",
+        project_dir.resolve(),
+        nodes_n,
+        links_n,
+        bbox_native,
+    )
     if bbox_wgs84_used is not None:
-        print("Config reference bbox (WGS84):", bbox_wgs84_used)
-    print("Trim stats:", trim_stats)
-    print("Enrich stats:", enrich_stats)
-    print("Wrote:", counts_path)
-    print("Wrote:", png_path_native)
-    print("Wrote:", geojson_path_native)
-    print("Wrote:", bbox_geojson_path_native)
-    if wgs_ok:
-        print("Wrote:", out_dir / "links_wgs84.png")
-        print("Wrote:", out_dir / "links_wgs84.geojson")
-        print("Wrote:", out_dir / "model_bbox_wgs84.geojson")
+        logger.info("Config reference bbox (WGS84): %s", bbox_wgs84_used)
+    logger.info("Trim stats: %s", trim_stats)
+    logger.info("Enrich stats: %s", enrich_stats)
+    logger.info(
+        "Wrote: %s, %s, %s, %s%s",
+        counts_path,
+        png_path_native,
+        geojson_path_native,
+        bbox_geojson_path_native,
+        (", " + ", ".join(str(p) for p in wgs_files)) if wgs_files else "",
+    )
 
     project.close()
 

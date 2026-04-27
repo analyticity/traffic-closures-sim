@@ -18,6 +18,7 @@ Steps in this module:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -26,12 +27,12 @@ import pandas as pd
 import geopandas as gpd
 from aequilibrae.matrix import AequilibraeMatrix
 
+from sim.defaults import SIM_DEFAULTS
 from sim.io_project import load_config
 
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# P/A vector building
-# ---------------------------------------------------------------------------
+# --- P/A vector building ---
 
 def build_pa_vectors(
     zone_ids: np.ndarray,
@@ -52,9 +53,7 @@ def build_pa_vectors(
     return pa
 
 
-# ---------------------------------------------------------------------------
-# Impedance loading
-# ---------------------------------------------------------------------------
+# --- Impedance loading ---
 
 def _load_impedance(
     output_dir: Path,
@@ -101,9 +100,7 @@ def _euclidean_impedance(zones_gdf: gpd.GeoDataFrame, zone_ids: np.ndarray) -> n
     return np.sqrt(dx ** 2 + dy ** 2)
 
 
-# ---------------------------------------------------------------------------
-# Gravity calibration & application
-# ---------------------------------------------------------------------------
+# --- Gravity calibration & application ---
 
 def calibrate_gravity_simple(
     seed: np.ndarray,
@@ -145,7 +142,6 @@ def calibrate_gravity_simple(
     except Exception:
         pass
 
-    # Fallback: fit beta for T_ij ~ exp(-beta * c_ij)
     flat_t = seed.ravel()
     flat_c = impedance.ravel()
     mask = (flat_t > 0) & (flat_c > 0) & np.isfinite(flat_t) & np.isfinite(flat_c)
@@ -159,9 +155,7 @@ def calibrate_gravity_simple(
     return {"function": "EXPO", "beta": round(beta, 6)}
 
 
-# ---------------------------------------------------------------------------
-# IPF (Iterative Proportional Fitting)
-# ---------------------------------------------------------------------------
+# --- IPF (iterative proportional fitting) ---
 
 def run_ipf(
     seed: np.ndarray,
@@ -217,9 +211,7 @@ def run_ipf(
     return mat
 
 
-# ---------------------------------------------------------------------------
-# Pipeline orchestrator
-# ---------------------------------------------------------------------------
+# --- Pipeline orchestrator ---
 
 def run_distribution(config_path: str | Path = "config/brno/sim.yaml") -> None:
     """Run the distribution step: gravity calibration + IPF on the seed OD."""
@@ -228,7 +220,7 @@ def run_distribution(config_path: str | Path = "config/brno/sim.yaml") -> None:
     dist_cfg = _get_nested(cfg, ["demand", "distribution"], {})
 
     if not dist_cfg.get("enabled", True):
-        print("Distribution step disabled in config — skipping.")
+        logger.info("Distribution step disabled in config, skipping")
         return
 
     matrix_path = Path(demand_cfg.get("matrix_path", "data/demand/od_matrix.aem"))
@@ -236,21 +228,19 @@ def run_distribution(config_path: str | Path = "config/brno/sim.yaml") -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     core_name = str(cfg.get("calibration", {}).get("core_name", "wd_daily"))
 
-    print("=== TRIP DISTRIBUTION (Gravity + IPF) ===")
+    logger.info("Trip distribution: gravity and IPF")
 
     if not matrix_path.exists():
         raise FileNotFoundError(f"OD matrix not found: {matrix_path}. Run build-demand first.")
 
-    # Load seed matrix
     mat = AequilibraeMatrix()
     mat.load(str(matrix_path))
     mat.computational_view([core_name])
     seed = mat.matrix[core_name][:, :].copy().astype(np.float64)
     zone_index = mat.index[:].copy()
     n = len(zone_index)
-    print(f"  Seed: {n} zones, total={seed.sum():,.0f}")
+    logger.info("Seed: %d zones, total=%s", n, f"{float(seed.sum()):,.0f}")
 
-    # Load zones and population
     zones_gdf = _load_zones_for_distribution(cfg)
     zone_ids = np.array(sorted(zones_gdf["zone_id"].astype(int).unique()), dtype=np.int64)
     population = _load_population(cfg)
@@ -274,58 +264,58 @@ def run_distribution(config_path: str | Path = "config/brno/sim.yaml") -> None:
                 f"demand.distribution.impedance=skim but could not load a valid matrix from {skim_path} "
                 f"(check zone count matches matrix, n={n})."
             )
-        print("  Impedance: loaded from skims.aem (required mode)")
+        logger.info("Impedance: loaded from skims.aem (required mode)")
         imp_source = "skim"
     else:
         impedance = _load_impedance(output_dir, zone_index)
         if impedance is not None:
-            print("  Impedance: loaded from skims.aem")
+            logger.info("Impedance: loaded from skims.aem")
             imp_source = "skim"
         else:
-            print("  Impedance: Euclidean distance (no skims available)")
+            logger.info("Impedance: Euclidean distance (no skims available)")
             impedance = _euclidean_impedance(zones_gdf, zone_ids)
             if impedance.shape[0] != n:
-                print(f"  WARNING: impedance shape mismatch ({impedance.shape[0]} vs {n}), using uniform")
-                impedance = np.ones((n, n), dtype=np.float64) * 5000.0
+                logger.warning("Impedance shape mismatch (%d vs %d), using uniform", impedance.shape[0], n)
+                _fallback = float(SIM_DEFAULTS["demand"]["distribution"]["uniform_impedance_fallback"])
+                impedance = np.ones((n, n), dtype=np.float64) * _fallback
             imp_source = "euclidean"
 
-    # Gravity calibration
     deterrence = str(dist_cfg.get("deterrence_function", "EXPO"))
-    print(f"  Calibrating gravity model ({deterrence}) ...")
+    logger.info("Calibrating gravity model (%s)", deterrence)
     params = calibrate_gravity_simple(seed, impedance, function=deterrence)
     beta = params.get("beta", 0.0001)
-    print(f"  Gravity params: {params}")
+    logger.info("Gravity params: %s", params)
 
-    # Build P/A vectors
     pa_trip_rate = float(dist_cfg.get("pa_trip_rate", 2.5))
     pa_car_share = float(dist_cfg.get("pa_car_share", 0.50))
     pa_occupancy = float(dist_cfg.get("pa_occupancy", 1.3))
     pa = build_pa_vectors(zone_ids, population, pa_trip_rate, pa_car_share, pa_occupancy)
-    print(f"  P/A: total_production={pa['production'].sum():,.0f}")
+    logger.info("P/A: total_production=%s", f"{float(pa['production'].sum()):,.0f}")
 
     target_rows = pa["production"].values
     target_cols = pa["attraction"].values
 
-    # IPF to match row/column totals
     ipf_max_iter = int(dist_cfg.get("ipf_max_iter", 200))
     ipf_tol = float(dist_cfg.get("ipf_tolerance", 0.001))
-    print(f"  Running IPF (max_iter={ipf_max_iter}) ...")
+    logger.info("Running IPF (max_iter=%d)", ipf_max_iter)
     adjusted = run_ipf(seed, target_rows, target_cols,
                        max_iter=ipf_max_iter, tolerance=ipf_tol)
 
-    # Regularize: blend adjusted matrix with original seed to prevent divergence
     alpha = float(dist_cfg.get("blend_alpha", 0.7))
     blended = alpha * adjusted + (1.0 - alpha) * seed
-    print(f"  Blended (alpha={alpha}): total={blended.sum():,.0f} "
-          f"(seed={seed.sum():,.0f}, ipf={adjusted.sum():,.0f})")
+    logger.info(
+        "Blended (alpha=%s): total=%s (seed=%s, ipf=%s)",
+        alpha,
+        f"{float(blended.sum()):,.0f}",
+        f"{float(seed.sum()):,.0f}",
+        f"{float(adjusted.sum()):,.0f}",
+    )
 
-    # Write back
     mat.matrix[core_name][:, :] = blended
     mat.save()
     mat.close()
-    print(f"  Updated matrix: {matrix_path}")
+    logger.info("Updated matrix: %s", matrix_path)
 
-    # Save distribution report
     report = {
         "impedance_mode": imp_mode,
         "impedance_source": imp_source,
@@ -346,12 +336,10 @@ def run_distribution(config_path: str | Path = "config/brno/sim.yaml") -> None:
     }
     report_path = output_dir / "distribution_report.json"
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"  Report: {report_path}")
+    logger.info("Report: %s", report_path)
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+# --- Internal helpers ---
 
 def _get_nested(cfg: Any, path: list, default: Any = None) -> Any:
     cur = cfg

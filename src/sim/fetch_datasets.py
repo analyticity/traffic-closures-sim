@@ -21,21 +21,18 @@ try:
 except Exception:  # pragma: no cover
     gpd = None
 
-# Allow running as a standalone script
 if __name__ == "__main__":
     _src_dir = Path(__file__).resolve().parent.parent
     if _src_dir.exists() and str(_src_dir) not in sys.path:
         sys.path.insert(0, str(_src_dir))
 
+from sim.defaults import SIM_DEFAULTS
 from sim.io_project import get_metric_epsg, load_config
 from sim._text import strip_diacritics as _strip_diacritics, norm_col as _norm_col
 
 _logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Default Czech dataset registry -- shared across all cities.
-# YAML datasets.sources merges on top (overriding per-key).
-# ---------------------------------------------------------------------------
+# --- Default Czech dataset registry (YAML merges on top) ---
 
 _CZ_DEFAULT_SOURCES: Dict[str, Dict[str, Any]] = {
     "commuting_sldb2021": {
@@ -119,9 +116,7 @@ def _merge_dataset_sources(yaml_sources: Optional[Dict[str, Any]]) -> Dict[str, 
     return merged
 
 
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
+# --- Small helpers ---
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -416,9 +411,7 @@ def _read_csv_flexible(path: Path, *, delimiter: str = "auto", encoding: str = "
     raise RuntimeError(f"Failed to read CSV {path}: {last_err}")
 
 
-# ---------------------------------------------------------------------------
-# Download helpers
-# ---------------------------------------------------------------------------
+# --- Download helpers ---
 
 def download_file(
     url: str,
@@ -545,9 +538,7 @@ def download_atom_latest_file(
     return info
 
 
-# ---------------------------------------------------------------------------
-# Generic grouped-points preprocessing
-# ---------------------------------------------------------------------------
+# --- Grouped point centroids ---
 
 def _build_grouped_point_centroids_from_df(
     df: pd.DataFrame,
@@ -698,9 +689,7 @@ def preprocess_grouped_points_zip_to_centroids(
     )
 
 
-# ---------------------------------------------------------------------------
-# Specific preprocessors
-# ---------------------------------------------------------------------------
+# --- Preprocessors (dataset-specific) ---
 
 def preprocess_commuting_sldb2021(
     src_csv: Path,
@@ -1011,9 +1000,7 @@ def preprocess_population_sldb2021(
     }
 
 
-# ---------------------------------------------------------------------------
-# ArcGIS helpers
-# ---------------------------------------------------------------------------
+# --- ArcGIS ---
 
 def _load_aoi_bbox_wgs84(cfg: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
     mb = cfg.get("model_bbox")
@@ -1138,13 +1125,11 @@ def _postprocess_pentlogram(
         work = _flag_neighbor_outliers(work, metric_epsg=out_epsg)
         return work
     except Exception as exc:
-        print(f"  WARNING: pentlogram post-processing failed: {exc}")
+        _logger.warning("Pentlogram post-processing failed: %s", exc)
         return None
 
 
-# ---------------------------------------------------------------------------
-# PostgreSQL closures provider (replaces NDIC ArcGIS)
-# ---------------------------------------------------------------------------
+# --- PostgreSQL closures ---
 
 _PG_FULL_CLOSURE_TYPES = frozenset({"road_closed", "roadClosed"})
 _PG_LANE_REDUCTION_TYPES = frozenset({
@@ -1185,7 +1170,7 @@ def fetch_postgres_closures(
     cache_path = cache_dir / "closures.parquet"
 
     if cache_path.exists() and not force:
-        print(f"  Using cached {cache_path}")
+        _logger.info("Using cached %s", cache_path)
         gdf = gpd.read_parquet(cache_path)
         return {
             "features": int(len(gdf)),
@@ -1194,13 +1179,14 @@ def fetch_postgres_closures(
             "closures_count": int(len(gdf)),
         }
 
+    _db_defaults = SIM_DEFAULTS["datasets"]["closures_db"]
     db_cfg = cfg.get("closures_db") or {}
     conn = psycopg2.connect(
-        host=db_cfg.get("host", "REDACTED_HOST"),
-        port=int(db_cfg.get("port", 5432)),
-        dbname=db_cfg.get("dbname", "traffic"),
-        user=db_cfg.get("user", "admin"),
-        password=db_cfg.get("password", "admin"),
+        host=db_cfg.get("host", _db_defaults["host"]),
+        port=int(db_cfg.get("port", _db_defaults["port"])),
+        dbname=db_cfg.get("dbname", _db_defaults["dbname"]),
+        user=db_cfg.get("user", _db_defaults["user"]),
+        password=db_cfg.get("password", _db_defaults["password"]),
     )
 
     table = source_cfg.get("table", "restrictions")
@@ -1234,40 +1220,46 @@ def fetch_postgres_closures(
         conn.close()
 
     if df.empty:
-        print("  PostgreSQL closures: no rows returned")
+        _logger.info("PostgreSQL closures: no rows returned")
         return {"features": 0, "parquet": str(cache_path), "closures_count": 0}
 
-    print(f"  PostgreSQL closures: fetched {len(df)} rows")
+    _logger.info("PostgreSQL closures: fetched %d rows", len(df))
 
     bbox = _load_aoi_bbox_wgs84(cfg)
     if bbox is not None:
         w, s, e, n = bbox
-        margin = 0.02
+        margin = float(SIM_DEFAULTS["datasets"]["closures_db"]["bbox_margin_deg"])
         before = len(df)
         mask = (
             (df["lon"] >= w - margin) & (df["lon"] <= e + margin)
             & (df["lat"] >= s - margin) & (df["lat"] <= n + margin)
         )
         df = df[mask].copy()
-        print(f"  PostgreSQL closures: {before} total -> {len(df)} in model area")
+        _logger.info(
+            "PostgreSQL closures: %d total -> %d in model area",
+            before,
+            len(df),
+        )
 
     if df.empty:
-        print("  PostgreSQL closures: no features in model area")
+        _logger.info("PostgreSQL closures: no features in model area")
         return {"features": 0, "parquet": str(cache_path), "closures_count": 0}
 
     # --- Status filtering ---
     if "status" in df.columns:
         unique_statuses = sorted(df["status"].dropna().unique().tolist())
-        print(f"  PostgreSQL closures: status values found: {unique_statuses}")
+        _logger.info("PostgreSQL closures: status values found: %s", unique_statuses)
 
     status_whitelist = source_cfg.get("status_whitelist")
     if status_whitelist and "status" in df.columns:
         allowed = {str(s).strip().lower() for s in status_whitelist}
         before_status = len(df)
         df = df[df["status"].fillna("").astype(str).str.strip().str.lower().isin(allowed)].copy()
-        print(
-            f"  PostgreSQL closures: status filter ({', '.join(sorted(allowed))}): "
-            f"{before_status} -> {len(df)}"
+        _logger.info(
+            "PostgreSQL closures: status filter (%s): %d -> %d",
+            ", ".join(sorted(allowed)),
+            before_status,
+            len(df),
         )
 
     # --- Minimum observation duration filter ---
@@ -1280,13 +1272,15 @@ def fetch_postgres_closures(
         before_dur = len(df)
         keep = duration.isna() | (duration >= min_days)
         df = df[keep].copy()
-        print(
-            f"  PostgreSQL closures: min_observed_days={min_days}: "
-            f"{before_dur} -> {len(df)}"
+        _logger.info(
+            "PostgreSQL closures: min_observed_days=%s: %d -> %d",
+            min_days,
+            before_dur,
+            len(df),
         )
 
     if df.empty:
-        print("  PostgreSQL closures: no features after filtering")
+        _logger.info("PostgreSQL closures: no features after filtering")
         return {"features": 0, "parquet": str(cache_path), "closures_count": 0}
 
     df["severity"] = df.apply(
@@ -1329,9 +1323,13 @@ def fetch_postgres_closures(
     full_count = int((gdf["severity"] == "full").sum())
     partial_count = int((gdf["severity"] == "lane_reduction").sum())
     speed_count = int((gdf["severity"] == "speed_limit").sum())
-    print(
-        f"  PostgreSQL closures: {len(gdf)} events in model area "
-        f"({full_count} full, {partial_count} lane_reduction, {speed_count} speed_limit)"
+    _logger.info(
+        "PostgreSQL closures: %d events in model area "
+        "(%d full, %d lane_reduction, %d speed_limit)",
+        len(gdf),
+        full_count,
+        partial_count,
+        speed_count,
     )
 
     gdf = _coerce_object_columns_for_parquet(gdf)
@@ -1411,7 +1409,7 @@ def _postprocess_ndic_closures(
     """
     try:
         if gdf.empty:
-            print("  NDIC closures: no features returned")
+            _logger.info("NDIC closures: no features returned")
             return None
 
         work = gdf.copy()
@@ -1421,16 +1419,20 @@ def _postprocess_ndic_closures(
             before = len(work)
             work_wgs = work.to_crs(epsg=4326) if (work.crs and work.crs.to_epsg() != 4326) else work
             w, s, e, n = bbox
-            margin = 0.02
+            margin = float(SIM_DEFAULTS["datasets"]["closures_db"]["bbox_margin_deg"])
             mask = (
                 (work_wgs.geometry.x >= w - margin) & (work_wgs.geometry.x <= e + margin) &
                 (work_wgs.geometry.y >= s - margin) & (work_wgs.geometry.y <= n + margin)
             )
             work = work[mask.values].copy()
-            print(f"  NDIC closures: {before} nationwide → {len(work)} in model area")
+            _logger.info(
+                "NDIC closures: %d nationwide -> %d in model area",
+                before,
+                len(work),
+            )
 
         if work.empty:
-            print("  NDIC closures: no features in model area")
+            _logger.info("NDIC closures: no features in model area")
             return None
 
         work["severity"] = work.apply(
@@ -1455,12 +1457,18 @@ def _postprocess_ndic_closures(
         full_count = int((work["severity"] == "full").sum())
         partial_count = int((work["severity"] == "lane_reduction").sum())
         speed_count = int((work["severity"] == "speed_limit").sum())
-        print(f"  NDIC closures: {len(work)} events in model area "
-              f"({full_count} full, {partial_count} lane_reduction, {speed_count} speed_limit)")
+        _logger.info(
+            "NDIC closures: %d events in model area "
+            "(%d full, %d lane_reduction, %d speed_limit)",
+            len(work),
+            full_count,
+            partial_count,
+            speed_count,
+        )
 
         return work
     except Exception as exc:
-        print(f"  WARNING: NDIC closure post-processing failed: {exc}")
+        _logger.warning("NDIC closure post-processing failed: %s", exc)
         import traceback
         traceback.print_exc()
         return None
@@ -1489,7 +1497,7 @@ def fetch_arcgis_feature_service(
     _ensure_dir(out_path.parent)
 
     if out_path.exists() and not force:
-        print(f"  Using cached {out_path}")
+        _logger.info("Using cached %s", out_path)
     else:
         src_timeout = int(source_cfg.get("timeout_s", timeout_s))
         geojson = arcgis_query_geojson(
@@ -1524,7 +1532,11 @@ def fetch_arcgis_feature_service(
             cleaned.to_parquet(cleaned_path, index=False)
             info["cleaned_parquet"] = str(cleaned_path)
             info["cleaned_features"] = int(len(cleaned))
-            print(f"  Pentlogram cleaned: {len(gdf)} → {len(cleaned)} segments")
+            _logger.info(
+                "Pentlogram cleaned: %d -> %d segments",
+                len(gdf),
+                len(cleaned),
+            )
 
     if usage.get("calibration_target") == "baseline_closures":
         closures_gdf = _postprocess_ndic_closures(gdf, cfg, source_cfg)
@@ -1538,9 +1550,7 @@ def fetch_arcgis_feature_service(
     return info
 
 
-# ---------------------------------------------------------------------------
-# Police CR traffic-info XML -> closures JSON
-# ---------------------------------------------------------------------------
+# --- Police CR traffic-info (XML to closures JSON) ---
 
 # Event codes that indicate a closure or restriction (not an accident report).
 _CLOSURE_EVENT_CODES = {
@@ -1588,7 +1598,7 @@ def _parse_police_xml_closures(
 
         if bbox_wgs84:
             w, s, e, n = bbox_wgs84
-            margin = 0.02
+            margin = float(SIM_DEFAULTS["datasets"]["closures_db"]["bbox_margin_deg"])
             if not (w - margin <= lon <= e + margin and s - margin <= lat <= n + margin):
                 continue
 
@@ -1690,7 +1700,12 @@ def fetch_police_traffic_xml(
 
     _ensure_dir(out_path.parent)
     out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"  Police closures: {len(closures)} events in model area (from {len(re.findall(r'<MSG ', xml_text))} total)")
+    n_msg = len(re.findall(r"<MSG ", xml_text))
+    _logger.info(
+        "Police closures: %d events in model area (from %d total messages)",
+        len(closures),
+        n_msg,
+    )
 
     return {
         "status": "fetched",
@@ -1699,9 +1714,7 @@ def fetch_police_traffic_xml(
     }
 
 
-# ---------------------------------------------------------------------------
-# Provider handlers
-# ---------------------------------------------------------------------------
+# --- Provider handlers ---
 
 def _default_cache_parquet(cache_dir: Path, out_path: Path) -> Path:
     return cache_dir / f"{_slug(out_path.stem)}.parquet"
@@ -1859,9 +1872,7 @@ def _handle_atom_file(
     return info
 
 
-# ---------------------------------------------------------------------------
-# Main runner
-# ---------------------------------------------------------------------------
+# --- Main runner ---
 
 def run_fetch_datasets(
     config_path: str | Path = "config/brno/sim.yaml",
@@ -1871,7 +1882,7 @@ def run_fetch_datasets(
     cfg = load_config(config_path)
     ds = cfg.get("datasets") or {}
     if ds.get("enabled") is False:
-        print("datasets.enabled=false -> nothing to do")
+        _logger.info("datasets.enabled=false, nothing to do")
         return
 
     timeout_s = int((ds.get("http") or {}).get("timeout_s", 60))
@@ -1898,7 +1909,7 @@ def run_fetch_datasets(
             continue
 
         provider = str(scfg.get("provider", "")).strip()
-        print(f"[{key}] provider={provider}")
+        _logger.info("%s: provider=%s", key, provider)
 
         try:
             if provider == "http_file":
@@ -1956,7 +1967,7 @@ def run_fetch_datasets(
             else:
                 raise ValueError(f"Unknown provider '{provider}' for source '{key}'")
         except Exception as exc:
-            print(f"  [ERROR] {key}: {exc}")
+            _logger.error("%s: %s", key, exc)
             errors.append((key, str(exc)))
             manifest["sources"][key] = {"error": str(exc)}
             continue
@@ -1965,13 +1976,13 @@ def run_fetch_datasets(
 
     manifest_path = cache_dir / "datasets_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"✓ Wrote manifest: {manifest_path}")
+    _logger.info("Wrote manifest: %s", manifest_path)
 
     if errors:
         names = ", ".join(k for k, _ in errors)
-        print(f"\n⚠ {len(errors)} source(s) failed: {names}")
+        _logger.warning("%d source(s) failed: %s", len(errors), names)
         for k, msg in errors:
-            print(f"  - {k}: {msg}")
+            _logger.warning("  %s: %s", k, msg)
 
 
 def main() -> None:

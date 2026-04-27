@@ -16,14 +16,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from enum import Enum as PyEnum
 from pydantic import BaseModel, Field, model_validator
+from sim.defaults import SIM_DEFAULTS
 from sim.io_project import get_metric_epsg, load_config, resolve_project_database_path
 from sim._metrics import aggregate_daily_volumes
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Data layer (lazy-loaded singletons)
-# ---------------------------------------------------------------------------
+# --- Data layer (lazy-loaded singletons) ---
 
 _cfg: Dict[str, Any] = {}
 _links_gdf: Optional[gpd.GeoDataFrame] = None
@@ -110,7 +109,8 @@ def _model_meta_payload() -> Dict[str, Any]:
 
     center = _map_center_lat_lng()
     if center is None:
-        center = (49.75, 15.47)
+        fb = SIM_DEFAULTS["api"]["fallback_map_center"]
+        center = (fb[0], fb[1])
 
     bc_cfg = (_cfg.get("baseline_closures") or {}) if _cfg else {}
     cache_dir = str(Path((_cfg or {}).get("datasets", {}).get("cache_dir", "data/cache")))
@@ -229,9 +229,7 @@ def _gdf_to_geojson(gdf: gpd.GeoDataFrame) -> dict:
     return json.loads(gdf.to_json())
 
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
+# --- FastAPI app ---
 
 _api_title = "Traffic Simulation API"
 _api_version = "0.2.0"
@@ -280,9 +278,7 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
-# Pydantic models for scenario API
-# ---------------------------------------------------------------------------
+# --- Pydantic models for scenario API ---
 
 class Direction(str, PyEnum):
     AB = "ab"
@@ -326,9 +322,7 @@ class ScenarioRunRequest(BaseModel):
         return self
 
 
-# ---------------------------------------------------------------------------
-# Links & nodes
-# ---------------------------------------------------------------------------
+# --- Links & nodes ---
 
 @app.get("/api/links")
 def get_links(
@@ -385,9 +379,7 @@ def get_nodes():
     return JSONResponse(_gdf_to_geojson(gdf))
 
 
-# ---------------------------------------------------------------------------
-# Zones
-# ---------------------------------------------------------------------------
+# --- Zones ---
 
 @app.get("/api/zones")
 def get_zones():
@@ -422,9 +414,7 @@ def get_model_meta():
     return JSONResponse(_model_meta_payload())
 
 
-# ---------------------------------------------------------------------------
-# Temporal
-# ---------------------------------------------------------------------------
+# --- Temporal ---
 
 @app.get("/api/temporal/profile")
 def temporal_profile():
@@ -441,9 +431,7 @@ def temporal_day_info(date: str = Query(..., description="Date YYYY-MM-DD")):
         raise HTTPException(404, str(e))
 
 
-# ---------------------------------------------------------------------------
-# Reports (JSON)
-# ---------------------------------------------------------------------------
+# --- Reports (JSON) ---
 
 @app.get("/api/reports/calibration")
 def report_calibration():
@@ -465,9 +453,7 @@ def report_network():
     return JSONResponse(_read_json(_out("network") / "network_summary.json"))
 
 
-# ---------------------------------------------------------------------------
-# Maps (PNG)
-# ---------------------------------------------------------------------------
+# --- Maps (PNG) ---
 
 @app.get("/api/maps/zones")
 def map_zones():
@@ -485,9 +471,7 @@ def map_network():
     return FileResponse(str(path), media_type="image/png")
 
 
-# ---------------------------------------------------------------------------
-# Scenarios
-# ---------------------------------------------------------------------------
+# --- Scenarios ---
 
 @app.post("/api/scenarios/run")
 def run_scenario(req: ScenarioRunRequest):
@@ -589,9 +573,7 @@ def scenario_delta_summary(scenario_id: str):
     })
 
 
-# ---------------------------------------------------------------------------
-# Closures (date-based)
-# ---------------------------------------------------------------------------
+# --- Closures (date-based) ---
 
 
 class ClosureScenarioRequest(BaseModel):
@@ -649,9 +631,7 @@ def run_closure_scenario(req: ClosureScenarioRequest):
     return JSONResponse(job.to_status_dict(), status_code=202)
 
 
-# ---------------------------------------------------------------------------
-# Diagnostics
-# ---------------------------------------------------------------------------
+# --- Diagnostics ---
 
 _MATCHING_DIAG_BIAS_COLS = ("link_id", "observed_car", "_corridor_volume")
 
@@ -1002,9 +982,7 @@ def diagnostics_corridors():
     return JSONResponse({"corridors": corridors})
 
 
-# ---------------------------------------------------------------------------
-# Intersection delay heuristic
-# ---------------------------------------------------------------------------
+# --- Intersection delay heuristic ---
 
 _SIGNALIZED_TYPES = frozenset({
     "motorway_link", "trunk", "trunk_link", "primary", "primary_link",
@@ -1654,9 +1632,7 @@ def diagnostics_routes():
     return JSONResponse({"routes": results})
 
 
-# ---------------------------------------------------------------------------
-# Server start
-# ---------------------------------------------------------------------------
+# --- Server start ---
 
 def start_server(config_path: str = "config/brno/sim.yaml") -> None:
     """Load config and start uvicorn."""
@@ -1675,8 +1651,8 @@ def start_server(config_path: str = "config/brno/sim.yaml") -> None:
         short = place.split(",")[0].strip()
         app.title = f"{short} — API simulace dopravy"
 
-    print(f"Starting API server on {host}:{port}")
-    print(f"Docs: http://{host}:{port}/docs")
-    print(f"Loaded sim config: {_cfg.get('_meta', {}).get('config_path')}")
-    print(f"Network link files expected under: {_out('network')}")
+    logger.info("Starting API server on %s:%s", host, port)
+    logger.info("Docs: http://%s:%s/docs", host, port)
+    logger.info("Loaded sim config: %s", _cfg.get("_meta", {}).get("config_path"))
+    logger.info("Network link files expected under: %s", _out("network"))
     uvicorn.run(app, host=host, port=port)

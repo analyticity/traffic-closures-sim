@@ -220,6 +220,13 @@ outputs/
 project/
 excel_examples/
 
+# Generated poster / diagram / screenshot binaries (re-created by scripts/)
+excel_materials/screenshots/
+excel_materials/diagrams/*.png
+excel_materials/diagrams/*.pdf
+excel_materials/poster_A1.pdf
+excel_materials/poster_A1.png
+
 # Archive snapshots
 *.zip
 

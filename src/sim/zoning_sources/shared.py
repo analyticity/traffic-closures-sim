@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import Any, Dict, List, Optional
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 from shapely.ops import unary_union
+
+logger = logging.getLogger(__name__)
 
 
 def fix_polygons(g: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -59,11 +62,21 @@ def drop_huge_zones_per_source(
 
     removed = int((~keep).sum())
     if removed > 0:
-        msg = f"  - drop huge zones: removed={removed} (median={med:.0f} m², rel_thr={thr_rel:.0f} m²"
         if abs_max_km2 is not None:
-            msg += f", abs_thr={float(abs_max_km2):.1f} km²"
-        msg += ")"
-        print(msg)
+            logger.info(
+                "drop huge zones: removed=%d (median=%.0f m², rel_thr=%.0f m², abs_thr=%.1f km²)",
+                removed,
+                med,
+                thr_rel,
+                float(abs_max_km2),
+            )
+        else:
+            logger.info(
+                "drop huge zones: removed=%d (median=%.0f m², rel_thr=%.0f m²)",
+                removed,
+                med,
+                thr_rel,
+            )
 
     return g.loc[keep.values].copy()
 

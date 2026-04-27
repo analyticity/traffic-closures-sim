@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import shutil
 import time
@@ -22,10 +23,10 @@ from sim.io_project import get_metric_epsg, load_config
 from sim._text import norm_name as _norm_name
 from sim._metrics import persons_to_vehicles
 
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Text helpers
-# ---------------------------------------------------------------------------
+
+# --- Text helpers ---
 
 _GEO_SUFFIXES = re.compile(r"\s+(u|nad|pod|na|ve|pri|při)\s+\S+$", re.IGNORECASE)
 
@@ -34,9 +35,7 @@ def _strip_geo_suffix(name_norm: str) -> str:
     return _GEO_SUFFIXES.sub("", name_norm).strip()
 
 
-# ---------------------------------------------------------------------------
-# Generic config helpers
-# ---------------------------------------------------------------------------
+# --- Generic config helpers ---
 
 def _get(cfg: Any, path: List[str], default: Any = None) -> Any:
     cur = cfg
@@ -59,9 +58,7 @@ def _zero_matrix(n: int) -> np.ndarray:
     return np.zeros((n, n), dtype=np.float64)
 
 
-# ---------------------------------------------------------------------------
-# Zone name lookup
-# ---------------------------------------------------------------------------
+# --- Zone name lookup ---
 
 def _build_zone_name_index(
     zones_gdf: gpd.GeoDataFrame,
@@ -124,9 +121,7 @@ def _match_zone_id(
     return None
 
 
-# ---------------------------------------------------------------------------
-# Gateway zones
-# ---------------------------------------------------------------------------
+# --- Gateway zones ---
 
 def _load_gateways(zones_gdf: gpd.GeoDataFrame) -> Dict[str, List[Tuple[int, float]]]:
     """
@@ -164,9 +159,9 @@ def _load_gateways(zones_gdf: gpd.GeoDataFrame) -> Dict[str, List[Tuple[int, flo
         gateways[gateway_name] = [(zid, weight) for zid in zone_ids]
 
     if gateways:
-        print(f"  Using synthetic external gateway zones: {len(gateways)} corridors")
+        logger.info("Using synthetic external gateway zones: %d corridors", len(gateways))
         for name, members in gateways.items():
-            print(f"    {name}: {[z for z, _ in members]}")
+            logger.debug("%s: %s", name, [z for z, _ in members])
 
     return gateways
 
@@ -279,12 +274,12 @@ def _load_external_gateway_lookup_directional(
     _empty: Tuple[dict, dict, dict, dict] = ({}, {}, {}, {})
 
     if not path.exists():
-        print(f"  External gateway lookup not found: {path}")
+        logger.warning("External gateway lookup not found: %s", path)
         return _empty
 
     df = pd.read_parquet(path)
     if df.empty:
-        print(f"  External gateway lookup is empty: {path}")
+        logger.warning("External gateway lookup is empty: %s", path)
         return _empty
 
     if "place_name_norm" not in df.columns:
@@ -303,7 +298,7 @@ def _load_external_gateway_lookup_directional(
     df = df[df["place_name_norm"] != ""].copy()
     df = df[df["gateway_name"].isin(set(gateways.keys()))].copy()
     if df.empty:
-        print(f"  External gateway lookup has no usable rows after filtering: {path}")
+        logger.warning("External gateway lookup has no usable rows after filtering: %s", path)
         return _empty
 
     has_directional = (
@@ -385,10 +380,13 @@ def _load_external_gateway_lookup_directional(
     top_in = sorted(gw_counts_in.items(), key=lambda x: -x[1])
     gw_summary = ", ".join(f"{g}={c}" for g, c in top_in[:5])
 
-    print(
-        f"  External gateway lookup loaded (multi-candidate weighted): "
-        f"{len(inbound_members)} inbound, {len(outbound_members)} outbound places "
-        f"({n_differ} differ in/out); primary gw: {gw_summary}"
+    logger.info(
+        "External gateway lookup loaded (multi-candidate weighted): %d inbound, %d outbound places "
+        "(%d differ in/out); primary gw: %s",
+        len(inbound_members),
+        len(outbound_members),
+        n_differ,
+        gw_summary,
     )
     return inbound_members, outbound_members, inbound_gateway, outbound_gateway
 
@@ -403,7 +401,7 @@ def _load_through_gateway_pairs(path: Path) -> pd.DataFrame:
       - vehicles_daily
     """
     if not path.exists():
-        print(f"  Through gateway pairs not found: {path}")
+        logger.warning("Through gateway pairs not found: %s", path)
         return pd.DataFrame(columns=["gateway_in", "gateway_out", "vehicles_daily"])
 
     df = pd.read_parquet(path)
@@ -425,9 +423,7 @@ def _load_through_gateway_pairs(path: Path) -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------------------
-# Hub group
-# ---------------------------------------------------------------------------
+# --- Hub group ---
 
 def _load_zone_population(cache_dir: Path = Path("data/cache")) -> Dict[int, int]:
     pop_path = cache_dir / "zone_population.parquet"
@@ -503,14 +499,12 @@ def _build_hub_group(
     w = w / w.sum()
 
     method = "population" if use_population else "area"
-    print(f"  Hub group '{hub_name}': {len(members)} zones, weighted by {method}")
+    logger.info("Hub group %r: %d zones, weighted by %s", hub_name, len(members), method)
 
     return {hub_norm: [(zid, float(wi)) for zid, wi in zip(ids, w)]}
 
 
-# ---------------------------------------------------------------------------
-# Demand configuration
-# ---------------------------------------------------------------------------
+# --- Demand configuration ---
 
 @dataclass(frozen=True)
 class PurposeConv:
@@ -795,22 +789,20 @@ def _parse_gateway_pair_weights(
     return {k: v for k, v in weights.items() if v > 0}
 
 
-# ---------------------------------------------------------------------------
-# Read and filter commuting data
-# ---------------------------------------------------------------------------
+# --- Read and filter commuting data ---
 
 def _read_commuting(bcfg: DemandBuildCfg) -> pd.DataFrame:
     if bcfg.external.enabled and bcfg.external.use_full_cr_dataset:
         if bcfg.commuting_full_cr_parquet.exists():
-            print(f"  Reading full-CR commuting parquet: {bcfg.commuting_full_cr_parquet}")
+            logger.info("Reading full-CR commuting parquet: %s", bcfg.commuting_full_cr_parquet)
             return pd.read_parquet(bcfg.commuting_full_cr_parquet)
 
     if bcfg.commuting_filtered_parquet.exists():
-        print(f"  Reading filtered commuting parquet: {bcfg.commuting_filtered_parquet}")
+        logger.info("Reading filtered commuting parquet: %s", bcfg.commuting_filtered_parquet)
         return pd.read_parquet(bcfg.commuting_filtered_parquet)
 
     if bcfg.external.enabled and bcfg.external.use_full_cr_dataset and bcfg.commuting_csv.exists():
-        print(f"  Reading raw commuting CSV: {bcfg.commuting_csv}")
+        logger.info("Reading raw commuting CSV: %s", bcfg.commuting_csv)
         return pd.read_csv(
             bcfg.commuting_csv,
             sep=bcfg.csv_delimiter,
@@ -861,9 +853,7 @@ def _filter_commuting(df: pd.DataFrame, bcfg: DemandBuildCfg) -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------------------
-# OD seed builders
-# ---------------------------------------------------------------------------
+# --- OD seed builders ---
 
 def _build_gravity_seed(
     zone_ids: np.ndarray,
@@ -1179,10 +1169,6 @@ def _build_od_cores(
     if origin_col is None or dest_col is None:
         raise RuntimeError(f"Expected columns op_obec/doj_obec, got: {list(df.columns)}")
 
-    # -- Phase 1: Pre-cache directional name resolutions --------------------
-    # External places need different gateway zones depending on whether they
-    # are the origin (traffic enters model -> inbound gateway) or the
-    # destination (traffic exits model -> outbound gateway).
     origin_names = df[origin_col].fillna("").astype(str).str.strip().values
     dest_names = df[dest_col].fillna("").astype(str).str.strip().values
 
@@ -1204,9 +1190,8 @@ def _build_od_cores(
             gateways=gateways,
             allow_legacy_fallback=bcfg.external.allow_legacy_fallback,
         )
-    print(f"  Pre-cached {len(name_cache_dir)} unique place-name resolutions (directional)")
+    logger.info("Pre-cached %d unique place-name resolutions (directional)", len(name_cache_dir))
 
-    # -- Phase 2: Vectorize vehicle conversion ------------------------------
     work_col_name = "dojizdka_prace"
     school_col_name = "dojizdka_skola"
     work_raw = (
@@ -1227,7 +1212,6 @@ def _build_od_cores(
     work_v_all = np.maximum(work_raw, 0.0) * w_conv
     school_v_all = np.maximum(school_raw, 0.0) * s_conv
 
-    # -- Phase 3: Pre-compute per-period share arrays -----------------------
     period_list = bcfg.periods
     n_periods = len(period_list)
     work_out = np.array([bcfg.shares_work.outbound.get(p, 0.0) for p in period_list])
@@ -1237,7 +1221,6 @@ def _build_od_cores(
 
     mat_arrays = [mats[f"wd_{p}"] for p in period_list]
 
-    # -- Phase 4: Iterate rows using directional cached arrays --------------
     _MODE_STAT = {"direct": "mapped_direct", "group": "mapped_group",
                   "lookup": "mapped_external_lookup",
                   "legacy_fallback": "mapped_external_legacy_fallback"}
@@ -1301,15 +1284,9 @@ def _build_od_cores(
             fwd = fwd * ext_comm_scale
             ret = ret * ext_comm_scale
 
-        # Forward trip: origin -> destination
-        #   origin external = traffic enters model -> use inbound gateway
-        #   dest   external = traffic exits model  -> use outbound gateway
         fwd_o_cands = o_in_cands
         fwd_d_cands = d_out_cands
 
-        # Return trip: destination -> origin (reverse direction)
-        #   dest becomes origin (enters model) -> use inbound gateway
-        #   origin becomes dest (exits model)  -> use outbound gateway
         ret_o_cands = d_in_cands
         ret_d_cands = o_out_cands
 
@@ -1351,9 +1328,7 @@ def _build_od_cores(
     return mats, summary
 
 
-# ---------------------------------------------------------------------------
-# AequilibraE output
-# ---------------------------------------------------------------------------
+# --- AequilibraE output ---
 
 def _write_aem(
     matrix_path: Path,
@@ -1414,9 +1389,7 @@ def _register_in_project(project_dir: Path, matrix_path: Path) -> None:
         project.close()
 
 
-# ---------------------------------------------------------------------------
-# Load zones
-# ---------------------------------------------------------------------------
+# --- Load zones ---
 
 def _load_zones(cfg: Dict[str, Any]) -> gpd.GeoDataFrame:
     zoning_dir = _get(cfg, ["zoning", "output_dir"], "outputs/baseline/zones")
@@ -1448,9 +1421,7 @@ def _load_zones(cfg: Dict[str, Any]) -> gpd.GeoDataFrame:
     return gdf
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+# --- Public entry point ---
 
 def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") -> None:
     t0 = time.perf_counter()
@@ -1466,16 +1437,14 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
     cfg = load_config(config_path)
     bcfg = _build_cfg(cfg)
 
-    print("=== BUILD OD MATRIX ===")
-
-    print("Loading zones ...")
+    logger.info("Loading zones")
     zones_gdf = _load_zones(cfg)
     _mark("load_zones")
 
     external_zone_ids: set[int] = set(
         zones_gdf.loc[zones_gdf["is_external"].fillna(0).astype(int) == 1, "zone_id"].astype(int)
     )
-    print(f"  External zones: {len(external_zone_ids)}")
+    logger.info("External zones: %d", len(external_zone_ids))
 
     zone_ids = np.array(sorted(zones_gdf["zone_id"].astype(int).unique()), dtype=np.int64)
 
@@ -1488,15 +1457,20 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
 
     raw_mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
     zone_to_centroid: Dict[int, int] = {int(k): int(v) for k, v in raw_mapping.items()}
-    print(f"  Loaded zone->centroid mapping ({len(zone_to_centroid)} entries)")
+    logger.info("Loaded zone->centroid mapping (%d entries)", len(zone_to_centroid))
 
     centroid_ids = np.array([zone_to_centroid.get(int(z), int(z)) for z in zone_ids], dtype=np.int64)
-    print(f"  {len(zone_ids)} zones loaded (centroid IDs: {centroid_ids.min()}-{centroid_ids.max()})")
+    logger.info(
+        "%d zones loaded (centroid IDs: %d-%d)",
+        len(zone_ids),
+        int(centroid_ids.min()),
+        int(centroid_ids.max()),
+    )
 
     primary, stripped = _build_zone_name_index(zones_gdf)
-    print(f"  Name index: {len(primary)} primary, {len(stripped)} stripped entries")
+    logger.info("Name index: %d primary, %d stripped entries", len(primary), len(stripped))
 
-    print("Reading commuting data ...")
+    logger.info("Reading commuting data")
     df_raw = _read_commuting(bcfg)
     _mark("read_commuting")
 
@@ -1534,16 +1508,16 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
     )
     if groups:
         for group_name, members in groups.items():
-            print(f"  Group '{group_name}': {len(members)} zones")
+            logger.debug("Group %r: %d zones", group_name, len(members))
     _mark("build_hub_groups")
 
     gateways = _load_gateways(zones_gdf)
     if gateways:
-        print(f"  Gateways: {len(gateways)} corridors")
+        logger.info("Gateways: %d corridors", len(gateways))
         for gateway_name, gateway_zones in gateways.items():
-            print(f"    {gateway_name}: {len(gateway_zones)} zones")
+            logger.debug("%s: %d zones", gateway_name, len(gateway_zones))
     else:
-        print("  No external gateway zones found")
+        logger.info("No external gateway zones found")
 
     _preflight_external_inputs(bcfg, gateways)
     _mark("preflight_external_inputs")
@@ -1562,10 +1536,10 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
         )
 
     df = _filter_commuting(df_raw, bcfg)
-    print(f"  {len(df)} rows after filtering")
+    logger.info("%d rows after filtering", len(df))
     _mark("filter_commuting")
 
-    print("Building commuting OD cores ...")
+    logger.info("Building commuting OD cores")
     cores, summary = _build_od_cores(
         df,
         zone_ids,
@@ -1588,7 +1562,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
 
     # --- Internal "other" trips ---
     if other_cfg and other_cfg.get("source", "gravity") == "gravity":
-        print("Building 'other' trips (gravity seed) ...")
+        logger.info("Building 'other' trips (gravity seed)")
         other_defaults = (other_cfg.get("defaults") or {})
         other_daily = _build_gravity_seed(
             zone_ids,
@@ -1601,7 +1575,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
             excluded_zone_ids=external_zone_ids,
             metric_epsg=get_metric_epsg(cfg),
         )
-        print(f"  'other' daily total: {float(other_daily.sum()):,.0f}")
+        logger.info("'other' daily total: %.0f", float(other_daily.sum()))
     else:
         other_daily = _zero_matrix(n_zones)
     _mark("build_other_seed")
@@ -1615,7 +1589,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
         and gateways
         and float(external_local_cfg.get("total_daily_trips", 0.0)) > 0
     ):
-        print("Building residual synthetic external-local trips (gateway ↔ internal) ...")
+        logger.info("Building residual synthetic external-local trips (gateway ↔ internal)")
         gw_link_types: Optional[Dict[str, str]] = None
         zoning_out = Path(cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones"))
         gw_diag_path = zoning_out / "gateway_diagnostics.csv"
@@ -1633,7 +1607,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
             corridor_weights=external_local_cfg.get("corridor_weights", {}) or {},
             gateway_link_types=gw_link_types,
         )
-        print(f"  'external_local' daily total: {float(external_local_daily.sum()):,.0f}")
+        logger.info("'external_local' daily total: %.0f", float(external_local_daily.sum()))
     else:
         external_local_daily = _zero_matrix(n_zones)
     _mark("build_external_local")
@@ -1643,7 +1617,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
     if bcfg.external.enabled and bcfg.external.use_through_traffic:
         through_pairs_df = _load_through_gateway_pairs(bcfg.external.through_pairs_path)
         if not through_pairs_df.empty:
-            print("Building data-driven external-through trips from supernetwork gateway pairs ...")
+            logger.info("Building data-driven external-through trips from supernetwork gateway pairs")
             data_driven_through_daily = _build_external_through_from_pairs(
                 zone_ids,
                 gateways,
@@ -1654,8 +1628,8 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
             )
             if through_scale != 1.0:
                 data_driven_through_daily *= through_scale
-                print(f"  Applied through_traffic_scale={through_scale:.2f}")
-            print(f"  'external_through_data' daily total: {float(data_driven_through_daily.sum()):,.0f}")
+                logger.info("Applied through_traffic_scale=%.2f", through_scale)
+            logger.info("'external_through_data' daily total: %.0f", float(data_driven_through_daily.sum()))
     _mark("build_external_through_data")
 
     # --- Optional residual synthetic external_through ---
@@ -1666,7 +1640,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
         and gateways
         and float(external_through_cfg.get("total_daily_trips", 0.0)) > 0
     ):
-        print("Building residual synthetic external-through trips (gateway ↔ gateway) ...")
+        logger.info("Building residual synthetic external-through trips (gateway ↔ gateway)")
         pair_weights = _parse_gateway_pair_weights(
             external_through_cfg.get("pairs", []),
             sorted(gateways.keys()),
@@ -1678,7 +1652,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
             total_daily_trips=float(external_through_cfg.get("total_daily_trips", 0.0)),
             pair_weights=pair_weights,
         )
-        print(f"  'external_through_residual' daily total: {float(residual_external_through_daily.sum()):,.0f}")
+        logger.info("'external_through_residual' daily total: %.0f", float(residual_external_through_daily.sum()))
     else:
         residual_external_through_daily = _zero_matrix(n_zones)
     _mark("build_external_through_residual")
@@ -1700,12 +1674,10 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
 
     all_cores: Dict[str, np.ndarray] = {}
 
-    # Preserve commuting-only cores explicitly
     for period in bcfg.periods:
         all_cores[f"wd_{period}_commuting"] = cores.get(f"wd_{period}", _zero_matrix(n_zones)).copy()
     all_cores["wd_daily_commuting"] = cores.get("wd_daily", _zero_matrix(n_zones)).copy()
 
-    # Non-commuting and external segment cores
     for period in bcfg.periods:
         all_cores[f"wd_{period}_other"] = other_daily * other_period_shares[period]
         all_cores[f"wd_{period}_external_local"] = external_local_daily * external_local_period_shares[period]
@@ -1725,7 +1697,6 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
         all_cores["wd_daily_commuting"] + other_daily + external_local_daily
     )
 
-    # Final combined cores used by the rest of the pipeline
     for period in bcfg.periods:
         all_cores[f"wd_{period}"] = (
             all_cores[f"wd_{period}_commuting"]
@@ -1747,9 +1718,9 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
         "external_total": round(float(all_cores["wd_daily_external"].sum()), 0),
         "combined_daily": round(float(all_cores["wd_daily"].sum()), 0),
     }
-    print(f"  Segment totals: {segment_totals}")
+    logger.info("Segment totals: %s", segment_totals)
 
-    print(f"Writing AEM matrix: {bcfg.matrix_path}")
+    logger.info("Writing AEM matrix: %s", bcfg.matrix_path)
     _write_aem(bcfg.matrix_path, centroid_ids, all_cores, matrix_name=bcfg.matrix_name)
     _mark("write_aem_matrix")
 
@@ -1795,7 +1766,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
 
     project_dir = cfg.get("project_path")
     if project_dir and Path(project_dir).exists():
-        print(f"Registering matrix in AequilibraE project: {project_dir}")
+        logger.info("Registering matrix in AequilibraE project: %s", project_dir)
         _register_in_project(Path(project_dir), bcfg.matrix_path)
     _mark("register_matrix")
 
@@ -1806,26 +1777,28 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
         encoding="utf-8",
     )
 
-    print("\n--- OD build summary ---")
-    print(f"  Zones:                         {summary['zones']}")
-    print(f"  Rows in:                       {summary['rows_in']}")
-    print(f"  Pairs used:                    {summary['pairs_used']}")
-    print(f"  Direct matches:                {summary['mapped_direct']}")
-    print(f"  Group matches:                 {summary['mapped_group']}")
-    print(f"  External lookup matches:       {summary['mapped_external_lookup']}")
-    print(f"  External legacy fallback:      {summary['mapped_external_legacy_fallback']}")
-    print(f"  Skipped external-external OD:  {summary['skipped_external_external_rows']}")
-    print(f"  Missing origin:                {summary['missing_origin']}")
-    print(f"  Missing dest:                  {summary['missing_destination']}")
-
+    logger.info(
+        "OD build: zones=%s rows_in=%s pairs_used=%s direct=%s group=%s ext_lookup=%s "
+        "legacy_fallback=%s skipped_ext_ext=%s missing_o=%s missing_d=%s",
+        summary["zones"],
+        summary["rows_in"],
+        summary["pairs_used"],
+        summary["mapped_direct"],
+        summary["mapped_group"],
+        summary["mapped_external_lookup"],
+        summary["mapped_external_legacy_fallback"],
+        summary["skipped_external_external_rows"],
+        summary["missing_origin"],
+        summary["missing_destination"],
+    )
     for core_name in sorted(all_cores.keys()):
         total = round(float(all_cores[core_name].sum()), 1)
         nonzero = int(np.count_nonzero(all_cores[core_name]))
-        print(f"  {core_name:30s} total={total:>12.1f}  nonzero={nonzero}")
+        logger.debug("%s total=%.1f nonzero=%d", core_name, total, nonzero)
 
-    print(f"\n  Matrix:  {bcfg.matrix_path}")
-    print(f"  Summary: {summary_path}")
-    print(f"  Timing:  {marks}")
+    logger.info("Matrix: %s", bcfg.matrix_path)
+    logger.info("Summary: %s", summary_path)
+    logger.info("Timing: %s", marks)
 
 
 def assert_build_demand_prerequisites(cfg: dict) -> None:

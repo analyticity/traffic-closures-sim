@@ -1,6 +1,7 @@
 """Load TAZ polygons from OpenStreetMap via osmnx."""
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict
 
 import geopandas as gpd
@@ -10,6 +11,8 @@ from sim.zoning_sources.shared import (
     fix_polygons,
     normalize_osmid,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def load_zones_osm_source(
@@ -36,17 +39,17 @@ def load_zones_osm_source(
     abs_max_km2 = None if abs_max_km2 in ("", "null", "None") else abs_max_km2
     abs_max_km2 = float(abs_max_km2) if abs_max_km2 is not None else None
 
-    print(f"=== OSM zones[{rank}] place={place} tags={tags} ===")
+    logger.info("OSM zones[%d] place=%s tags=%s", rank, place, tags)
     g = ox.features.features_from_place(place, tags)
 
     if g is None or len(g) == 0:
-        print("⚠ 0 features")
+        logger.warning("0 features")
         return gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{crs_epsg}")
 
     g = g.reset_index()
     g = fix_polygons(g)
     if g.empty:
-        print("⚠ no polygonal features after fix")
+        logger.warning("no polygonal features after fix")
         return gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{crs_epsg}")
 
     osmid_col = next((c for c in ("osmid", "osm_id", "id") if c in g.columns), None)
@@ -77,5 +80,5 @@ def load_zones_osm_source(
         abs_max_km2=abs_max_km2,
     )
 
-    print(f"✓ zones[{rank}] OSM kept: {len(out)}")
+    logger.info("zones[%d] OSM kept: %d", rank, len(out))
     return out

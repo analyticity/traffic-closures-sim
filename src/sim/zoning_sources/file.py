@@ -1,6 +1,7 @@
 """Load TAZ polygons from GeoPackage, GeoJSON, or other formats readable by geopandas."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -8,6 +9,8 @@ import geopandas as gpd
 import pandas as pd
 
 from sim.zoning_sources.shared import drop_huge_zones_per_source, fix_polygons, normalize_osmid
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_path(src: Dict[str, Any]) -> Path:
@@ -34,7 +37,7 @@ def load_zones_file_source(
     abs_max_km2 = None if abs_max_km2 in ("", "null", "None") else abs_max_km2
     abs_max_km2 = float(abs_max_km2) if abs_max_km2 is not None else None
 
-    print(f"=== FILE zones[{rank}] path={path} layer={layer!r} ===")
+    logger.info("FILE zones[%d] path=%s layer=%r", rank, path, layer)
     if not path.is_file():
         raise FileNotFoundError(f"Zone file source not found: {path}")
 
@@ -44,12 +47,12 @@ def load_zones_file_source(
 
     g = gpd.read_file(path, **kwargs)
     if g is None or g.empty:
-        print("⚠ 0 rows")
+        logger.warning("0 rows")
         return gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{crs_epsg}")
 
     g = fix_polygons(g)
     if g.empty:
-        print("⚠ no polygonal features after fix")
+        logger.warning("no polygonal features after fix")
         return gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{crs_epsg}")
 
     id_actual: Optional[str] = id_col
@@ -99,5 +102,5 @@ def load_zones_file_source(
         abs_max_km2=abs_max_km2,
     )
 
-    print(f"✓ zones[{rank}] file kept: {len(out)}")
+    logger.info("zones[%d] file kept: %d", rank, len(out))
     return out

@@ -6,6 +6,7 @@ and optionally writes ``zoning.cache_file``.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -16,6 +17,8 @@ from sim.zoning_sources.cache import read_zones_cache, safe_path, write_zones_ca
 from sim.zoning_sources.file import load_zones_file_source
 from sim.zoning_sources.osm import load_zones_osm_source
 from sim.zoning_sources.shared import remove_overlaps_by_priority
+
+logger = logging.getLogger(__name__)
 
 
 def _loader_kind(src: Dict[str, Any]) -> str:
@@ -64,11 +67,11 @@ def load_zones_from_sources(
 
     zones = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=f"EPSG:{crs_epsg}")
 
-    print("=== REMOVE overlaps by priority ===")
+    logger.info("Remove overlaps by priority")
     before = len(zones)
     zones = remove_overlaps_by_priority(zones, rank_col="source_rank", min_area_m2=25.0)
     after = len(zones)
-    print(f"zones after de-overlap: {before} -> {after}")
+    logger.info("zones after de-overlap: %d -> %d", before, after)
 
     if cache_file is not None:
         write_zones_cache(zones, cache_file, crs_epsg)

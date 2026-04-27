@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
 import geopandas as gpd
+
+logger = logging.getLogger(__name__)
 
 
 def safe_path(p: str | Path) -> Path:
@@ -26,7 +29,7 @@ def write_zones_cache(zones: gpd.GeoDataFrame, cache_file: Path, crs_epsg: int) 
 
     meta = {"crs_epsg": int(crs_epsg)}
     cache_meta_path(cache_file).write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    print(f"✓ zones cache saved: {cache_file} (+ meta) ({len(zones)})")
+    logger.info("zones cache saved: %s (+ meta) (%d)", cache_file, len(zones))
 
 
 def read_zones_cache(cache_file: Path, crs_epsg: int) -> Optional[gpd.GeoDataFrame]:
@@ -50,5 +53,5 @@ def read_zones_cache(cache_file: Path, crs_epsg: int) -> Optional[gpd.GeoDataFra
     if gdf.crs.to_epsg() != crs_epsg:
         gdf = gdf.to_crs(epsg=crs_epsg)
 
-    print(f"✓ zones loaded from cache: {cache_file} ({len(gdf)}) CRS={gdf.crs}")
+    logger.info("zones loaded from cache: %s (%d) CRS=%s", cache_file, len(gdf), gdf.crs)
     return gdf

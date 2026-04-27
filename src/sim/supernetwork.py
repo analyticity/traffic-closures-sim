@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import heapq
 import json
+import logging
 import math
 import re
 import time
@@ -31,6 +32,8 @@ from sim.network_pipeline import (
 from sim._text import norm_name as _norm_name
 from sim._metrics import persons_to_vehicles_from_cfg
 
+logger = logging.getLogger(__name__)
+
 try:
     import pyogrio
 except Exception:  # pragma: no cover
@@ -42,9 +45,7 @@ except Exception:  # pragma: no cover
     cKDTree = None
 
 
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
+# --- Small helpers ---
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -61,8 +62,6 @@ def _get(cfg: Dict[str, Any], *keys: str, default: Any = None) -> Any:
 
 def _as_path(value: Any) -> Path:
     return value if isinstance(value, Path) else Path(str(value))
-
-
 
 
 def _make_place_key(name_norm: str, district_norm: str = "") -> str:
@@ -153,9 +152,7 @@ def _iter_lines(geom: Any) -> Iterable[LineString]:
     return []
 
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+# --- Config ---
 
 @dataclass(frozen=True)
 class SuperCfg:
@@ -248,9 +245,7 @@ def build_cfg(cfg_root: Dict[str, Any]) -> SuperCfg:
     )
 
 
-# ---------------------------------------------------------------------------
-# Inputs
-# ---------------------------------------------------------------------------
+# --- Inputs ---
 
 def load_model_area(path: Path, metric_epsg: int) -> gpd.GeoDataFrame:
     gdf = gpd.read_file(path)
@@ -536,13 +531,11 @@ def resolve_external_units(
 
     out = gpd.GeoDataFrame(merged, geometry=merged["geometry"], crs=place_centroids.crs)
 
-    print(f"Resolved external places: {len(out)}; unresolved: {len(still_unresolved)}")
+    logger.info("Resolved external places: %d; unresolved: %d", len(out), len(still_unresolved))
     return out.reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# Graph
-# ---------------------------------------------------------------------------
+# --- Graph ---
 
 def read_osm_lines_from_pbf(pbf_path: Path, highway_types: List[str]) -> gpd.GeoDataFrame:
     wanted = sorted(set(str(x).strip() for x in highway_types if str(x).strip()))
@@ -742,9 +735,7 @@ def graph_from_parquets(nodes_path: Path, edges_path: Path) -> nx.DiGraph:
     return G
 
 
-# ---------------------------------------------------------------------------
-# Lookup + classification
-# ---------------------------------------------------------------------------
+# --- Lookup and classification ---
 
 def single_source_costs(G: nx.DiGraph, source_node: int) -> Dict[int, float]:
     return nx.single_source_dijkstra_path_length(G, source=source_node, weight="travel_time_s")
@@ -902,7 +893,6 @@ def classify_relations(
     cfg: SuperCfg,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     t0 = time.perf_counter()
-    # Backward/empty-schema guard: keep compatibility with older lookup schema.
     if "rank_in" not in gateway_lookup.columns:
         if "rank" in gateway_lookup.columns:
             gateway_lookup = gateway_lookup.copy()
@@ -1093,12 +1083,10 @@ def classify_relations(
     return classified, through_pairs
 
 
-# ---------------------------------------------------------------------------
-# Plot
-# ---------------------------------------------------------------------------
+# --- Plot ---
 
 def _external_units_outside_model_area(units: gpd.GeoDataFrame, model_area: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Drop connector-unit markers whose centroid lies inside the model polygon (AOI clutter)."""
+    """Omit unit markers inside the model polygon to reduce map clutter."""
     if units.empty or model_area.empty:
         return units
     aoi = unary_union(model_area.geometry.values)
@@ -1126,7 +1114,6 @@ def plot_overview(edges_metric: gpd.GeoDataFrame, model_area: gpd.GeoDataFrame, 
         alpha=0.92,
         zorder=1,
     )
-    # Gateways / units: palette neutrals (no traffic red — matches thesis map style)
     gateways.plot(ax=ax, color="#423E3A", markersize=36, marker="o", zorder=5)
     units_out = _external_units_outside_model_area(units, model_area)
     if not units_out.empty:
@@ -1185,9 +1172,7 @@ def plot_overview(edges_metric: gpd.GeoDataFrame, model_area: gpd.GeoDataFrame, 
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# --- Main ---
 
 def run(config_path: str = "config/brno/sim.yaml") -> Dict[str, Any]:
     t_run = time.perf_counter()
@@ -1207,16 +1192,17 @@ def run(config_path: str = "config/brno/sim.yaml") -> Dict[str, Any]:
         type_ok = gateways_all[type_col].astype(str).isin(eligible_set)
         if type_col != "link_type":
             type_ok = type_ok | gateways_all["link_type"].astype(str).isin(eligible_set)
-        # Whitelist (non-auto-discovered) gateways are always kept regardless
-        # of road class — the user explicitly declared them as important.
         is_whitelist = ~gateways_all["auto_discovered"].astype(bool) if "auto_discovered" in gateways_all.columns else pd.Series(True, index=gateways_all.index)
         mask = type_ok | is_whitelist
         dropped = gateways_all[~mask]["gateway_name"].tolist()
         gateways = gateways_all[mask].copy()
         if dropped:
-            print(f"  Supernetwork: filtered auto-discovered gateways by eligible types {sorted(eligible_set)}")
-            print(f"    Kept {len(gateways)}: {sorted(gateways['gateway_name'].tolist())}")
-            print(f"    Dropped {len(dropped)} auto-discovered: {dropped}")
+            logger.info(
+                "Supernetwork: filtered auto-discovered gateways by eligible types %s",
+                sorted(eligible_set),
+            )
+            logger.info("Kept %d: %s", len(gateways), sorted(gateways["gateway_name"].tolist()))
+            logger.info("Dropped %d auto-discovered: %s", len(dropped), dropped)
     else:
         gateways = gateways_all
 
@@ -1304,8 +1290,6 @@ def run(config_path: str = "config/brno/sim.yaml") -> Dict[str, Any]:
     units_join = units_join.dropna(subset=["graph_node"]).copy()
     profile["phases_s"]["snap_gateways_and_units"] = round(time.perf_counter() - phase_t, 3)
 
-    # Guard against stale/misaligned cached supernetwork graph.
-    # If nearly all external units snap to one node, the graph/cache is invalid for CZ-wide lookup.
     unique_unit_nodes = int(units_join["graph_node"].nunique()) if not units_join.empty else 0
     if len(units_join) > 100 and unique_unit_nodes <= 1:
         raise RuntimeError(
@@ -1352,10 +1336,15 @@ def run(config_path: str = "config/brno/sim.yaml") -> Dict[str, Any]:
     ext_ext_total = int((classified["classification"] == "external_external").sum())
     ext_ext_accepted = int(((classified["classification"] == "external_external") & (classified["accepted"] == True)).sum())
     resolved_coverage = (len(units_join) / max(len(external_units), 1)) * 100.0
-    print(f"External unit coverage: {len(units_join)}/{len(external_units)} ({resolved_coverage:.1f}%)")
-    print(f"External-external accepted: {ext_ext_accepted}/{ext_ext_total}")
+    logger.info(
+        "External unit coverage: %d/%d (%.1f%%)",
+        len(units_join),
+        len(external_units),
+        resolved_coverage,
+    )
+    logger.info("External-external accepted: %d/%d", ext_ext_accepted, ext_ext_total)
     if reason_counts:
-        print(f"External-external rejection reasons: {reason_counts}")
+        logger.info("External-external rejection reasons: %s", reason_counts)
 
     ei_ok = classified[(classified["classification"] == "external_internal") & (classified["accepted"] == True)]
     inbound_by_gw: Dict[str, float] = {}
@@ -1379,19 +1368,24 @@ def run(config_path: str = "config/brno/sim.yaml") -> Dict[str, Any]:
             })
 
     if inbound_by_gw:
-        print("Gateway inbound (external -> model), vehicles/day:")
+        logger.info("Gateway inbound (external -> model), vehicles/day:")
         for k, v in sorted(inbound_by_gw.items(), key=lambda x: -x[1]):
-            print(f"  {k}: {v:,.0f}")
+            logger.info("  %s: %s", k, f"{v:,.0f}")
     if outbound_by_gw:
-        print("Gateway outbound (model -> external), vehicles/day:")
+        logger.info("Gateway outbound (model -> external), vehicles/day:")
         for k, v in sorted(outbound_by_gw.items(), key=lambda x: -x[1]):
-            print(f"  {k}: {v:,.0f}")
+            logger.info("  %s: %s", k, f"{v:,.0f}")
     if through_by_pair:
-        print("Through traffic (gateway -> gateway), vehicles/day:")
+        logger.info("Through traffic (gateway -> gateway), vehicles/day:")
         for item in sorted(through_by_pair, key=lambda x: -x["vehicles_daily"])[:20]:
-            print(f"  {item['gateway_in']} -> {item['gateway_out']}: {item['vehicles_daily']:,.0f}")
+            logger.info(
+                "  %s -> %s: %s",
+                item["gateway_in"],
+                item["gateway_out"],
+                f"{item['vehicles_daily']:,.0f}",
+            )
         if len(through_by_pair) > 20:
-            print(f"  ... +{len(through_by_pair) - 20} more pairs")
+            logger.info("  ... +%d more pairs", len(through_by_pair) - 20)
 
     gateways_geojson = cfg.output_dir / "gateway_points.geojson"
     units_geojson = cfg.output_dir / "used_external_units.geojson"
@@ -1455,9 +1449,8 @@ def run(config_path: str = "config/brno/sim.yaml") -> Dict[str, Any]:
             gw_health_warnings.append(f"{name}: {', '.join(issues)}")
 
     if gw_health_warnings:
-        print("\nGateway health warnings:")
         for w in gw_health_warnings:
-            print(f"  [WARN] {w}")
+            logger.warning("%s", w)
 
     matrix_csv_path = cfg.output_dir / "gateway_through_matrix.csv"
     matrix_txt_path = cfg.output_dir / "gateway_through_matrix.txt"

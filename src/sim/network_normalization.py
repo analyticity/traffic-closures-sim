@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -16,12 +17,11 @@ from sim.io_project import get_metric_epsg, load_config
 
 from sim.defaults import NETWORK_NORM_DEFAULTS
 
+logger = logging.getLogger(__name__)
+
 _MAJOR_ROAD_TYPES = frozenset({"motorway", "motorway_link", "trunk", "trunk_link"})
 
-# ---------------------------------------------------------------------------
-# Czech-Republic normalization defaults (from centralized defaults.py).
-# YAML values (if provided) merge on top of these.
-# ---------------------------------------------------------------------------
+# --- Czech Republic normalization defaults (from defaults.py; YAML overrides merge on top) ---
 
 _NORM_DEFS = NETWORK_NORM_DEFAULTS["normalization"]
 _DEFAULT_THRESHOLDS: Dict[str, float] = _NORM_DEFS["thresholds"]
@@ -90,7 +90,13 @@ def _apply_speed_caps(links: pd.DataFrame, speed_caps: dict) -> None:
         links.loc[m, "speed_ba"] = np.minimum(links.loc[m, "speed_ba"], cap)
         after_ab = links.loc[m, "speed_ab"].mean()
         if before_ab != after_ab:
-            print(f"  speed_cap {lt}: {before_ab:.1f} → {after_ab:.1f} km/h (cap={cap})")
+            logger.debug(
+                "speed_cap %s: %.1f -> %.1f km/h (cap=%s)",
+                lt,
+                before_ab,
+                after_ab,
+                cap,
+            )
 
 
 def _apply_capacity_factors(links: pd.DataFrame, capacity_factors: dict) -> None:
@@ -164,7 +170,7 @@ def _ensure_link_types_registered(
             "INSERT INTO link_types (link_type, link_type_id, description) VALUES (?, ?, ?)",
             (lt, lt_id, f"Ramp/connector: {lt}"),
         )
-        print(f"  Registered link_type '{lt}' (id='{lt_id}') in link_types table")
+        logger.debug("Registered link_type %r (id=%r) in link_types table", lt, lt_id)
     conn.commit()
     conn.close()
 
@@ -191,14 +197,12 @@ def normalize_network_attributes(
     min_tt = _threshold(thresholds, "min_travel_time_s", 0.01)
 
     profile = _resolved_experiment_profile(network_cfg, experiment_profile)
-    print(f"Applying network experiment profile: {experiment_profile}")
+    logger.info("Applying network experiment profile: %s", experiment_profile)
 
     links = project.network.links.data.copy()
 
-    # Restore fine-grained link_type from osm_highway where AequilibraE
-    # collapsed *_link types into their parent (motorway_link → motorway).
-    # This ensures normalization defaults (speed, capacity, lanes) are applied
-    # correctly per actual OSM road class.
+    # AequilibraE collapses *_link to parent; osm_highway restores fine type so
+    # defaults (speed, capacity, lanes) match the actual OSM class.
     if "osm_highway" in links.columns:
         _RESTORABLE = {
             "motorway_link", "trunk_link", "primary_link",
@@ -210,12 +214,13 @@ def normalize_network_attributes(
         if n_restored > 0:
             _ensure_link_types_registered(project, _RESTORABLE)
             links.loc[restore_mask, "link_type"] = osm_hw[restore_mask]
-            print(f"  Restored link_type from osm_highway for {n_restored} *_link links")
+            logger.info(
+                "Restored link_type from osm_highway for %d *_link links",
+                n_restored,
+            )
 
-    # Reclassify construction links to their target road class so the
-    # model represents the ideal network (all roads as designed, no closures).
-    # osm_highway is None for all construction links, so we infer the target
-    # class from speed / lanes / direction.
+    # Reclassify construction to a target class (ideal network). osm_highway is
+    # None for construction links, so target class is inferred from speed/lanes/direction.
     constr_mask = links["link_type"].astype(str) == "construction"
     n_constr = int(constr_mask.sum())
     if n_constr > 0:
@@ -231,12 +236,15 @@ def normalize_network_attributes(
         links.loc[hw_multi, "link_type"] = "trunk_link"
         still_constr = links["link_type"].astype(str) == "construction"
         links.loc[still_constr, "link_type"] = "residential"
-        print(f"  Reclassified {n_constr} construction links "
-              f"({int(hw_1lane.sum())} motorway_link, {int(hw_multi.sum())} trunk_link, "
-              f"{int(still_constr.sum())} residential)")
+        logger.info(
+            "Reclassified %d construction links (%d motorway_link, %d trunk_link, %d residential)",
+            n_constr,
+            int(hw_1lane.sum()),
+            int(hw_multi.sum()),
+            int(still_constr.sum()),
+        )
 
-    # Apply per-road link_type overrides from experiment profile.
-    # Fixes OSM misclassifications (e.g. trunk roads tagged as secondary).
+    # Per-road link_type overrides from experiment profile (e.g. trunk tagged as secondary).
     lt_overrides = profile.get("link_type_overrides") or []
     if lt_overrides and "osm_ref_norm" in links.columns:
         for ovr in lt_overrides:
@@ -254,7 +262,7 @@ def normalize_network_attributes(
             if n_ovr > 0:
                 _ensure_link_types_registered(project, {new_lt})
                 links.loc[mask, "link_type"] = new_lt
-                print(f"  Reclassified {n_ovr} links matching {match_spec} → {new_lt}")
+                logger.info("Reclassified %d links matching %s to %s", n_ovr, match_spec, new_lt)
                 min_spd = ovr.get("min_speed")
                 if min_spd is not None:
                     min_spd = float(min_spd)
@@ -267,7 +275,11 @@ def normalize_network_attributes(
                     links.loc[mask, "speed_ba"] = np.where(
                         spd_ba.isna(), min_spd, np.maximum(spd_ba, min_spd)
                     )
-                    print(f"    Applied min_speed={min_spd} km/h ({n_raised} links raised)")
+                    logger.info(
+                        "Applied min_speed=%s km/h (%d links raised)",
+                        min_spd,
+                        n_raised,
+                    )
 
     # Remove crossing links (pedestrian crossing markup, not a road segment).
     crossing_mask = links["link_type"].astype(str) == "crossing"
@@ -281,7 +293,7 @@ def normalize_network_attributes(
         _conn.execute(f"DELETE FROM links WHERE link_id IN ({ph})", crossing_ids)
         _conn.commit()
         _conn.close()
-        print(f"  Removed {n_crossing} crossing links from network")
+        logger.info("Removed %d crossing links from network", n_crossing)
 
     links["estimated_distance"] = 0
     links["estimated_speed_ab"] = 0
@@ -295,9 +307,7 @@ def normalize_network_attributes(
 
     mask_twoway = links["direction"] == 0
 
-    # ------------------------------------------------------------------
-    # 1. Distance (from geometry if missing)
-    # ------------------------------------------------------------------
+    # --- Distance (from geometry if missing) ---
     if "distance" not in links.columns:
         links["distance"] = None
     missing_dist = links["distance"].isna() | (links["distance"] == 0)
@@ -305,9 +315,6 @@ def normalize_network_attributes(
         links.loc[missing_dist, "distance"] = links.loc[missing_dist, "geometry"].length
         links.loc[missing_dist, "estimated_distance"] = 1
 
-    # ------------------------------------------------------------------
-    # Helper: resolve per-direction attribute from OSM columns
-    # ------------------------------------------------------------------
     def _resolve_directional(
         col_ab: str,
         col_ba: str,
@@ -330,7 +337,7 @@ def normalize_network_attributes(
         ab_missing = links[col_ab].isna()
         ba_missing = links[col_ba].isna()
 
-        # Two-way: if one direction present but other missing, copy
+        # Two-way: copy present direction to missing opposite (asymmetry preserved).
         tw_ab_only = mask_twoway & (~ab_missing) & ba_missing
         tw_ba_only = mask_twoway & ab_missing & (~ba_missing)
         links.loc[tw_ab_only, col_ba] = links.loc[tw_ab_only, col_ab]
@@ -338,7 +345,6 @@ def normalize_network_attributes(
         links.loc[tw_ba_only, col_ab] = links.loc[tw_ba_only, col_ba]
         links.loc[tw_ba_only, est_ab] = 1
 
-        # Fill remaining missing from defaults by link_type
         still_ab_missing = links[col_ab].isna()
         still_ba_missing = links[col_ba].isna()
         if "link_type" in links.columns:
@@ -354,15 +360,12 @@ def normalize_network_attributes(
                 links.loc[m_ba, col_ba] = dv
                 links.loc[m_ba, est_ba] = 1
 
-        # Final fallback
         links.loc[links[col_ab].isna(), est_ab] = 1
         links.loc[links[col_ab].isna(), col_ab] = fallback_val
         links.loc[links[col_ba].isna(), est_ba] = 1
         links.loc[links[col_ba].isna(), col_ba] = fallback_val
 
-    # ------------------------------------------------------------------
-    # 2. Speed (preserve AB/BA)
-    # ------------------------------------------------------------------
+    # --- Speed (AB/BA) ---
     _resolve_directional(
         "speed_ab",
         "speed_ba",
@@ -372,9 +375,7 @@ def normalize_network_attributes(
         "estimated_speed_ba",
     )
 
-    # ------------------------------------------------------------------
-    # 3. Lanes (preserve AB/BA)
-    # ------------------------------------------------------------------
+    # --- Lanes (AB/BA) ---
     _resolve_directional(
         "lanes_ab",
         "lanes_ba",
@@ -386,11 +387,7 @@ def normalize_network_attributes(
     links["lanes_ab"] = links["lanes_ab"].clip(lower=1)
     links["lanes_ba"] = links["lanes_ba"].clip(lower=1)
 
-    # ------------------------------------------------------------------
-    # 4. Capacity (preserve AB/BA)
-    # Total veh/h per direction: existing OSM/Aeq values kept; gaps filled as
-    # capacity_* = capacity_per_lane[link_type] * lanes_* (see network_normalization.yaml).
-    # ------------------------------------------------------------------
+    # --- Capacity (AB/BA): gap fill as capacity_per_lane[link_type] * lanes_* ---
     if "capacity_ab" in links.columns:
         links["capacity_ab"] = pd.to_numeric(links["capacity_ab"], errors="coerce")
     else:
@@ -401,7 +398,7 @@ def normalize_network_attributes(
     else:
         links["capacity_ba"] = None
 
-    # Two-way: copy present direction to missing one
+    # Two-way: copy single known direction to missing side
     tw_cab = mask_twoway & links["capacity_ab"].notna() & links["capacity_ba"].isna()
     tw_cba = mask_twoway & links["capacity_ba"].notna() & links["capacity_ab"].isna()
     links.loc[tw_cab, "capacity_ba"] = links.loc[tw_cab, "capacity_ab"]
@@ -409,7 +406,6 @@ def normalize_network_attributes(
     links.loc[tw_cba, "capacity_ab"] = links.loc[tw_cba, "capacity_ba"]
     links.loc[tw_cba, "estimated_capacity_ab"] = 1
 
-    # Estimate missing from capacity_per_lane * lanes
     for suffix, est_col, lanes_col in [
         ("ab", "estimated_capacity_ab", "lanes_ab"),
         ("ba", "estimated_capacity_ba", "lanes_ba"),
@@ -427,14 +423,10 @@ def normalize_network_attributes(
                 links.loc[remaining, cap_col] = generic_cpl * links.loc[remaining, lanes_col]
                 links.loc[remaining, est_col] = 1
 
-    # ------------------------------------------------------------------
-    # 4.5 Experiment profile adjustments (speed/capacity hierarchy)
-    # ------------------------------------------------------------------
+    # --- Experiment profile (speed/capacity) ---
     links = _apply_experiment_profile(links, profile, thresholds)
 
-    # ------------------------------------------------------------------
-    # 5. Free-flow travel time (preserve AB/BA)
-    # ------------------------------------------------------------------
+    # --- Free-flow travel time (AB/BA) ---
     if "travel_time_ab" in links.columns:
         links["travel_time_ab"] = pd.to_numeric(links["travel_time_ab"], errors="coerce")
     else:
@@ -445,7 +437,7 @@ def normalize_network_attributes(
     else:
         links["travel_time_ba"] = None
 
-    # Two-way: copy present direction to missing
+    # Two-way: copy single known direction to missing side
     tw_tab = mask_twoway & links["travel_time_ab"].notna() & links["travel_time_ba"].isna()
     tw_tba = mask_twoway & links["travel_time_ba"].notna() & links["travel_time_ab"].isna()
     links.loc[tw_tab, "travel_time_ba"] = links.loc[tw_tab, "travel_time_ab"]
@@ -453,7 +445,7 @@ def normalize_network_attributes(
     links.loc[tw_tba, "travel_time_ab"] = links.loc[tw_tba, "travel_time_ba"]
     links.loc[tw_tba, "estimated_free_flow_time_ab"] = 1
 
-    # ALWAYS recompute travel time from distance/speed to ensure consistency.
+    # Recompute from distance/speed (single source of truth for consistency).
     for tt_col, spd_col in [("travel_time_ab", "speed_ab"), ("travel_time_ba", "speed_ba")]:
         valid_spd = (
             links[spd_col].notna()
@@ -465,21 +457,17 @@ def normalize_network_attributes(
             links.loc[valid_spd, "distance"] * 3.6 / links.loc[valid_spd, spd_col]
         )
 
-    # ------------------------------------------------------------------
-    # 5.5 Experiment profile adjustments (time penalties)
-    # ------------------------------------------------------------------
+    # --- Experiment profile (time penalties) ---
     _apply_time_penalties(links, profile.get("time_penalties") or {})
 
     # Floor travel time to prevent zero-cost links in BPR
     for tt_col in ("travel_time_ab", "travel_time_ba"):
         links[tt_col] = links[tt_col].clip(lower=min_tt)
 
-    # ------------------------------------------------------------------
-    # DB write-back (per-direction, preserving asymmetry)
-    # ------------------------------------------------------------------
+    # --- Write link attributes to DB (AB/BA kept asymmetric) ---
     db_path = resolve_project_database_path(project)
     if not db_path.is_file():
-        print(f"Warning: project database not found at {db_path}, DB update skipped")
+        logger.warning("Project database not found at %s, DB update skipped", db_path)
         return links
 
     conn = sqlite3.connect(str(db_path))
@@ -512,16 +500,21 @@ def normalize_network_attributes(
     conn.commit()
     conn.close()
 
-    # Diagnostics
     n_asym_speed = int(((links["speed_ab"] - links["speed_ba"]).abs() > 0.1).sum())
     n_asym_lanes = int((links["lanes_ab"] != links["lanes_ba"]).sum())
     n_asym_cap = int(((links["capacity_ab"] - links["capacity_ba"]).abs() > 0.1).sum())
     n_est_speed = int((links["estimated_speed_ab"] | links["estimated_speed_ba"]).sum())
     n_est_cap = int((links["estimated_capacity_ab"] | links["estimated_capacity_ba"]).sum())
 
-    print(f"Updated {len(updates)} links in DB (per-direction)")
-    print(f"  Asymmetric: speed={n_asym_speed}, lanes={n_asym_lanes}, capacity={n_asym_cap}")
-    print(f"  Estimated:  speed={n_est_speed}, capacity={n_est_cap}")
+    logger.info("Updated %d links in DB (per-direction)", len(updates))
+    logger.info(
+        "Asymmetric: speed=%d, lanes=%d, capacity=%d; estimated: speed=%d, capacity=%d",
+        n_asym_speed,
+        n_asym_lanes,
+        n_asym_cap,
+        n_est_speed,
+        n_est_cap,
+    )
 
     return links
 
@@ -543,7 +536,7 @@ def repair_boundary_scc(project: Project) -> Dict[str, Any]:
                 "major_outside_before": 0, "major_outside_after": 0,
                 "repaired_ids": []}
 
-    # ---- build directed graph and find largest SCC ----
+    # --- Build directed graph; largest SCC ---
     G = nx.DiGraph()
     for _, lk in links.iterrows():
         a, b = int(lk["a_node"]), int(lk["b_node"])
@@ -562,7 +555,7 @@ def repair_boundary_scc(project: Project) -> Dict[str, Any]:
     largest_scc = max(sccs, key=len)
     scc_before = len(largest_scc)
 
-    # ---- count major links outside SCC before repair ----
+    # --- Major links with an endpoint outside the largest SCC (before) ---
     major_outside_before = 0
     for _, lk in links.iterrows():
         if str(lk.get("link_type", "")) not in _MAJOR_ROAD_TYPES:
@@ -571,7 +564,7 @@ def repair_boundary_scc(project: Project) -> Dict[str, Any]:
         if a not in largest_scc or b not in largest_scc:
             major_outside_before += 1
 
-    # ---- select one-way major links to repair ----
+    # --- One-way major links to repair (endpoint outside largest SCC) ---
     repair_ids = []
     for _, lk in links.iterrows():
         lt = str(lk.get("link_type", ""))
@@ -586,13 +579,13 @@ def repair_boundary_scc(project: Project) -> Dict[str, Any]:
         repair_ids.append(int(lk["link_id"]))
 
     if not repair_ids:
-        print(f"  Boundary SCC repair: nothing to fix (SCC={scc_before})")
+        logger.info("Boundary SCC repair: nothing to fix (SCC=%d)", scc_before)
         return {"repaired": 0, "scc_before": scc_before, "scc_after": scc_before,
                 "major_outside_before": major_outside_before,
                 "major_outside_after": major_outside_before,
                 "repaired_ids": []}
 
-    # ---- update DB: direction → 0, sync BA ← AB ----
+    # --- DB: direction=0, copy AB to BA for repaired links ---
     db_path = resolve_project_database_path(project)
     conn = sqlite3.connect(str(db_path))
     for lid in repair_ids:
@@ -615,7 +608,7 @@ def repair_boundary_scc(project: Project) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # ---- re-check SCC ----
+    # --- Recompute SCC after repair ---
     links2 = project.network.links.data
     G2 = nx.DiGraph()
     for _, lk in links2.iterrows():
@@ -638,9 +631,16 @@ def repair_boundary_scc(project: Project) -> Dict[str, Any]:
         if a not in largest_scc2 or b not in largest_scc2:
             major_outside_after += 1
 
-    print(f"  Boundary SCC repair: made {len(repair_ids)} one-way major links bidirectional")
-    print(f"  SCC: {scc_before} → {scc_after} nodes (+{scc_after - scc_before})")
-    print(f"  Major links outside SCC: {major_outside_before} → {major_outside_after}")
+    logger.info(
+        "Boundary SCC repair: made %d one-way major links bidirectional; "
+        "SCC %d -> %d nodes (+%d); major links outside SCC %d -> %d",
+        len(repair_ids),
+        scc_before,
+        scc_after,
+        scc_after - scc_before,
+        major_outside_before,
+        major_outside_after,
+    )
 
     return {
         "repaired": len(repair_ids),
@@ -679,7 +679,6 @@ def repair_divided_highway_dead_ends(
     db_path = resolve_project_database_path(project)
     conn = sqlite3.connect(str(db_path))
 
-    # 1) Collect motorway link info per node
     rows = conn.execute(
         "SELECT link_id, a_node, b_node, link_type, osm_ref_norm FROM links"
     ).fetchall()
@@ -704,17 +703,15 @@ def repair_divided_highway_dead_ends(
             node_nonmajor[a] += 1
             node_nonmajor[b] += 1
 
-    # 2) Find dead-end nodes: exactly 1 major link, no non-major/non-connector links
     dead_ends: Dict[int, int] = {}  # node_id -> the single major link_id
     for nid, major_lids in node_major.items():
         if len(major_lids) == 1 and node_nonmajor[nid] == 0:
             dead_ends[nid] = major_lids[0]
 
     if not dead_ends:
-        print("  Divided highway repair: no dead-end carriageway nodes found")
+        logger.info("Divided highway repair: no dead-end carriageway nodes found")
         return {"connected_pairs": 0, "new_link_ids": []}
 
-    # 3) Get node coordinates in a metric CRS for distance calculation
     node_ids = list(dead_ends.keys())
     placeholders = ",".join(str(n) for n in node_ids)
     try:
@@ -746,24 +743,21 @@ def repair_divided_highway_dead_ends(
 
     if not node_geo_rows:
         conn.close()
-        print("  Divided highway repair: could not read node coordinates")
+        logger.warning("Divided highway repair: could not read node coordinates")
         return {"connected_pairs": 0, "new_link_ids": []}
 
-    # Build coordinate lookup (WGS-84)
     node_coords = {int(r[0]): (float(r[1]), float(r[2])) for r in node_geo_rows}
 
     # Geodesic distance on WGS84 ellipsoid (metres)
     from pyproj import Geod
     geod = Geod(ellps="WGS84")
 
-    # 4) For each dead-end node, get its road ref and link_type (for new connector link)
     dead_ref: Dict[int, str] = {}
     dead_lt: Dict[int, str] = {}
     for nid, lid in dead_ends.items():
         dead_ref[nid] = link_ref.get(lid, "")
         dead_lt[nid] = link_lt.get(int(lid), "motorway")
 
-    # 5) Greedy pair matching: match closest same-ref dead-end pairs
     remaining = set(dead_ends.keys()) & set(node_coords.keys())
     pairs_to_create: list = []
 
@@ -799,10 +793,10 @@ def repair_divided_highway_dead_ends(
     conn.close()
 
     if not pairs_to_create:
-        print("  Divided highway repair: no pairs within snap distance")
+        logger.info("Divided highway repair: no pairs within snap distance")
         return {"connected_pairs": 0, "new_link_ids": []}
 
-    # 6) Create connecting links via AequilibraE API (needs exclusive DB access)
+    # --- Create connecting links (AequilibraE API needs exclusive DB access) ---
     lt_needed = {dead_lt.get(n1, "motorway") for n1, _, _, _ in pairs_to_create}
     lt_needed |= {dead_lt.get(n2, "motorway") for _, n2, _, _ in pairs_to_create}
     _ensure_link_types_registered(project, lt_needed)
@@ -840,12 +834,17 @@ def repair_divided_highway_dead_ends(
 
         new_link_ids.append(new_link.link_id)
         connected_pairs.append((n1, n2, round(dist, 1), ref))
-        print(
-            f"  Connected {ref} dead-end pair: {n1} ↔ {n2} ({dist:.0f}m) → link {new_link.link_id} "
-            f"({lt_use})",
+        logger.debug(
+            "Connected dead-end pair %s: %d and %d (%.0fm) -> link %s (%s)",
+            ref,
+            n1,
+            n2,
+            dist,
+            new_link.link_id,
+            lt_use,
         )
 
-    # 7) Update osm_ref and node IDs via SQL (AequilibraE API doesn't expose these)
+    # osm_ref / node_ids: AequilibraE API does not expose these
     conn2 = sqlite3.connect(str(db_path))
     for lid, (n1, n2, _, ref) in zip(new_link_ids, pairs_to_create):
         lt_use = dead_lt.get(n1, dead_lt.get(n2, "motorway"))
@@ -865,7 +864,10 @@ def repair_divided_highway_dead_ends(
     except Exception:
         pass
 
-    print(f"  Divided highway repair: connected {len(connected_pairs)} carriageway pair(s)")
+    logger.info(
+        "Divided highway repair: connected %d carriageway pair(s)",
+        len(connected_pairs),
+    )
     return {"connected_pairs": len(connected_pairs), "new_link_ids": new_link_ids}
 
 
@@ -901,7 +903,7 @@ def check_connectivity(project: Project) -> Dict[str, Any]:
             G.add_edge(a_node, b_node, **attrs)
             G.add_edge(b_node, a_node, **attrs)
 
-    # --- Undirected analysis (original) ---
+    # --- Undirected connectivity ---
     G_undirected = G.to_undirected()
     components = list(nx.connected_components(G_undirected))
     components_sorted = sorted(components, key=len, reverse=True)
@@ -910,7 +912,7 @@ def check_connectivity(project: Project) -> Dict[str, Any]:
     isolated_nodes = [node for comp in components_sorted[1:] for node in comp if len(comp) == 1]
     isolated_components = [comp for comp in components_sorted[1:] if len(comp) > 1]
 
-    # --- Directed (SCC) analysis ---
+    # --- Directed (strongly connected) ---
     sccs = list(nx.strongly_connected_components(G))
     sccs_sorted = sorted(sccs, key=len, reverse=True)
     largest_scc = sccs_sorted[0] if sccs_sorted else set()
@@ -926,8 +928,11 @@ def check_connectivity(project: Project) -> Dict[str, Any]:
             major_outside_scc += 1
 
     if major_outside_scc > 0:
-        print(f"  WARNING: {major_outside_scc} motorway/trunk links are outside "
-              f"the largest strongly-connected component ({len(largest_scc)} nodes)")
+        logger.warning(
+            "%d motorway/trunk links are outside the largest strongly-connected component (%d nodes)",
+            major_outside_scc,
+            len(largest_scc),
+        )
 
     result = {
         "total_components": len(components_sorted),
@@ -1078,26 +1083,27 @@ def export_stable_network(
     summary_path = output_path / "network_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    print(f"Exported network to: {output_path}")
-    print(f"  - Links: {len(links)}")
-    print(f"  - Nodes: {len(nodes)}")
+    logger.info("Exported network to %s (links: %d, nodes: %d)", output_path, len(links), len(nodes))
     if "geometry" in links_export.columns:
-        print(f"  - network_links.gpkg (EPSG:{output_crs_epsg}, metres, aligns with distance)")
-        print("  - network_links.geojson (EPSG:4326, for maps only)")
+        logger.info(
+            "Wrote network_links.gpkg (EPSG:%d) and network_links.geojson (EPSG:4326, for maps only)",
+            output_crs_epsg,
+        )
     if connectivity_info:
-        print(f"  - Components: {connectivity_info['total_components']}")
-        print(f"  - Largest component: {connectivity_info['largest_component_size']} nodes")
+        logger.info("Components: %d, largest: %d nodes", connectivity_info['total_components'], connectivity_info['largest_component_size'])
         if "directed_scc_count" in connectivity_info:
-            print(f"  - Directed SCCs: {connectivity_info['directed_scc_count']}")
-            print(f"  - Largest SCC: {connectivity_info['largest_scc_size']} nodes")
-            if connectivity_info.get("major_links_outside_scc", 0) > 0:
-                print(f"  - WARNING: {connectivity_info['major_links_outside_scc']} "
-                      f"major links outside largest SCC")
+            logger.info(
+                "Directed SCCs: %d, largest SCC: %d nodes",
+                connectivity_info['directed_scc_count'],
+                connectivity_info['largest_scc_size'],
+            )
+            n_maj = connectivity_info.get("major_links_outside_scc", 0)
+            if n_maj > 0:
+                logger.warning("%d major links outside largest SCC", n_maj)
 
 
-# ---------------------------------------------------------------------------
-# Baseline closures
-# ---------------------------------------------------------------------------
+# --- Baseline closures ---
+
 
 def _closure_overlaps_period(
     closure: Dict[str, Any],
@@ -1133,7 +1139,7 @@ def load_closures(
         is in this list are returned.
     """
     if not source_path.exists():
-        print(f"  Closures file not found: {source_path} — skipping")
+        logger.info("Closures file not found: %s, skipping", source_path)
         return []
 
     suffix = source_path.suffix.lower()
@@ -1146,7 +1152,7 @@ def load_closures(
             gdf = gpd.GeoDataFrame(gdf)
 
         if gdf.empty:
-            print("  Closures parquet is empty")
+            logger.info("Closures parquet is empty")
             return []
 
         closures = gdf.to_dict(orient="records")
@@ -1154,11 +1160,11 @@ def load_closures(
         data = json.loads(source_path.read_text(encoding="utf-8"))
         closures = data.get("closures", [])
     else:
-        print(f"  Unsupported closure file format: {suffix}")
+        logger.warning("Unsupported closure file format: %s", suffix)
         return []
 
     if not closures:
-        print("  Closures file is empty")
+        logger.info("Closures file is empty")
         return []
 
     total = len(closures)
@@ -1166,9 +1172,15 @@ def load_closures(
         p_start = measurement_period.get("start", "1900-01-01")
         p_end = measurement_period.get("end", "2099-12-31")
         closures = [c for c in closures if _closure_overlaps_period(c, p_start, p_end)]
-        print(f"  Loaded {total} closures, {len(closures)} overlap measurement period {p_start}..{p_end}")
+        logger.info(
+            "Loaded %d closures, %d overlap measurement period %s..%s",
+            total,
+            len(closures),
+            p_start,
+            p_end,
+        )
     else:
-        print(f"  Loaded {total} closures (no temporal filter)")
+        logger.info("Loaded %d closures (no temporal filter)", total)
 
     if status_whitelist:
         allowed = {str(s).strip().lower() for s in status_whitelist}
@@ -1177,9 +1189,11 @@ def load_closures(
             c for c in closures
             if str(c.get("status", "")).strip().lower() in allowed
         ]
-        print(
-            f"  Status filter ({', '.join(sorted(allowed))}): "
-            f"{before} -> {len(closures)} closures"
+        logger.info(
+            "Status filter (%s): %d -> %d closures",
+            ", ".join(sorted(allowed)),
+            before,
+            len(closures),
         )
 
     return closures
@@ -1244,8 +1258,11 @@ def apply_baseline_closures(
         # (typical range 0–180) but CRS is metric, reproject from 4326.
         sample_x = link_gdf.geometry.iloc[0].coords[0][0] if len(link_gdf) > 0 else 0
         if link_gdf.crs and link_gdf.crs.to_epsg() == metric_epsg and abs(sample_x) < 360:
-            print(f"  WARNING: link coords look like WGS84 (x={sample_x:.4f}) "
-                  f"but CRS is EPSG:{metric_epsg} — reprojecting from 4326")
+            logger.warning(
+                "Link coords look like WGS84 (x=%.4f) but CRS is EPSG:%d; reprojecting from 4326",
+                sample_x,
+                metric_epsg,
+            )
             link_gdf = link_gdf.set_crs(epsg=4326, allow_override=True)
             link_gdf = link_gdf.to_crs(epsg=metric_epsg)
     else:
@@ -1281,19 +1298,27 @@ def apply_baseline_closures(
                 if lid not in affected_link_ids or sev == "full":
                     affected_link_ids[lid] = sev
     else:
-        print("  WARNING: No link geometries available for spatial closure matching")
+        logger.warning("No link geometries available for spatial closure matching")
 
     if not affected_link_ids:
-        # Diagnostic: report coordinate ranges to aid CRS debugging
         if link_gdf is not None and len(closure_pts) > 0:
             lb = link_gdf.total_bounds
             cb = closure_pts.total_bounds
-            print(f"  No closures matched to network links "
-                  f"(link bounds=[{lb[0]:.0f},{lb[1]:.0f},{lb[2]:.0f},{lb[3]:.0f}], "
-                  f"closure bounds=[{cb[0]:.0f},{cb[1]:.0f},{cb[2]:.0f},{cb[3]:.0f}], "
-                  f"buffer={max_dist_m}m)")
+            logger.debug(
+                "No closures matched (link bounds [%.0f,%.0f,%.0f,%.0f], "
+                "closure bounds [%.0f,%.0f,%.0f,%.0f], buffer %sm)",
+                lb[0],
+                lb[1],
+                lb[2],
+                lb[3],
+                cb[0],
+                cb[1],
+                cb[2],
+                cb[3],
+                max_dist_m,
+            )
         else:
-            print("  No closures matched to network links")
+            logger.info("No closures matched to network links")
         return links
 
     for lid, sev in affected_link_ids.items():
@@ -1323,16 +1348,21 @@ def apply_baseline_closures(
         n_nan = int(links[col].isna().sum())
         if n_nan:
             links[col] = links[col].fillna(min_cap)
-            print(f"  WARNING: filled {n_nan} NaN values in {col} with {min_cap}")
+            logger.warning("Filled %d NaN values in %s with %s", n_nan, col, min_cap)
     for col in ("speed_ab", "speed_ba"):
         n_nan = int(links[col].isna().sum())
         if n_nan:
             links[col] = links[col].fillna(min_spd)
-            print(f"  WARNING: filled {n_nan} NaN values in {col} with {min_spd}")
+            logger.warning("Filled %d NaN values in %s with %s", n_nan, col, min_spd)
 
     full_count = sum(1 for s in affected_link_ids.values() if s == "full")
     partial_count = len(affected_link_ids) - full_count
-    print(f"  Applied {len(affected_link_ids)} baseline closures ({full_count} full, {partial_count} partial)")
+    logger.info(
+        "Applied %d baseline closures (%d full, %d partial)",
+        len(affected_link_ids),
+        full_count,
+        partial_count,
+    )
     return links
 
 
@@ -1351,13 +1381,12 @@ def strip_closures(
     project_dir = Path(cfg["project_path"])
     db_path = resolve_project_database_path(project_dir)
     if not db_path.is_file():
-        print(f"Project DB not found at {db_path}")
+        logger.warning("Project DB not found at %s", db_path)
         return
 
     conn = _sqlite3.connect(str(db_path))
     cur = conn.cursor()
 
-    # Check if _preclosure columns exist
     cur.execute("PRAGMA table_info(links)")
     existing_cols = {row[1] for row in cur.fetchall()}
     preclosure_cols = {
@@ -1365,7 +1394,7 @@ def strip_closures(
         "_preclosure_speed_ab", "_preclosure_speed_ba",
     }
     if not preclosure_cols.issubset(existing_cols):
-        print("  No _preclosure columns found — closures were not applied or already stripped")
+        logger.info("No _preclosure columns (closures not applied or already stripped)")
         conn.close()
         return
 
@@ -1392,7 +1421,6 @@ def strip_closures(
     conn.commit()
     conn.close()
 
-    # Re-export the network with restored values
     network_cfg = cfg.get("network") or {}
     outputs_dir = network_cfg.get("output_dir", "outputs/baseline/network")
     project = Project()
@@ -1412,20 +1440,21 @@ def strip_closures(
     finally:
         project.close()
 
-    print(f"  Stripped closures: restored {restored} links to pre-closure values")
-    print(f"  Re-exported network to {outputs_dir}")
+    logger.info("Stripped closures: restored %d links; re-exported network to %s", restored, outputs_dir)
 
     # Re-run assignment on the restored (closure-free) network so that
     # assignment_results.parquet reflects the clean state shown on the map.
     demand_cfg = cfg.get("demand") or {}
     matrix_path = Path(demand_cfg.get("matrix_path", "data/demand/od_matrix.aem"))
     if matrix_path.is_file():
-        print("\n=== RE-ASSIGNMENT (post strip-closures) ===")
+        logger.info("Re-running assignment after strip_closures")
         from sim.assignment import run_assignment
         run_assignment(config_path)
     else:
-        print(f"  WARNING: OD matrix not found at {matrix_path} — skipping post-strip re-assignment")
-        print("  The map will show stale volumes computed with closures still active.")
+        logger.warning(
+            "OD matrix not found at %s, skipping post-strip re-assignment; map may show stale volumes",
+            matrix_path,
+        )
 
 
 def swap_db_closures(
@@ -1446,10 +1475,10 @@ def swap_db_closures(
     project_dir = Path(cfg["project_path"])
     db_path = resolve_project_database_path(project_dir)
     if not db_path.is_file():
-        print(f"  swap_db_closures: DB not found at {db_path}")
+        logger.warning("swap_db_closures: DB not found at %s", db_path)
         return 0
 
-    # --- Step 1: strip existing closures ---
+    # --- Strip existing DB closures ---
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
     cur.execute("PRAGMA table_info(links)")
@@ -1478,15 +1507,15 @@ def swap_db_closures(
             except Exception:
                 pass
         conn.commit()
-        print(f"  swap_db_closures: stripped closures from {restored} links")
+        logger.info("swap_db_closures: stripped closures from %d links", restored)
     else:
-        print("  swap_db_closures: no existing closures to strip")
+        logger.info("swap_db_closures: no existing closures to strip")
     conn.close()
 
     if measurement_period is None:
         return 0
 
-    # --- Step 2: apply closures for the given period ---
+    # --- Apply closures for the measurement period ---
     bc_cfg = cfg.get("baseline_closures") or {}
     _cache = str(Path(cfg.get("datasets", {}).get("cache_dir", "data/cache")))
     source_path = Path(bc_cfg.get("source_path", f"{_cache}/closures.parquet"))
@@ -1497,7 +1526,7 @@ def swap_db_closures(
         status_whitelist=status_wl,
     )
     if not closures:
-        print(f"  swap_db_closures: no closures for period {measurement_period}")
+        logger.info("swap_db_closures: no closures for period %s", measurement_period)
         return 0
 
     project = Project()
@@ -1546,14 +1575,17 @@ def swap_db_closures(
         project.close()
 
     n = len(closures)
-    # Count how many links actually had closure effects applied
     n_affected = sum(
         1 for _, row in links_gdf.iterrows()
         if "_preclosure_capacity_ab" in row.index
         and row.get("capacity_ab") != row.get("_preclosure_capacity_ab")
     ) if "_preclosure_capacity_ab" in links_gdf.columns else 0
-    print(f"  swap_db_closures: applied {n} closures for period {measurement_period}"
-          f" ({n_affected} links affected)")
+    logger.info(
+        "swap_db_closures: applied %d closures for period %s (%d links affected)",
+        n,
+        measurement_period,
+        n_affected,
+    )
     return n
 
 
@@ -1576,15 +1608,15 @@ def normalize_and_export_network(
     project.open(str(project_dir))
 
     try:
-        print("=== NORMALIZE ATTRIBUTES ===")
+        logger.info("Normalize attributes")
         links = normalize_network_attributes(
             project,
             network_cfg,
             experiment_profile=experiment_profile,
         )
-        print(f"Normalized {len(links)} links")
+        logger.info("Normalized %d links", len(links))
 
-        print("\n=== REPAIR BOUNDARY SCC ===")
+        logger.info("Repair boundary SCC")
         repair_info = repair_boundary_scc(project)
         if repair_info.get("repaired", 0) > 0:
             repaired_set = set(repair_info["repaired_ids"])
@@ -1595,7 +1627,7 @@ def normalize_and_export_network(
             links.loc[mask, "lanes_ba"] = links.loc[mask, "lanes_ab"]
             links.loc[mask, "travel_time_ba"] = links.loc[mask, "travel_time_ab"]
 
-        print("\n=== REPAIR DIVIDED HIGHWAYS ===")
+        logger.info("Repair divided highways")
         divided_info = repair_divided_highway_dead_ends(
             project,
             max_snap_distance_m=float(
@@ -1626,17 +1658,20 @@ def normalize_and_export_network(
                     links = pd.concat([links, new_row], ignore_index=True)
             conn_tmp.close()
 
-        print("\n=== CHECK CONNECTIVITY ===")
+        logger.info("Check connectivity")
         connectivity_info = check_connectivity(project)
-        print(f"Components: {connectivity_info['total_components']}")
-        print(f"Largest component: {connectivity_info['largest_component_size']} nodes")
-        print(f"Isolated nodes: {connectivity_info['isolated_nodes_count']}")
-        print(f"Isolated components: {connectivity_info['isolated_components_count']}")
+        logger.info(
+            "Connectivity: %d components, largest %d nodes, %d isolated nodes, %d isolated multi-node components",
+            connectivity_info["total_components"],
+            connectivity_info["largest_component_size"],
+            connectivity_info["isolated_nodes_count"],
+            connectivity_info["isolated_components_count"],
+        )
 
-        # ----- Baseline closures (optional) -----
+        # --- Baseline closures (optional) ---
         bc_cfg = cfg.get("baseline_closures") or {}
         if bc_cfg.get("enabled", False):
-            print("\n=== BASELINE CLOSURES ===")
+            logger.info("Baseline closures")
             _cache2 = str(Path(cfg.get("datasets", {}).get("cache_dir", "data/cache")))
             source_path = Path(bc_cfg.get("source_path", f"{_cache2}/closures.parquet"))
             closures = load_closures(
@@ -1647,7 +1682,6 @@ def normalize_and_export_network(
             if closures:
                 links = apply_baseline_closures(links, closures, cfg)
 
-                # Persist closure-affected values + _preclosure columns to DB
                 db_path = resolve_project_database_path(project)
                 if db_path.is_file():
                     conn = sqlite3.connect(str(db_path))
@@ -1685,9 +1719,9 @@ def normalize_and_export_network(
                     conn.commit()
                     conn.close()
             else:
-                print("  No closures to apply (empty or file missing)")
+                logger.info("No closures to apply (empty or file missing)")
 
-        print("\n=== EXPORT NETWORK ===")
+        logger.info("Export network")
         out_dir = Path(outputs_dir)
         crs_epsg = get_metric_epsg(cfg)
         export_stable_network(
@@ -1699,7 +1733,7 @@ def normalize_and_export_network(
             cfg=cfg,
         )
 
-        print("\n=== NORMALIZATION COMPLETE ===")
+        logger.info("Normalization complete")
 
     finally:
         project.close()

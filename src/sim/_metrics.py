@@ -38,13 +38,17 @@ def persons_to_vehicles_from_cfg(
     cfg_root: Dict[str, Any],
 ) -> float:
     """Sum work + school vehicle trips using ``demand.conversion`` config."""
+    from sim.defaults import SIM_DEFAULTS
+    _DEFAULTS = SIM_DEFAULTS["demand"]["conversion"]
+
     def _conv(p: float, branch: str) -> float:
         conv_cfg = (cfg_root.get("demand") or {}).get("conversion", {}).get(branch, {}) or {}
+        defaults = _DEFAULTS.get(branch, _DEFAULTS["work"])
         return persons_to_vehicles(
             p,
-            car_share=float(conv_cfg.get("car_share", 0.0)),
-            occupancy=float(conv_cfg.get("occupancy", 1.0)),
-            trips_per_person=float(conv_cfg.get("trips_per_person", 2.0)),
+            car_share=float(conv_cfg.get("car_share", defaults["car_share"])),
+            occupancy=float(conv_cfg.get("occupancy", defaults["occupancy"])),
+            trips_per_person=float(conv_cfg.get("trips_per_person", defaults["trips_per_person"])),
         )
     return _conv(work, "work") + _conv(school, "school")
 

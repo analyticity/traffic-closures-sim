@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 from aequilibrae.matrix import AequilibraeMatrix
 
+from sim.fetch_datasets import resolved_commuting_full_cr_parquet_path
 from sim.io_project import get_metric_epsg, load_config
 from sim._text import norm_name as _norm_name
 from sim._metrics import persons_to_vehicles
@@ -570,9 +571,11 @@ def _resolve_commuting_paths(cfg: Dict[str, Any]) -> Tuple[Path, Path, Path]:
         _get(cfg, ["datasets", "sources", "commuting_sldb2021", "filtered_out_parquet"],
              cache_dir / f"{csv_path.stem}.parquet")
     )
-    full_cr_parquet = _as_path(
-        _get(cfg, ["datasets", "sources", "commuting_sldb2021", "full_cr_out_parquet"],
-             cache_dir / f"{csv_path.stem}_full_cr.parquet")
+    full_cr_explicit = _get(cfg, ["datasets", "sources", "commuting_sldb2021", "full_cr_out_parquet"], None)
+    full_cr_parquet = (
+        _as_path(full_cr_explicit)
+        if full_cr_explicit
+        else resolved_commuting_full_cr_parquet_path(cfg)
     )
     return csv_path, filtered_parquet, full_cr_parquet
 
@@ -627,27 +630,28 @@ def _build_cfg(cfg: Dict[str, Any]) -> DemandBuildCfg:
 
     ext_cfg = _get(demand, ["sldb", "external_processing"], {}) or {}
     seg_ext_through = _get(demand, ["segments", "external_through"], {}) or {}
+    _cache = _as_path(_get(cfg, ["datasets", "cache_dir"], "data/cache"))
 
     gateway_lookup_path = _as_path(
-        ext_cfg.get("external_gateway_lookup_path", "data/cache/external_gateway_lookup.parquet")
+        ext_cfg.get("external_gateway_lookup_path", str(_cache / "external_gateway_lookup.parquet"))
     )
     through_pairs_path = _as_path(
         ext_cfg.get(
             "through_gateway_pairs_path",
-            seg_ext_through.get("data_driven_pairs_path", "data/cache/through_gateway_pairs.parquet"),
+            seg_ext_through.get("data_driven_pairs_path", str(_cache / "through_gateway_pairs.parquet")),
         )
     )
 
     external = ExternalProcessingCfg(
-        enabled=bool(ext_cfg.get("enabled", False)),
-        use_full_cr_dataset=bool(ext_cfg.get("use_full_cr_dataset", False)),
+        enabled=bool(ext_cfg.get("enabled", True)),
+        use_full_cr_dataset=bool(ext_cfg.get("use_full_cr_dataset", True)),
         use_external_internal=bool(ext_cfg.get("use_external_internal", True)),
         use_internal_external=bool(ext_cfg.get("use_internal_external", True)),
         use_through_traffic=bool(ext_cfg.get("use_through_traffic", True)),
         gateway_lookup_path=gateway_lookup_path,
         through_pairs_path=through_pairs_path,
         allow_legacy_fallback=bool(_get(demand, ["use_gateway_fallback_in_commuting"], False)),
-        external_commuting_scale=float(ext_cfg.get("external_commuting_scale", 1.0)),
+        external_commuting_scale=float(ext_cfg.get("external_commuting_scale", 0.75)),
     )
 
     return DemandBuildCfg(
@@ -657,7 +661,7 @@ def _build_cfg(cfg: Dict[str, Any]) -> DemandBuildCfg:
         csv_delimiter=str(fmt.get("delimiter", ",")),
         csv_encoding=str(fmt.get("encoding", "utf-8")),
         include_lokalizace=[str(x) for x in include_lok],
-        only_internal_pairs=bool(_get(demand, ["sldb", "only_internal_pairs"], True)),
+        only_internal_pairs=bool(_get(demand, ["sldb", "only_internal_pairs"], False)),
         origin_filters=origin_filters,
         conv_work=conv_work,
         conv_school=conv_school,
@@ -1448,7 +1452,7 @@ def _load_zones(cfg: Dict[str, Any]) -> gpd.GeoDataFrame:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None:
+def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") -> None:
     t0 = time.perf_counter()
     marks: Dict[str, float] = {}
     t_prev = t0
@@ -1589,10 +1593,10 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
         other_daily = _build_gravity_seed(
             zone_ids,
             zone_population,
-            trip_rate=float(other_cfg.get("trip_rate", other_defaults.get("trip_rate", 0.6))),
-            car_share=float(other_cfg.get("car_share", other_defaults.get("car_share", 0.35))),
-            occupancy=float(other_cfg.get("occupancy", other_defaults.get("occupancy", 1.50))),
-            beta=float(other_cfg.get("beta", other_defaults.get("beta", 0.00015))),
+            trip_rate=float(other_cfg.get("trip_rate", other_defaults.get("trip_rate", 1.0))),
+            car_share=float(other_cfg.get("car_share", other_defaults.get("car_share", 0.38))),
+            occupancy=float(other_cfg.get("occupancy", other_defaults.get("occupancy", 1.45))),
+            beta=float(other_cfg.get("beta", other_defaults.get("beta", 0.00030))),
             centroids_gdf=zones_gdf,
             excluded_zone_ids=external_zone_ids,
             metric_epsg=get_metric_epsg(cfg),
@@ -1603,10 +1607,11 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
     _mark("build_other_seed")
 
     # --- Residual synthetic external_local (optional) ---
+    _el_source = external_local_cfg.get("source", "gateway_local") if external_local_cfg else None
     if (
         external_local_cfg
         and bool(external_local_cfg.get("enabled", True))
-        and external_local_cfg.get("source") == "gateway_local"
+        and _el_source == "gateway_local"
         and gateways
         and float(external_local_cfg.get("total_daily_trips", 0.0)) > 0
     ):
@@ -1645,7 +1650,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/sim.yaml") -> None
                 through_pairs_df,
             )
             through_scale = float(
-                _get(cfg, ["demand", "sldb", "external_processing", "through_traffic_scale"], 1.0) or 1.0
+                _get(cfg, ["demand", "sldb", "external_processing", "through_traffic_scale"], 0.65) or 0.65
             )
             if through_scale != 1.0:
                 data_driven_through_daily *= through_scale
@@ -1845,18 +1850,19 @@ def assert_build_demand_prerequisites(cfg: dict) -> None:
 
     demand = cfg.get("demand") or {}
     seg_ext_through = (demand.get("segments") or {}).get("external_through") or {}
+    _cache_dir = str(Path(cfg.get("datasets", {}).get("cache_dir", "data/cache")))
 
     def _resolve(p: Any) -> Path:
         path = Path(p) if not isinstance(p, Path) else p
         return path if path.is_absolute() else (root / path).resolve()
 
     gw = _resolve(
-        ext.get("external_gateway_lookup_path", "data/cache/external_gateway_lookup.parquet")
+        ext.get("external_gateway_lookup_path", f"{_cache_dir}/external_gateway_lookup.parquet")
     )
     tp_default = ext.get("through_gateway_pairs_path")
     if not tp_default:
         tp_default = seg_ext_through.get(
-            "data_driven_pairs_path", "data/cache/through_gateway_pairs.parquet"
+            "data_driven_pairs_path", f"{_cache_dir}/through_gateway_pairs.parquet"
         )
     tp = _resolve(tp_default)
 

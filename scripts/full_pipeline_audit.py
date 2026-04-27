@@ -150,7 +150,7 @@ def infer_warnings(step: str, log_text: str) -> List[str]:
 
 
 def build_magic_inventory(repo_root: Path, out_dir: Path) -> None:
-    cfg_path = repo_root / "config" / "sim.yaml"
+    cfg_path = repo_root / "config" / "brno" / "sim.yaml"
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     rows: List[Dict[str, object]] = []
 
@@ -262,7 +262,7 @@ def write_fix_packages(out_dir: Path) -> None:
 
 
 def write_unused_policy_report(repo_root: Path, out_dir: Path) -> None:
-    cfg_path = repo_root / "config" / "sim.yaml"
+    cfg_path = repo_root / "config" / "brno" / "sim.yaml"
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     pol = (((cfg.get("experiments") or {}).get("policy") or {}))
     used_keys = {
@@ -321,7 +321,7 @@ def compare_with_previous(repo_root: Path, out_dir: Path, current_rows: List[Dic
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Full pipeline validity audit")
-    ap.add_argument("--config", default="config/sim.yaml")
+    ap.add_argument("--config", default="config/brno/sim.yaml")
     ap.add_argument("--out-root", default="outputs/audit/full_pipeline_audit")
     ap.add_argument("--timeout-s", type=int, default=1200)
     ap.add_argument("--stop-on-fail", action="store_true")

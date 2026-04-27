@@ -54,7 +54,7 @@ def metric_row(run_id, block, calib, valid, rc):
 
 def main():
     ap = argparse.ArgumentParser(description="Run calibration tuning variants batch")
-    ap.add_argument("--base-config", default="config/sim.yaml")
+    ap.add_argument("--base-config", default="config/brno/sim.yaml")
     ap.add_argument("--work-root", default="outputs/tuning")
     ap.add_argument("--outer-iterations", type=int, default=6)
     ap.add_argument("--quiet", action="store_true")

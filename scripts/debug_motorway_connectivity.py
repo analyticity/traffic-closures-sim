@@ -1,7 +1,7 @@
 """Motorway connectivity debug: directed SCC, ramp audit, reachability, bearing mismatch.
 
 Usage:
-    python scripts/debug_motorway_connectivity.py --config config/sim.yaml
+    python scripts/debug_motorway_connectivity.py --config config/brno/sim.yaml
 """
 from __future__ import annotations
 
@@ -556,7 +556,7 @@ def export_issues_geojson(
 
 def main():
     parser = argparse.ArgumentParser(description="Motorway connectivity debug")
-    parser.add_argument("--config", default="config/sim.yaml")
+    parser.add_argument("--config", default="config/brno/sim.yaml")
     args = parser.parse_args()
 
     import yaml

@@ -18,6 +18,10 @@ import pandas as pd
 from shapely.geometry import LineString, MultiLineString, Point
 from shapely.ops import unary_union
 
+from sim.fetch_datasets import (
+    resolved_commuting_full_cr_parquet_path,
+    resolved_cz_place_centroids_parquet_path,
+)
 from sim.io_project import get_metric_epsg, load_config
 from sim.network_pipeline import (
     NETWORK_MAP_EXPORT_DPI,
@@ -192,6 +196,7 @@ def build_cfg(cfg_root: Dict[str, Any]) -> SuperCfg:
     output_dir = _as_path(sn.get("output_dir", "outputs/baseline/supernetwork"))
     zoning_output_dir = _as_path(_get(cfg_root, "zoning", "output_dir", default="outputs/baseline/zones"))
     commute_src = _get(cfg_root, "datasets", "sources", "commuting_sldb2021", default={}) or {}
+    general_cache = _as_path(_get(cfg_root, "datasets", "cache_dir", default="data/cache"))
     highway_types = list(
         _get(sn, "national_network", "highway_types", default=["motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link"])
     )
@@ -204,20 +209,28 @@ def build_cfg(cfg_root: Dict[str, Any]) -> SuperCfg:
         output_dir=output_dir,
         cache_dir=cache_dir,
         pbf_path=_as_path(sn.get("pbf_path", "data/sources/osm/czech-republic-latest.osm.pbf")),
-        place_centroids_path=_as_path(sn.get("place_centroids_path", "data/cache/cz_place_centroids.parquet")),
+        place_centroids_path=(
+            _as_path(sn["place_centroids_path"])
+            if sn.get("place_centroids_path")
+            else resolved_cz_place_centroids_parquet_path(cfg_root)
+        ),
         place_centroids_crs_epsg=int(sn.get("place_centroids_crs_epsg", 4326)),
         highway_types=highway_types,
         contract_graph=bool(sn.get("contract_graph", True)),
         contract_degree=int(sn.get("contract_exclude_degree_leq", 2)),
         max_candidate_gateways=int(_get(sn, "gateway_mapping", "max_candidate_gateways", default=3)),
-        detour_ratio_max=float(_get(sn, "relation_filter", "detour_ratio_max", default=1.25)),
-        max_extra_minutes=float(_get(sn, "relation_filter", "max_extra_minutes", default=20.0)),
+        detour_ratio_max=float(_get(sn, "relation_filter", "detour_ratio_max", default=1.40)),
+        max_extra_minutes=float(_get(sn, "relation_filter", "max_extra_minutes", default=25.0)),
         allow_same_gateway_pair=bool(_get(sn, "relation_filter", "allow_same_gateway_pair", default=False)),
         model_area_path=zoning_output_dir / "model_area.geojson",
         zones_path=zoning_output_dir / "zones.geojson",
-        gateway_seed_lookup_path=_as_path(_get(cfg_root, "zoning", "external_gateways", "export_lookup_path", default="data/cache/gateway_lookup_seed.parquet")),
+        gateway_seed_lookup_path=_as_path(_get(cfg_root, "zoning", "external_gateways", "export_lookup_path", default=str(general_cache / "gateway_lookup_seed.parquet"))),
         gateway_diagnostics_path=zoning_output_dir / "gateway_diagnostics.csv",
-        full_cr_commuting_parquet=_as_path(commute_src.get("full_cr_out_parquet", "data/cache/dojizdka_obce_full_cr.parquet")),
+        full_cr_commuting_parquet=(
+            _as_path(commute_src["full_cr_out_parquet"])
+            if commute_src.get("full_cr_out_parquet")
+            else resolved_commuting_full_cr_parquet_path(cfg_root)
+        ),
         full_cr_commuting_csv=_as_path(commute_src.get("out_path", "data/sources/csu/sldb2021/dojizdka_obce.csv")),
         national_nodes_path=_as_path(
             outputs.get("national_nodes", cache_dir / f"national_nodes_{hw_sig}.parquet")
@@ -225,9 +238,9 @@ def build_cfg(cfg_root: Dict[str, Any]) -> SuperCfg:
         national_edges_path=_as_path(
             outputs.get("national_edges", cache_dir / f"national_edges_{hw_sig}.parquet")
         ),
-        external_unit_lookup_path=_as_path(outputs.get("external_unit_lookup", "data/cache/external_unit_lookup.parquet")),
-        external_gateway_lookup_path=_as_path(outputs.get("external_gateway_lookup", "data/cache/external_gateway_lookup.parquet")),
-        through_gateway_pairs_path=_as_path(outputs.get("through_gateway_pairs", "data/cache/through_gateway_pairs.parquet")),
+        external_unit_lookup_path=_as_path(outputs.get("external_unit_lookup", str(general_cache / "external_unit_lookup.parquet"))),
+        external_gateway_lookup_path=_as_path(outputs.get("external_gateway_lookup", str(general_cache / "external_gateway_lookup.parquet"))),
+        through_gateway_pairs_path=_as_path(outputs.get("through_gateway_pairs", str(general_cache / "through_gateway_pairs.parquet"))),
         unresolved_places_path=cache_dir / "unresolved_external_places.parquet",
         classified_relations_path=cache_dir / "classified_external_relations.parquet",
         raw_major_roads_cache=cache_dir / f"major_roads_raw_{hw_sig}.parquet",
@@ -283,7 +296,11 @@ def read_commuting(cfg: SuperCfg) -> pd.DataFrame:
         return pd.read_parquet(cfg.full_cr_commuting_parquet)
     if cfg.full_cr_commuting_csv.exists():
         return pd.read_csv(cfg.full_cr_commuting_csv, sep=",", encoding="utf-8", low_memory=False)
-    raise FileNotFoundError("Full-CR commuting dataset not found")
+    raise FileNotFoundError(
+        "Full-CR commuting dataset not found. Expected parquet at "
+        f"{cfg.full_cr_commuting_parquet} or CSV at {cfg.full_cr_commuting_csv}. "
+        "Run fetch-data (dataset commuting_sldb2021) so the CSV exists and the full-CR parquet is built."
+    )
 
 
 def aggregate_commuting_pairs(df: pd.DataFrame) -> pd.DataFrame:
@@ -764,8 +781,15 @@ def build_gateway_lookup(
     costs_from_gateway: Dict[str, Dict[int, float]],
     costs_to_gateway: Dict[str, Dict[int, float]],
     cfg: SuperCfg,
+    gateway_snap_distances: Optional[Dict[str, float]] = None,
 ) -> pd.DataFrame:
     t0 = time.perf_counter()
+    _SNAP_PENALTY_SPEED_MPS = 50.0 * 1000.0 / 3600.0
+    snap_penalties: Dict[str, float] = {}
+    if gateway_snap_distances:
+        for gw, dist in gateway_snap_distances.items():
+            snap_penalties[gw] = dist / _SNAP_PENALTY_SPEED_MPS
+
     columns = [
         "unit_id",
         "place_key",
@@ -789,10 +813,11 @@ def build_gateway_lookup(
         for gw_name in gateway_names:
             to_cost = costs_to_gateway.get(gw_name, {}).get(unit_node)
             from_cost = costs_from_gateway.get(gw_name, {}).get(unit_node)
+            penalty = snap_penalties.get(gw_name, 0.0)
             if to_cost is not None and np.isfinite(to_cost):
-                scored_in.append((gw_name, float(to_cost)))
+                scored_in.append((gw_name, float(to_cost) + penalty))
             if from_cost is not None and np.isfinite(from_cost):
-                scored_out.append((gw_name, float(from_cost)))
+                scored_out.append((gw_name, float(from_cost) + penalty))
 
         if not scored_in and not scored_out:
             continue
@@ -1164,7 +1189,7 @@ def plot_overview(edges_metric: gpd.GeoDataFrame, model_area: gpd.GeoDataFrame, 
 # Main
 # ---------------------------------------------------------------------------
 
-def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
+def run(config_path: str = "config/brno/sim.yaml") -> Dict[str, Any]:
     t_run = time.perf_counter()
     phase_t = time.perf_counter()
     profile: Dict[str, Any] = {"phases_s": {}}
@@ -1209,7 +1234,17 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
         "external_units": int(len(external_units)),
     }
 
-    if cfg.national_nodes_path.exists() and cfg.national_edges_path.exists():
+    gw_hash = hashlib.sha1(
+        ",".join(sorted(gateways["gateway_name"].astype(str))).encode()
+    ).hexdigest()[:12]
+    gw_hash_path = cfg.national_nodes_path.with_suffix(".gw_hash")
+    _cache_valid = (
+        cfg.national_nodes_path.exists()
+        and cfg.national_edges_path.exists()
+        and gw_hash_path.exists()
+        and gw_hash_path.read_text().strip() == gw_hash
+    )
+    if _cache_valid:
         phase_t = time.perf_counter()
         G = graph_from_parquets(cfg.national_nodes_path, cfg.national_edges_path)
         nodes_metric = gpd.read_parquet(cfg.national_nodes_path)
@@ -1251,6 +1286,7 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
         nodes_metric, edges_metric = graph_to_gdfs(G, cfg.metric_epsg)
         nodes_metric.to_parquet(cfg.national_nodes_path, index=False)
         edges_metric.to_parquet(cfg.national_edges_path, index=False)
+        gw_hash_path.write_text(gw_hash)
         profile["phases_s"]["persist_graph_cache"] = round(time.perf_counter() - phase_t, 3)
         profile["graph_source"] = "rebuilt"
 
@@ -1285,7 +1321,15 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
     profile["phases_s"]["write_unit_lookup"] = round(time.perf_counter() - phase_t, 3)
 
     costs_from_gateway, costs_to_gateway, gateway_pair_costs = build_gateway_costs(G, gateways_join, profile=profile)
-    gateway_lookup = build_gateway_lookup(units_join, costs_from_gateway, costs_to_gateway, cfg)
+    gw_snap_dists = {
+        str(r["gateway_name"]): float(r["snap_distance_m"])
+        for _, r in gateways_join.iterrows()
+        if pd.notna(r.get("snap_distance_m"))
+    }
+    gateway_lookup = build_gateway_lookup(
+        units_join, costs_from_gateway, costs_to_gateway, cfg,
+        gateway_snap_distances=gw_snap_dists,
+    )
     profile["gateway_lookup"] = gateway_lookup.attrs.get("profile", {})
     phase_t = time.perf_counter()
     gateway_lookup.to_parquet(cfg.external_gateway_lookup_path, index=False)
@@ -1474,14 +1518,14 @@ def run(config_path: str = "config/sim.yaml") -> Dict[str, Any]:
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     return summary
 
-def run_build_supernetwork(config_path: str | Path = "config/sim.yaml") -> dict[str, Any]:
+def run_build_supernetwork(config_path: str | Path = "config/brno/sim.yaml") -> dict[str, Any]:
     return run(config_path)
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Simplified supernetwork builder")
-    parser.add_argument("--config", default="config/sim.yaml")
+    parser.add_argument("--config", default="config/brno/sim.yaml")
     args = parser.parse_args()
 
     summary = run(args.config)

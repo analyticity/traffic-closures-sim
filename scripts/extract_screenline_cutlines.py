@@ -1,6 +1,6 @@
 """One-time helper: extract WKT cut-line geometries for existing screenlines.
 
-Reads the current screenlines.yaml (with hardcoded link_ids), loads the
+Reads the current Brno screenlines.yaml (with hardcoded link_ids), loads the
 network links, and for each screenline generates a short LINESTRING that
 crosses all the referenced links perpendicularly.  Outputs new YAML to stdout.
 """
@@ -45,7 +45,7 @@ def _perpendicular_cut(centroid: Point, bearing_deg: float, half_len: float) -> 
 
 def main() -> None:
     links_path = Path("outputs/baseline/network/network_links.geojson")
-    sl_path = Path("config/screenlines.yaml")
+    sl_path = Path("config/brno/screenlines.yaml")
 
     if not links_path.exists():
         sys.exit(f"Network links not found: {links_path}")

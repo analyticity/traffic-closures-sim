@@ -24,7 +24,7 @@ def _match_closures_to_links(
     closures: List[Dict[str, Any]],
     link_gdf: gpd.GeoDataFrame,
     *,
-    max_distance_m: float = 150.0,
+    max_distance_m: float = 50.0,
     require_road_ref_match: bool = False,
     metric_epsg: int = 5514,
 ) -> Dict[int, List[Dict[str, Any]]]:
@@ -130,14 +130,19 @@ def closures_for_date(
     ``closure_text``, ``start``, ``end``, ``lon``, ``lat``).
     """
     bc_cfg = cfg.get("baseline_closures") or {}
-    source_path = Path(bc_cfg.get("source_path", "data/cache/closures.parquet"))
+    _cache = str(Path(cfg.get("datasets", {}).get("cache_dir", "data/cache")))
+    source_path = Path(bc_cfg.get("source_path", f"{_cache}/closures.parquet"))
     match_cfg = bc_cfg.get("matching") or {}
     severity_map = bc_cfg.get("severity_map") or {}
-    max_dist = float(match_cfg.get("max_distance_m", 150))
+    max_dist = float(match_cfg.get("max_distance_m", 50))
     require_ref = bool(match_cfg.get("require_road_ref_match", False))
     metric_epsg = int(cfg.get("crs_epsg", 5514))
 
-    closures = load_closures(source_path, measurement_period={"start": date, "end": date})
+    closures = load_closures(
+        source_path,
+        measurement_period={"start": date, "end": date},
+        status_whitelist=bc_cfg.get("status_whitelist"),
+    )
     if not closures:
         logger.info("No closures active on %s", date)
         return []

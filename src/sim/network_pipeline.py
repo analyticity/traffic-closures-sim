@@ -1123,7 +1123,7 @@ def enrich_links_from_osm(
 # ----------------------------
 
 def build_network_from_osm(
-    config_path: str | Path = "config/sim.yaml",
+    config_path: str | Path = "config/brno/sim.yaml",
     outputs_dir: str | Path | None = None,
 ) -> None:
     cfg = load_config(config_path)
@@ -1139,7 +1139,7 @@ def build_network_from_osm(
     buffer_km = float(osm_cfg.get("buffer_km", 0))
 
     if not bbox_cfg and not place_name:
-        raise ValueError("Missing config model_bbox or osm.place_name in config/sim.yaml")
+        raise ValueError("Missing config model_bbox or osm.place_name in sim.yaml")
 
     # Two bboxes when buffer_km is set:
     #   model_bbox_polygon  – buffer_km around the city (desired model extent, used for trim)

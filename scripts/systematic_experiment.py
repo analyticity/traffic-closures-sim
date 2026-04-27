@@ -200,7 +200,7 @@ def choose_top(rows: List[Dict[str, object]], n: int) -> List[str]:
 
 def main():
     ap = argparse.ArgumentParser(description="Systematic mismatch experiment runner")
-    ap.add_argument("--base-config", default="config/sim.yaml")
+    ap.add_argument("--base-config", default="config/brno/sim.yaml")
     ap.add_argument("--out-root", default="outputs/tuning/systematic_experiment")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--confirmatory-runs", type=int, default=3)

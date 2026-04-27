@@ -221,7 +221,7 @@ def run_ipf(
 # Pipeline orchestrator
 # ---------------------------------------------------------------------------
 
-def run_distribution(config_path: str | Path = "config/sim.yaml") -> None:
+def run_distribution(config_path: str | Path = "config/brno/sim.yaml") -> None:
     """Run the distribution step: gravity calibration + IPF on the seed OD."""
     cfg = load_config(config_path)
     demand_cfg = cfg.get("demand") or {}

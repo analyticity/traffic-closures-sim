@@ -12,17 +12,15 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
+from sim.defaults import LOCALE_DEFAULTS
+from sim.fetch_datasets import ensure_csd2025_validation_parquet, normalize_csd_count_columns
 from sim.io_project import load_config, load_locale
 
 # ---------------------------------------------------------------------------
 # Day classification
 # ---------------------------------------------------------------------------
 
-# Default holidays (Czech Republic); overridden by config/locale.yaml.
-_DEFAULT_HOLIDAYS_MD = [
-    (1, 1), (5, 1), (5, 8), (7, 5), (7, 6),
-    (9, 28), (10, 28), (11, 17), (12, 24), (12, 25), (12, 26),
-]
+_DEFAULT_HOLIDAYS_MD = [tuple(pair) for pair in LOCALE_DEFAULTS["holidays_md"]]
 
 _holidays_md_cache: list | None = None
 
@@ -83,12 +81,10 @@ def learn_day_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
     fb_day = float(fallback_shares.get("day", 0.785))
     fb_eve = float(fallback_shares.get("evening", 0.137))
     fb_night = float(fallback_shares.get("night", 0.078))
-    cache_dir = Path(cfg.get("datasets", {}).get("cache_dir", "data/cache"))
-    parquet = cache_dir / "v2_csd2025.parquet"
-    if not parquet.exists():
-        raise FileNotFoundError(f"CSD parquet not found: {parquet}. Run fetch-data first.")
+    parquet = ensure_csd2025_validation_parquet(cfg)
 
     df = pd.read_parquet(str(parquet))
+    df = normalize_csd_count_columns(df)
     locale = load_locale(cfg)
     csd_filter = locale.get("csd_region_filter") or {}
     filter_col = csd_filter.get("column", "kk")
@@ -267,7 +263,7 @@ def day_info(d: date | str, profile: Dict[str, Any]) -> Dict[str, Any]:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def run_learn_profile(config_path: str | Path = "config/sim.yaml") -> None:
+def run_learn_profile(config_path: str | Path = "config/brno/sim.yaml") -> None:
     cfg = load_config(config_path)
     print("=== LEARN TEMPORAL PROFILE ===")
     learn_day_profile(cfg)

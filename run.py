@@ -28,10 +28,14 @@ Workflow:
 """
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 import sys
 import argparse
+
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+sys.dont_write_bytecode = True
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
@@ -40,7 +44,7 @@ from sim.io_project import load_config, resolve_project_database_path
 from sim.network_pipeline import build_network_from_osm
 from sim.network_normalization import normalize_and_export_network, strip_closures
 from sim.zoning import build_zones_and_connectors
-from sim.fetch_datasets import run_fetch_datasets
+from sim.fetch_datasets import resolved_csd2025_validation_parquet_path, run_fetch_datasets
 from sim.demand import assert_build_demand_prerequisites, load_or_build_od_matrix
 from sim.assignment import run_assignment, run_warm_skim_assignment
 from sim.calibration import run_calibration, run_odme_calibration, run_validation_only, run_match_diagnostics
@@ -48,6 +52,7 @@ from sim.temporal import run_learn_profile
 from sim.supernetwork import run_build_supernetwork
 
 STEPS = [
+    "init-city",
     "clean",
     "check",
     "build-network",
@@ -99,19 +104,23 @@ def _require_assign_inputs(cfg: dict, step: str) -> None:
         )
 
 
-def run_clean(config_path: str) -> None:
-    """Delete all generated data so the next run starts fresh."""
+def run_clean(config_path: str, *, force: bool = False) -> None:
+    """Delete city-specific generated data so the next run starts fresh.
+
+    Shared national data in ``data/sources/`` is preserved unless
+    ``force=True``, which also removes downloaded source files.
+    """
     cfg = load_config(config_path)
+    city_slug = cfg["_meta"].get("city_slug", "default")
     project_root = Path(cfg["_meta"]["project_root"])
 
     dirs_to_remove = [
         Path(cfg["project_path"]),
-        project_root / "outputs",
-        project_root / "data" / "demand",
-        project_root / "data" / "cache",
-        project_root / "data" / "zones",
-        project_root / "data" / "sources",
+        project_root / "outputs" / city_slug,
+        project_root / "data" / city_slug,
     ]
+    if force:
+        dirs_to_remove.append(project_root / "data" / "sources")
 
     for d in dirs_to_remove:
         if d.exists():
@@ -120,7 +129,12 @@ def run_clean(config_path: str) -> None:
         else:
             print(f"  Already clean: {d}")
 
-    print("Clean done.  Re-run pipeline from build-network.")
+    if force:
+        print(f"Full clean done for '{city_slug}' (shared sources removed too).")
+    else:
+        print(f"Clean done for '{city_slug}'. Shared data in data/sources/ preserved.")
+        print("  Use --force to also remove shared downloaded sources.")
+    print("Re-run pipeline from build-network.")
 
 
 def run_check(config_path: str) -> None:
@@ -152,15 +166,21 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("--config", default="config/sim.yaml", help="path to sim.yaml")
+    ap.add_argument("--config", default="config/brno/sim.yaml", help="path to sim.yaml")
+    ap.add_argument("--force", action="store_true",
+                     help="for 'clean': also remove shared downloaded sources in data/sources/")
     ap.add_argument("step", choices=STEPS, help="pipeline step to execute")
     args = ap.parse_args()
 
     cfg = args.config
     step = args.step
 
-    if step == "clean":
-        run_clean(cfg)
+    if step == "init-city":
+        from scripts.generate_city_config import main as gen_main
+        gen_main()
+        return
+    elif step == "clean":
+        run_clean(cfg, force=args.force)
     elif step == "check":
         run_check(cfg)
     elif step == "build-network":
@@ -181,9 +201,11 @@ def main() -> None:
         from sim.distribution import run_distribution
         run_distribution(cfg)
     elif step == "build-supernetwork":
-        _require_paths(cfg=load_config(cfg), step=step, rel_paths=[
-            "outputs/baseline/zones/model_area.geojson",
-            "outputs/baseline/zones/zones.geojson",
+        _sn_cfg = load_config(cfg)
+        _zoning_out = Path(_sn_cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones"))
+        _require_abs_paths(_sn_cfg, step, [
+            _zoning_out / "model_area.geojson",
+            _zoning_out / "zones.geojson",
         ])
         run_build_supernetwork(cfg)
     elif step == "assign":
@@ -212,8 +234,7 @@ def main() -> None:
         run_validation_only(cfg)
     elif step == "learn-profile":
         _c = load_config(cfg)
-        cache_dir = Path(_c.get("datasets", {}).get("cache_dir", "data/cache"))
-        _require_abs_paths(_c, step, [cache_dir / "v2_csd2025.parquet"])
+        _require_abs_paths(_c, step, [resolved_csd2025_validation_parquet_path(_c)])
         run_learn_profile(cfg)
     elif step == "strip-closures":
         strip_closures(cfg)

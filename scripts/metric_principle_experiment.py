@@ -523,7 +523,7 @@ def rank_stability_scores(df: pd.DataFrame, score_cols: List[str]) -> Dict[str, 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-config", default="config/sim.yaml")
+    ap.add_argument("--base-config", default="config/brno/sim.yaml")
     ap.add_argument(
         "--v4-results",
         default="outputs/tuning/systematic_experiment_v4/results_summary.csv",

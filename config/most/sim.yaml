@@ -1,0 +1,64 @@
+project_path: "project/most_aeq"
+
+osm:
+  place_name: "Most, Czechia"
+
+network:
+  normalization_config: "config/most/network_normalization.yaml"
+
+assignment:
+  bpr:
+    by_link_type:
+      trunk:      { alpha: 0.80 }
+      trunk_link: { alpha: 0.80 }
+      primary:    { alpha: 0.95 }
+      tertiary:   { alpha: 0.50 }
+
+zoning:
+  sources:
+    - type: osm
+      place: "Okres Most, Czechia"
+      admin_level: "9"
+  external_gateways:
+    enabled: true
+    max_anchor_distance_m: 5000
+    whitelist:
+      - ref: "2541"
+        anchor_latlon: [50.5597, 13.5749]
+    auto_discover:
+      enabled: true
+      link_types: []
+
+demand:
+  sldb:
+    external_processing:
+      through_traffic_scale: 0.7
+  segments:
+    external_local:
+      source: "gateway_local"
+      total_daily_trips: 15000
+
+calibration:
+  count_source: "csd_split"
+  auto_screenlines:
+    enabled: true
+
+datasets:
+  enabled: true
+  sources:
+    commuting_sldb2021:
+      filter:
+        enabled: true
+        origin:
+          keep_if_any_matches:
+            - field: "op_okres"
+              values: ["Most"]
+            - field: "op_orp"
+              values: ["Most"]
+        destination:
+          keep_all: true
+    calibration_brno_pentlogram_2024:
+      enabled: false
+    validation_csd2025_v2:
+      usage:
+        area_filter: { enabled: true, region_hint: "Ústecký kraj" }

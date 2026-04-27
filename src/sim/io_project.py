@@ -36,20 +36,79 @@ def _as_abs_path(value: Any, base_dir: Path) -> Any:
     return str(p)
 
 
-def load_config(config_path: str | Path = "config/sim.yaml") -> Dict[str, Any]:
+def _find_project_root(config_file: Path) -> Path:
+    """Walk up from *config_file* to find the repo/project root.
+
+    The root is the nearest ancestor that directly contains a ``src``
+    or ``config`` directory.  This allows config files to live at any
+    nesting depth (``config/sim.yaml``, ``config/brno/sim.yaml``, etc.)
+    without breaking relative-path resolution.
+    """
+    candidate = config_file.parent
+    for _ in range(10):
+        if (candidate / "src").is_dir() or (candidate / "config").is_dir():
+            return candidate
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    return config_file.parent.parent
+
+
+def _derive_city_slug(base_dir: Path, cfg: Dict[str, Any]) -> str:
+    """Derive a short city identifier from the config directory or project_path."""
+    name = base_dir.name
+    if name not in ("config", ".", ""):
+        return name
+    pp = cfg.get("project_path", "")
+    if pp:
+        stem = Path(pp).name.removesuffix("_aeq")
+        if stem:
+            return stem
+    return "default"
+
+
+def _set_nested_default(cfg: Dict[str, Any], keys: list[str], value: Any) -> None:
+    """Set a nested config value only if it is not already present."""
+    d = cfg
+    for k in keys[:-1]:
+        d = d.setdefault(k, {})
+        if not isinstance(d, dict):
+            return
+    d.setdefault(keys[-1], value)
+
+
+def load_config(config_path: str | Path = "config/brno/sim.yaml") -> Dict[str, Any]:
+    from sim.defaults import SIM_DEFAULTS
+
     p = Path(config_path).expanduser().resolve()
     base_dir = p.parent
 
-    cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    if not isinstance(cfg, dict):
-        raise ValueError(f"Config must be a mapping (dict), got: {type(cfg).__name__}")
+    raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"Config must be a mapping (dict), got: {type(raw).__name__}")
+
+    cfg = _deep_merge(SIM_DEFAULTS, raw)
+
+    city_slug = _derive_city_slug(base_dir, cfg)
 
     cfg.setdefault("_meta", {})
     cfg["_meta"]["config_path"] = str(p)
     cfg["_meta"]["base_dir"] = str(base_dir)
-    # Project root (parent of config/) — data files are stored here, not under config/
-    project_root = base_dir.parent
+    cfg["_meta"]["city_slug"] = city_slug
+    project_root = _find_project_root(p)
     cfg["_meta"]["project_root"] = str(project_root)
+
+    cfg.setdefault("crs_epsg", 5514)
+
+    _set_nested_default(cfg, ["datasets", "cache_dir"], f"data/{city_slug}/cache")
+    _set_nested_default(cfg, ["demand", "matrix_path"], f"data/{city_slug}/demand/od_matrix.aem")
+    _set_nested_default(cfg, ["demand", "output_dir"], f"outputs/{city_slug}/baseline/demand")
+    _set_nested_default(cfg, ["zoning", "output_dir"], f"outputs/{city_slug}/baseline/zones")
+    _set_nested_default(cfg, ["network", "output_dir"], f"outputs/{city_slug}/baseline/network")
+    _set_nested_default(cfg, ["network", "maps_dir"], f"outputs/{city_slug}/baseline/maps")
+    _set_nested_default(cfg, ["supernetwork", "output_dir"], f"outputs/{city_slug}/baseline/supernetwork")
+    _set_nested_default(cfg, ["supernetwork", "cache_dir"], f"data/{city_slug}/cache/supernetwork")
 
     if "project_path" in cfg:
         cfg["project_path"] = _as_abs_path(cfg["project_path"], project_root)
@@ -106,12 +165,22 @@ def load_config(config_path: str | Path = "config/sim.yaml") -> Dict[str, Any]:
             network["experiment_profiles"] = _deep_merge(file_exp, inline_exp)
         cfg["network"] = network
 
+    supernetwork = cfg.get("supernetwork") or {}
+    if isinstance(supernetwork, dict):
+        for k in ("output_dir", "cache_dir"):
+            if k in supernetwork:
+                supernetwork[k] = _as_abs_path(supernetwork[k], project_root)
+        cfg["supernetwork"] = supernetwork
+
     datasets = cfg.get("datasets") or {}
     if isinstance(datasets, dict):
         for k in ("root_dir", "cache_dir"):
             if k in datasets:
                 datasets[k] = _as_abs_path(datasets[k], project_root)
-        sources = datasets.get("sources") or {}
+        # Merge YAML sources on top of built-in CZ dataset defaults.
+        from sim.fetch_datasets import _merge_dataset_sources  # lazy to avoid circular import
+        datasets["sources"] = _merge_dataset_sources(datasets.get("sources"))
+        sources = datasets["sources"]
         if isinstance(sources, dict):
             for _, scfg in sources.items():
                 if isinstance(scfg, dict) and "out_path" in scfg:
@@ -131,15 +200,22 @@ def load_locale(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Load locale-specific configuration (holidays, mappings, etc.).
 
     The locale file path is taken from ``cfg["locale_path"]``, defaulting
-    to ``config/locale.yaml`` relative to the project root.
+    to ``locale.yaml`` in the same directory as the sim config file.
+    National defaults (Czech Republic) from ``LOCALE_DEFAULTS`` are used
+    as the base; the YAML file overrides them.
     """
-    project_root = Path(cfg.get("_meta", {}).get("project_root", "."))
-    locale_path = Path(cfg.get("locale_path", project_root / "config" / "locale.yaml"))
+    from sim.defaults import LOCALE_DEFAULTS
+
+    meta = cfg.get("_meta", {})
+    project_root = Path(meta.get("project_root", "."))
+    config_dir = Path(meta.get("base_dir", project_root / "config"))
+    locale_path = Path(cfg.get("locale_path", config_dir / "locale.yaml"))
     if not locale_path.is_absolute():
         locale_path = (project_root / locale_path).resolve()
+    raw: Dict[str, Any] = {}
     if locale_path.exists():
-        return yaml.safe_load(locale_path.read_text(encoding="utf-8")) or {}
-    return {}
+        raw = yaml.safe_load(locale_path.read_text(encoding="utf-8")) or {}
+    return _deep_merge(LOCALE_DEFAULTS, raw)
 
 
 def get_metric_epsg(cfg: Dict[str, Any]) -> int:

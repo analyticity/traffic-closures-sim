@@ -1,20 +1,6 @@
 # Locale-specific configuration for Czech Republic / Brno.
-# Replace this file when deploying for a different city or country.
-
-# Public holidays — recurring (month, day) pairs.
-# Used by temporal.py to classify workdays vs holidays.
-holidays_md:
-  - [1, 1]
-  - [5, 1]
-  - [5, 8]
-  - [7, 5]
-  - [7, 6]
-  - [9, 28]
-  - [10, 28]
-  - [11, 17]
-  - [12, 24]
-  - [12, 25]
-  - [12, 26]
+# National defaults (holidays, road_classification, reference_speeds) are
+# built into the code; only city-specific values need to be here.
 
 # CSD (nationwide traffic census) region filter.
 # NUTS code fragment to select relevant census sections.
@@ -23,7 +9,6 @@ csd_region_filter:
   contains: "064"
 
 # Municipal-part to cadastral-unit mapping (for SLDB population preprocessing).
-# Used by fetch_datasets.py → preprocess_population_sldb2021.
 municipal_parts_to_cadastral:
   "Brno-střed": ["Město Brno", "Staré Brno", "Veveří", "Pisárky", "Stránice", "Zábrdovice", "Trnitá", "Štýřice"]
   "Brno-Žabovřesky": ["Žabovřesky"]
@@ -53,25 +38,3 @@ municipal_parts_to_cadastral:
   "Brno-Jehnice": ["Jehnice"]
   "Brno-Útěchov": ["Útěchov u Brna"]
   "Brno-Ořešín": ["Ořešín"]
-
-# Road classification from CSD road number (e.g. "D1" → motorway, "43" → trunk).
-# Used by calibration.py and temporal.py.
-road_classification:
-  motorway_prefix: "D"
-  trunk_max: 99
-  secondary_max: 999
-
-# Czech reference speeds by road class (km/h) used for speed validation.
-# From calibration.py _CZECH_REFERENCE_SPEEDS.
-reference_speeds:
-  motorway: 130
-  trunk: 90
-  primary: 70
-  secondary: 60
-  tertiary: 50
-  residential: 30
-  motorway_link: 80
-  trunk_link: 70
-  primary_link: 50
-  secondary_link: 40
-  tertiary_link: 30

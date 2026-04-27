@@ -1,0 +1,76 @@
+project_path: "project/brno_aeq"
+
+osm:
+  place_name: "Brno, Czechia"
+  buffer_km: 2
+
+network:
+  normalization_config: "config/brno/network_normalization.yaml"
+
+zoning:
+  sources:
+    - type: osm
+      place: "Okres Brno-město, Czechia"
+      admin_level: "9"
+    - type: osm
+      place: "Okres Brno-venkov, Czechia"
+      admin_level: "9"
+  external_gateways:
+    enabled: true
+    whitelist: ["D1", "D2", "I/43", "I/50", "I/52", "I/23", "I/385", "384", "602"]
+
+demand:
+  segments:
+    external_local:
+      total_daily_trips: 35000
+      corridor_weights:
+        D1_NW: 2.0
+        D1_E: 1.8
+        D2_S: 1.5
+        I43_N: 1.3
+        I52_S: 1.8
+        I50_E: 1.0
+        I23_W: 0.8
+
+calibration:
+  # Link-level calibration vs CSD 2025 (same pipeline as other cities).
+  count_source: "csd_split"
+  screenlines_path: "config/brno/screenlines.yaml"
+
+datasets:
+  enabled: true
+  sources:
+    commuting_sldb2021:
+      filter:
+        enabled: true
+        origin:
+          keep_if_any_matches:
+            - field: "op_okres"
+              values: ["Brno-město", "Brno-venkov"]
+            - field: "op_orp"
+              values: ["Brno"]
+        destination:
+          keep_all: true
+    # Optional Brno pentlogram (not used when calibration.count_source is csd_split).
+    calibration_brno_pentlogram_2024:
+      enabled: false
+    validation_csd2025_v2:
+      usage:
+        area_filter: { enabled: true, region_hint: "Jihomoravský kraj" }
+
+closures_db:
+  host: "REDACTED_HOST"
+  port: 5432
+  dbname: "traffic"
+  user: "admin"
+  password: "admin"
+
+baseline_closures:
+  enabled: true
+  severity_map:
+    full:           { capacity_factor: 0.50, speed_factor: 0.70 }
+    lane_reduction: { capacity_factor: 0.60, speed_factor: 0.80 }
+    speed_limit:    { capacity_factor: 1.00, speed_factor: 0.60 }
+  measurement_period: { start: "2025-01-01", end: "2025-12-31" }
+  calibration_period: { start: "2025-01-01", end: "2025-12-31" }
+  validation_period:  { start: "2025-01-01", end: "2025-12-31" }

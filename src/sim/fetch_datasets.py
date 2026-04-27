@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 import time
@@ -29,6 +30,94 @@ if __name__ == "__main__":
 from sim.io_project import get_metric_epsg, load_config
 from sim._text import strip_diacritics as _strip_diacritics, norm_col as _norm_col
 
+_logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Default Czech dataset registry -- shared across all cities.
+# YAML datasets.sources merges on top (overriding per-key).
+# ---------------------------------------------------------------------------
+
+_CZ_DEFAULT_SOURCES: Dict[str, Dict[str, Any]] = {
+    "commuting_sldb2021": {
+        "enabled": True,
+        "provider": "csu_open_data_csv",
+        "url": "https://csu.gov.cz/docs/107508/4dbdab3b-905c-deff-4cfa-e4828a6fa2de/dojizdka_obce.csv?version=1.0",
+        "out_path": "data/sources/csu/sldb2021/dojizdka_obce.csv",
+        "purposes": ["work", "school"],
+        "preprocess": {"write_filtered": True, "write_full_cr": True},
+    },
+    "validation_csd2025_v2": {
+        "enabled": True,
+        "year": 2025,
+        "provider": "http_file",
+        "url": "https://www.rsd.cz/documents/38144/3734982/V2_CSD_2025.xlsx/50663492-395b-0fd4-f365-d18440997ca5?t=1773922634346",
+        "out_path": "data/sources/rsd/csd2025/V2_CSD2025.xlsx",
+        "format": {"type": "xlsx"},
+        "usage": {"validation_target": "aadt_screenlines"},
+    },
+    "population_sldb2021": {
+        "enabled": True,
+        "provider": "http_file",
+        "url": "https://csu.gov.cz/docs/107508/79c509a0-261c-b4dd-d58d-c05955a24a2c/sldb2021_pohlavi.csv",
+        "out_path": "data/sources/csu/sldb2021/populace_pohlavi.csv",
+        "format": {"type": "csv"},
+        "usage": {"socioeconomic": "population_per_zone"},
+    },
+    "cz_place_centroids": {
+        "enabled": True,
+        "provider": "atom_file",
+        "url": "https://atom.cuzk.gov.cz/get.ashx?theme=RUIAN-CSV-ADR-ST",
+        "feed_cache_path": "data/sources/cz/places/ruian_csv_adr_st.atom.xml",
+        "out_path": "data/sources/cz/places/ruian_csv_adr_st.zip",
+        "format": {
+            "type": "zip_csv",
+            "asset_pattern": r"(?i)(^|/)[0-9]{8}_OB_ADR_csv\.zip$",
+            "member_pattern": r"(?i)\.csv$",
+            "delimiter": ";",
+            "encoding": "cp1250",
+            "source_crs_epsg": 2065,
+            "output_crs_epsg": 4326,
+        },
+        "columns": {
+            "place_code": "Kód obce",
+            "place_name": "Název obce",
+            "x": "Souřadnice X",
+            "y": "Souřadnice Y",
+        },
+        "usage": {"supernetwork_places": "grouped_point_centroids"},
+    },
+    "closures_pg": {
+        "enabled": True,
+        "provider": "postgres_closures",
+        "table": "restrictions",
+        "status_whitelist": [],
+        "min_observed_days": 2,
+        "usage": {"calibration_target": "baseline_closures"},
+    },
+    "cz_roads_major_pbf": {
+        "enabled": True,
+        "provider": "http_file",
+        "url": "https://download.geofabrik.de/europe/czech-republic-latest.osm.pbf",
+        "out_path": "data/sources/osm/czech-republic-latest.osm.pbf",
+    },
+}
+
+
+def _merge_dataset_sources(yaml_sources: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge YAML dataset source overrides on top of built-in CZ defaults."""
+    import copy
+    merged = copy.deepcopy(_CZ_DEFAULT_SOURCES)
+    if not yaml_sources:
+        return merged
+    for key, overrides in yaml_sources.items():
+        if key in merged:
+            if overrides is None:
+                continue
+            merged[key].update(overrides)
+        else:
+            merged[key] = overrides or {}
+    return merged
+
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -45,6 +134,186 @@ def _now_iso() -> str:
 def _slug(s: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "_", str(s).strip().lower())
     return re.sub(r"_+", "_", s).strip("_")
+
+
+def resolved_commuting_full_cr_parquet_path(cfg: Dict[str, Any]) -> Path:
+    """Path to the national SLDB full-CR parquet (same for every city).
+
+    Stored next to the downloaded CSV under ``data/sources/`` so it survives
+    per-city ``clean`` and is not duplicated per city.
+    """
+    src = ((cfg.get("datasets") or {}).get("sources") or {}).get("commuting_sldb2021") or {}
+    if src.get("full_cr_out_parquet"):
+        return Path(str(src["full_cr_out_parquet"]))
+    op = src.get("out_path")
+    csv_p = Path(str(op)) if op else Path("data/sources/csu/sldb2021/dojizdka_obce.csv")
+    return csv_p.parent / f"{csv_p.stem}_full_cr.parquet"
+
+
+def resolved_cz_place_centroids_parquet_path(cfg: Dict[str, Any]) -> Path:
+    """National RUIAN centroids parquet next to the downloaded ZIP."""
+    src = ((cfg.get("datasets") or {}).get("sources") or {}).get("cz_place_centroids") or {}
+    if src.get("out_parquet"):
+        return Path(str(src["out_parquet"]))
+    op = src.get("out_path")
+    zip_p = Path(str(op)) if op else Path("data/sources/cz/places/ruian_csv_adr_st.zip")
+    return zip_p.parent / "cz_place_centroids.parquet"
+
+
+def resolved_csd2025_validation_parquet_path(cfg: Dict[str, Any]) -> Path:
+    """CSD validation parquet next to the downloaded XLSX."""
+    ds = cfg.get("datasets") or {}
+    src = (ds.get("sources") or {}).get("validation_csd2025_v2") or {}
+    if src.get("out_parquet"):
+        return Path(str(src["out_parquet"]))
+    op = src.get("out_path")
+    if not op:
+        return Path(str(ds.get("cache_dir", "data/cache"))) / "v2_csd2025.parquet"
+    xlsx_p = Path(str(op))
+    return xlsx_p.parent / f"{_slug(xlsx_p.stem)}.parquet"
+
+
+_CSD_VOLUME_HINT_COLS = frozenset({
+    "sv", "s", "o", "l", "tv", "t", "pn", "tn", "a", "al", "m", "tvp", "rpdi",
+})
+
+
+def _parquet_column_names(path: Path) -> set[str]:
+    """Column names without loading the full table into memory."""
+    try:
+        import pyarrow.parquet as pq  # type: ignore
+
+        return set(pq.read_schema(str(path)).names)
+    except Exception:
+        return set(pd.read_parquet(path).columns)
+
+
+def _csd_validation_parquet_schema_ok(path: Path) -> bool:
+    names = _parquet_column_names(path)
+    if "sil" not in names:
+        return False
+    return bool(names & _CSD_VOLUME_HINT_COLS)
+
+
+def ensure_csd2025_validation_parquet(cfg: Dict[str, Any]) -> Path:
+    """Return the CSD validation parquet path, repairing stale files if needed.
+
+    Older pipeline runs wrote a parquet whose first Excel row was taken as the
+    header (``Unnamed:*`` columns only).  That breaks anything expecting
+    ``sil`` and volume columns.  If the file on disk is stale but the source XLSX
+    exists, re-run :func:`preprocess_csd_xlsx` in place.
+    """
+    parquet_path = resolved_csd2025_validation_parquet_path(cfg)
+    if not parquet_path.exists():
+        raise FileNotFoundError(
+            f"CSD parquet not found: {parquet_path}. Run fetch-data first."
+        )
+    if _csd_validation_parquet_schema_ok(parquet_path):
+        return parquet_path
+
+    ds = cfg.get("datasets") or {}
+    src = (ds.get("sources") or {}).get("validation_csd2025_v2") or {}
+    xlsx_raw = src.get("out_path")
+    if not xlsx_raw:
+        raise FileNotFoundError(
+            f"CSD parquet at {parquet_path} is missing usable CSD columns "
+            "(need 'sil' plus a volume column). "
+            "No validation_csd2025_v2.out_path is configured. Run fetch-data or delete the bad parquet."
+        )
+    xlsx_path = Path(str(xlsx_raw))
+    if not xlsx_path.exists():
+        raise FileNotFoundError(
+            f"CSD parquet at {parquet_path} is missing usable CSD columns "
+            f"and source XLSX not found at {xlsx_path}. Delete the parquet and run fetch-data."
+        )
+
+    _logger.warning(
+        "CSD parquet schema is stale or incomplete; re-preprocessing from %s",
+        xlsx_path,
+    )
+    preprocess_csd_xlsx(xlsx_path, parquet_path)
+    if not _csd_validation_parquet_schema_ok(parquet_path):
+        raise RuntimeError(
+            f"Re-preprocessing {xlsx_path} did not produce usable CSD columns "
+            f"(need 'sil' plus at least one of {_CSD_VOLUME_HINT_COLS!r})."
+        )
+    return parquet_path
+
+
+def normalize_csd_count_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure ``sv``, ``o``, and ``tv`` exist for calibration / validation.
+
+    Official CSD 2025 exports often expose ``sv`` (all motor vehicles), ``o``
+    (passenger cars), ``tv`` (heavy).  Some spreadsheets only publish class
+    breakdowns (``S`` total, ``L`` light, ``T``/``PN``/``TN``/…); after
+    :func:`sim._text.norm_col` those become ``s``, ``l``, ``t``, ``pn``, …
+    This function fills the canonical three totals so :func:`load_csd` and
+    ``load_csd_as_link_counts`` keep working unchanged.
+    """
+    out = df.copy()
+
+    def _num(col: str) -> Optional[pd.Series]:
+        if col not in out.columns:
+            return None
+        return pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+
+    def _nonzero_series(s: Optional[pd.Series]) -> bool:
+        if s is None:
+            return False
+        return bool(float(s.fillna(0).abs().sum()) > 0)
+
+    # --- sv: all motor vehicles ---
+    sv = _num("sv")
+    if not _nonzero_series(sv):
+        s_col = _num("s")
+        if _nonzero_series(s_col):
+            out["sv"] = s_col
+        else:
+            parts: list[pd.Series] = []
+            for c in ("l", "t", "pn", "tn", "a", "al", "m"):
+                v = _num(c)
+                if _nonzero_series(v):
+                    parts.append(v)
+            if parts:
+                acc = parts[0]
+                for v in parts[1:]:
+                    acc = acc + v
+                out["sv"] = acc
+            else:
+                out["sv"] = 0.0
+    else:
+        out["sv"] = sv
+
+    # --- o: passenger cars (proxy ``L`` / light vehicles when ``o`` absent) ---
+    o_s = _num("o")
+    if not _nonzero_series(o_s):
+        l_col = _num("l")
+        if _nonzero_series(l_col):
+            out["o"] = l_col
+        else:
+            out["o"] = 0.0
+    else:
+        out["o"] = o_s
+
+    # --- tv: heavy vehicles ---
+    tv_s = _num("tv")
+    if not _nonzero_series(tv_s):
+        parts = []
+        for c in ("t", "pn", "tn", "a", "al"):
+            v = _num(c)
+            if _nonzero_series(v):
+                parts.append(v)
+        if parts:
+            acc = parts[0]
+            for v in parts[1:]:
+                acc = acc + v
+            out["tv"] = acc
+        else:
+            out["tv"] = (out["sv"] - out["o"]).clip(lower=0.0)
+    else:
+        out["tv"] = tv_s
+
+    return out
 
 
 def _find_col(df: pd.DataFrame, wanted: str) -> Optional[str]:
@@ -504,7 +773,12 @@ def preprocess_xlsx_table(
             except Exception:
                 continue
             cols_norm = [_norm_col(c) for c in preview.columns]
-            score = sum(1 for c in cols_norm if c in key_cols) if key_cols else len([c for c in cols_norm if c])
+            if key_cols:
+                score = sum(1 for c in cols_norm if c in key_cols)
+                if score == 0:
+                    continue
+            else:
+                score = len([c for c in cols_norm if c])
             if score > best_score:
                 best_score = score
                 best_sheet = sheet
@@ -541,13 +815,18 @@ def preprocess_xlsx_table(
 
 
 def preprocess_csd_xlsx(xlsx_path: Path, out_parquet: Path) -> Dict[str, Any]:
-    return preprocess_xlsx_table(
+    summary = preprocess_xlsx_table(
         xlsx_path,
         out_parquet,
-        key_cols={"sv", "o", "tv", "sil", "rpdi"},
+        key_cols={"sil", "rpdi", "sv", "s", "o", "l", "tv", "t"},
         max_header_row_scan=4,
         summary_tag="csd_xlsx",
     )
+    df = pd.read_parquet(out_parquet)
+    df = normalize_csd_count_columns(df)
+    _ensure_dir(out_parquet.parent)
+    df.to_parquet(out_parquet, index=False)
+    return summary
 
 
 def _load_mc_to_ku(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, List[str]]:
@@ -559,6 +838,29 @@ def _load_mc_to_ku(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, List[str]]
         if mapping and isinstance(mapping, dict):
             return mapping
     return {}
+
+
+_DEFAULT_CZ_SUFFIXES = [
+    " u brna", " u prahy", " u mostu", " u olomouce", " u ostravy",
+    " nad labem", " nad svitavou", " nad sazavou", " nad vltavou",
+    " nad orlici", " nad moravou", " nad jihlavou", " nad luznici",
+    " v cechach", " na morave", " pod rizem", " pod radhostem",
+]
+
+
+def _load_place_name_suffixes(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Load place-name suffixes to strip during zone↔obec matching.
+
+    Returns the list from ``locale.yaml`` → ``place_name_suffixes_to_strip``
+    if present; otherwise falls back to common Czech municipality suffixes.
+    """
+    if cfg:
+        from sim.io_project import load_locale
+        locale = load_locale(cfg)
+        custom = locale.get("place_name_suffixes_to_strip")
+        if custom and isinstance(custom, list):
+            return [str(s).lower() for s in custom]
+    return list(_DEFAULT_CZ_SUFFIXES)
 
 
 def preprocess_population_sldb2021(
@@ -613,8 +915,8 @@ def preprocess_population_sldb2021(
         (pd.to_numeric(total["uzemi_cis"], errors="coerce") == 44)
         & (total["nazev"].str.startswith(city_prefix, na=False) if city_prefix else False)
     )
-    brno_mc = total[mc_filter]
-    mc_pop = {str(r["nazev"]).strip(): int(r["hodnota"]) for _, r in brno_mc.iterrows()}
+    city_mc = total[mc_filter]
+    mc_pop = {str(r["nazev"]).strip(): int(r["hodnota"]) for _, r in city_mc.iterrows()}
 
     obce = total[pd.to_numeric(total["uzemi_cis"], errors="coerce") == 43][["uzemi_kod", "nazev", "hodnota"]].copy()
     obce = obce.sort_values("hodnota", ascending=False).drop_duplicates(subset="nazev", keep="first")
@@ -637,15 +939,21 @@ def preprocess_population_sldb2021(
     zones_m = zones.to_crs(epsg=get_metric_epsg(cfg or {}))
     zone_area = {int(r["zone_id"]): r.geometry.area for _, r in zones_m.iterrows()}
 
+    # MC→KU mapping is optional; skip for cities without municipal parts.
     mc_zone_ids: Dict[str, List[int]] = {}
     zone_mc_map: Dict[int, str] = {}
-    for _, zrow in zones.iterrows():
-        zid = int(zrow["zone_id"])
-        znorm = norm(zrow["name"])
-        if znorm in ku_to_mc:
-            mc = ku_to_mc[znorm]
-            mc_zone_ids.setdefault(mc, []).append(zid)
-            zone_mc_map[zid] = mc
+    if ku_to_mc:
+        for _, zrow in zones.iterrows():
+            zid = int(zrow["zone_id"])
+            znorm = norm(zrow["name"])
+            if znorm in ku_to_mc:
+                mc = ku_to_mc[znorm]
+                mc_zone_ids.setdefault(mc, []).append(zid)
+                zone_mc_map[zid] = mc
+
+    # Name suffixes to strip when matching zone names to SLDB obce.
+    # Loaded from locale config; falls back to common Czech suffixes.
+    suffixes_to_strip = _load_place_name_suffixes(cfg)
 
     max_zone_mc_share = 0.70
     result_rows: List[Dict[str, Any]] = []
@@ -670,9 +978,9 @@ def preprocess_population_sldb2021(
             continue
 
         matched = False
-        for suffix in [" u brna", " nad svitavou"]:
+        for suffix in suffixes_to_strip:
             stripped = znorm.replace(suffix, "")
-            if stripped in obec_norm:
+            if stripped != znorm and stripped in obec_norm:
                 original = obec_norm[stripped]
                 result_rows.append({"zone_id": zid, "zone_name": zname, "population": obec_pop[original], "match": f"obec_strip:{original}"})
                 matched = True
@@ -945,6 +1253,40 @@ def fetch_postgres_closures(
 
     if df.empty:
         print("  PostgreSQL closures: no features in model area")
+        return {"features": 0, "parquet": str(cache_path), "closures_count": 0}
+
+    # --- Status filtering ---
+    if "status" in df.columns:
+        unique_statuses = sorted(df["status"].dropna().unique().tolist())
+        print(f"  PostgreSQL closures: status values found: {unique_statuses}")
+
+    status_whitelist = source_cfg.get("status_whitelist")
+    if status_whitelist and "status" in df.columns:
+        allowed = {str(s).strip().lower() for s in status_whitelist}
+        before_status = len(df)
+        df = df[df["status"].fillna("").astype(str).str.strip().str.lower().isin(allowed)].copy()
+        print(
+            f"  PostgreSQL closures: status filter ({', '.join(sorted(allowed))}): "
+            f"{before_status} -> {len(df)}"
+        )
+
+    # --- Minimum observation duration filter ---
+    min_observed_days = source_cfg.get("min_observed_days")
+    if min_observed_days is not None and "first_seen" in df.columns and "last_seen" in df.columns:
+        min_days = float(min_observed_days)
+        fs = pd.to_datetime(df["first_seen"], errors="coerce", utc=True)
+        ls = pd.to_datetime(df["last_seen"], errors="coerce", utc=True)
+        duration = (ls - fs).dt.total_seconds() / 86400.0
+        before_dur = len(df)
+        keep = duration.isna() | (duration >= min_days)
+        df = df[keep].copy()
+        print(
+            f"  PostgreSQL closures: min_observed_days={min_days}: "
+            f"{before_dur} -> {len(df)}"
+        )
+
+    if df.empty:
+        print("  PostgreSQL closures: no features after filtering")
         return {"features": 0, "parquet": str(cache_path), "closures_count": 0}
 
     df["severity"] = df.apply(
@@ -1391,7 +1733,7 @@ def _handle_http_file(
             fmt_type = "csv"
 
     if fmt_type == "xlsx":
-        out_parquet = _default_cache_parquet(cache_dir, out_path)
+        out_parquet = Path(scfg.get("out_parquet") or str(out_path.parent / f"{_slug(out_path.stem)}.parquet"))
         if usage.get("validation_target") == "aadt_screenlines" or usage.get("calibration_target") == "aadt_screenlines":
             info["preprocess"] = preprocess_csd_xlsx(out_path, out_parquet)
         else:
@@ -1443,7 +1785,7 @@ def _handle_csu_open_data_csv(
         )
 
     if bool(preprocess_cfg.get("write_full_cr", False)):
-        full_out = Path(scfg.get("full_cr_out_parquet") or (cache_dir / f"{_slug(out_path.stem)}_full_cr.parquet"))
+        full_out = Path(scfg.get("full_cr_out_parquet") or (out_path.parent / f"{out_path.stem}_full_cr.parquet"))
         info["preprocess"]["full_cr"] = preprocess_commuting_sldb2021(
             out_path,
             full_out,
@@ -1458,6 +1800,7 @@ def _handle_csu_open_data_csv(
 def _handle_atom_file(
     scfg: Dict[str, Any],
     *,
+    cache_dir: Path,
     timeout_s: int,
     retries: int,
     headers: Dict[str, str],
@@ -1481,7 +1824,7 @@ def _handle_atom_file(
     }
 
     if usage.get("supernetwork_places") == "grouped_point_centroids":
-        out_parquet = Path(scfg["out_parquet"])
+        out_parquet = Path(scfg.get("out_parquet") or str(out_path.parent / "cz_place_centroids.parquet"))
         if fmt_cfg.get("type") == "zip_csv":
             info["preprocess"] = preprocess_grouped_points_zip_to_centroids(
                 out_path,
@@ -1521,13 +1864,13 @@ def _handle_atom_file(
 # ---------------------------------------------------------------------------
 
 def run_fetch_datasets(
-    config_path: str | Path = "config/sim.yaml",
+    config_path: str | Path = "config/brno/sim.yaml",
     force: bool = False,
     only: Optional[List[str]] = None,
 ) -> None:
     cfg = load_config(config_path)
     ds = cfg.get("datasets") or {}
-    if not ds.get("enabled", False):
+    if ds.get("enabled") is False:
         print("datasets.enabled=false -> nothing to do")
         return
 
@@ -1547,7 +1890,8 @@ def run_fetch_datasets(
 
     errors: list[tuple[str, str]] = []
     selected = set(only) if only else None
-    for key, scfg in (ds.get("sources") or {}).items():
+    all_sources = _merge_dataset_sources(ds.get("sources"))
+    for key, scfg in all_sources.items():
         if selected is not None and key not in selected:
             continue
         if not (scfg or {}).get("enabled", False):
@@ -1579,6 +1923,7 @@ def run_fetch_datasets(
             elif provider == "atom_file":
                 info = _handle_atom_file(
                     scfg,
+                    cache_dir=cache_dir,
                     timeout_s=timeout_s,
                     retries=retries,
                     headers=headers,
@@ -1631,7 +1976,7 @@ def run_fetch_datasets(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config/sim.yaml")
+    parser.add_argument("--config", default="config/brno/sim.yaml")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--only", nargs="*", default=None)
     args = parser.parse_args()

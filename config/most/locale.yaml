@@ -1,0 +1,12 @@
+# Locale-specific configuration for Czech Republic / Most.
+# National defaults (holidays, road_classification, reference_speeds) are
+# built into the code; only city-specific values need to be here.
+
+# CSD (nationwide traffic census) region filter.
+# NUTS code fragment to select relevant census sections.
+csd_region_filter:
+  column: kk
+  contains: "042"
+
+# Most is not a statutory city with municipal parts (městské části).
+municipal_parts_to_cadastral: {}

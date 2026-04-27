@@ -21,25 +21,26 @@ screenlines:
   # === Major radial gateways (model boundary) ===
 
   - name: "D1_west"
-    description: "D1 motorway western model boundary (CSD 6-8670: Devět křížů → Ostrovačice)"
+    description: "D1 motorway western model boundary (near gateway node 249493)"
     type: "radial"
     observed_aadt_cars: 36985
     observed_aadt_all: 58191
-    geometry_wkt: "LINESTRING(16.4505 49.1896, 16.4505 49.1904)"
-    filter:
-      osm_ref_norm: "602"
-    expected_links: 2
-
-  - name: "D1_east"
-    description: "D1 motorway eastern model boundary (CSD 6-8810: Holubice → Rousínov)"
-    type: "radial"
-    observed_aadt_cars: 44152
-    observed_aadt_all: 58936
-    geometry_wkt: "LINESTRING(16.8085 49.18205, 16.8105 49.18205)"
+    geometry_wkt: "LINESTRING(16.335 49.250, 16.335 49.262)"
     filter:
       osm_highway: "motorway"
       osm_ref_norm: "D1"
-    expected_links: 1
+    expected_links: 2
+
+  - name: "D1_east"
+    description: "D1;50 shared motorway eastern model boundary (CSD 6-8810: Holubice → Rousínov)"
+    type: "radial"
+    observed_aadt_cars: 44152
+    observed_aadt_all: 58936
+    geometry_wkt: "LINESTRING(16.780 49.178, 16.780 49.186)"
+    filter:
+      osm_highway: "motorway"
+      osm_ref_norm: "D1;50"
+    expected_links: 2
 
   - name: "D2_south"
     description: "D2 motorway southern model boundary (CSD 6-8710: Brno,Chrlice → Blučina)"
@@ -76,31 +77,34 @@ screenlines:
   # === Inner-city corridors ===
 
   - name: "Koliste_radial"
-    description: "Koliště secondary ring road (inner city, bidirectional)"
+    description: "Koliště/Příkop inner ring road cross-section (bidirectional pair)"
     type: "radial"
     observed_aadt_cars: 46000
-    geometry_wkt: "LINESTRING(16.6125 49.1992, 16.6125 49.1980)"
+    observed_aadt_all: 52900
+    geometry_wkt: "LINESTRING(16.6145 49.2020, 16.6145 49.1940)"
     filter:
-      name: "Koliště"
-    expected_links: 1
+      name: "Koliště,Příkop"
+    expected_links: 2
 
   - name: "Dornych_radial"
     description: "Dornych primary corridor (south-east radial, dual carriageway)"
     type: "radial"
     observed_aadt_cars: 38000
+    observed_aadt_all: 43700
     geometry_wkt: "LINESTRING(16.6195 49.1875, 16.6195 49.1865)"
     filter:
       name: "Dornych"
     expected_links: 2
 
   - name: "Krenova_radial"
-    description: "Křenová tertiary corridor (east-west through centre)"
+    description: "Křenová tertiary corridor (east-west through centre, dual carriageway)"
     type: "radial"
     observed_aadt_cars: 22000
-    geometry_wkt: "LINESTRING(16.6220 49.1920, 16.6220 49.1900)"
+    observed_aadt_all: 25300
+    geometry_wkt: "LINESTRING(16.6200 49.1935, 16.6200 49.1890)"
     filter:
       name: "Křenová"
-    expected_links: 1
+    expected_links: 2
 
   # === Additional corridors for ODME spatial control ===
 
@@ -108,15 +112,17 @@ screenlines:
     description: "Žabovřeská trunk corridor (pentlogram)"
     type: "radial"
     observed_aadt_cars: 50000
+    observed_aadt_all: 57500
     geometry_wkt: "LINESTRING(16.5810 49.2190, 16.5850 49.2215)"
     filter:
       osm_ref_norm: "640"
     expected_links: 1
 
   - name: "Husovicky_tunel"
-    description: "Husovický tunel trunk corridor (dual carriageway, pentlogram)"
+    description: "Husovický tunel trunk corridor (dual carriageway, CSD road 42 mean_cars ~31k)"
     type: "radial"
-    observed_aadt_cars: 22000
+    observed_aadt_cars: 31000
+    observed_aadt_all: 35650
     geometry_wkt: "LINESTRING(16.6290 49.2155, 16.6330 49.2185)"
     filter:
       osm_highway: "trunk"
@@ -127,6 +133,7 @@ screenlines:
     description: "Kounicova tertiary corridor (inner city, pentlogram)"
     type: "radial"
     observed_aadt_cars: 11000
+    observed_aadt_all: 12650
     geometry_wkt: "LINESTRING(16.5960 49.2090, 16.5930 49.2095)"
     filter:
       name: "Kounicova"

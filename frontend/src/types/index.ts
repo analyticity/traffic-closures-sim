@@ -9,6 +9,17 @@ export interface GeoJSONFeature {
   properties: Record<string, unknown>;
 }
 
+/** From ``GET /api/meta`` — reflects the city loaded in the API server config. */
+export interface ModelMeta {
+  place_name: string;
+  city_slug: string;
+  title_short: string;
+  map_center: { lat: number; lng: number };
+  features?: {
+    has_closures?: boolean;
+  };
+}
+
 export interface LinkProperties {
   link_id: number;
   /** 0 = obousměrný úsek v síti, 1 = jen A→B, -1 = jen B→A (viz export sítě) */
@@ -90,17 +101,23 @@ export interface CalibrationReport {
   };
 }
 
+/** Link-level fit vs observed counts (CSD calibration subset or pentlogram). */
+export interface ValidationCountFit {
+  matched: number;
+  n: number;
+  r2: number | null;
+  rmse: number;
+  geh_lt5_pct: number;
+  geh_lt10_pct: number;
+  sum_modeled: number;
+  sum_observed: number;
+}
+
 export interface ValidationReport {
-  pentlogram?: {
-    matched: number;
-    n: number;
-    r2: number | null;
-    rmse: number;
-    geh_lt5_pct: number;
-    geh_lt10_pct: number;
-    sum_modeled: number;
-    sum_observed: number;
-  };
+  /** When ``calibration.count_source`` is ``pentlogram``. */
+  pentlogram?: ValidationCountFit;
+  /** When ``calibration.count_source`` is ``csd_split`` (reference step 1). */
+  calibration_reference?: ValidationCountFit;
   csd_observed?: Array<{
     road_class: string;
     sections: number;

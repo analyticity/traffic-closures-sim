@@ -8,9 +8,8 @@ import {
   Popup,
 } from "react-leaflet";
 import { useZonesList, useZoneRoute } from "../../api/hooks";
+import { useLeafletMapLayout } from "../../map/useLeafletMapCenter";
 import type { ZoneRouteBiasStation } from "../../types";
-
-const BRNO_CENTER: [number, number] = [49.195, 16.608];
 
 function fmt(n: number): string {
   return Math.round(n).toLocaleString("cs-CZ");
@@ -55,6 +54,7 @@ function BiasMarker({ s }: { s: ZoneRouteBiasStation }) {
 
 export function RouteComparisonMap() {
   const { data: zonesData, isLoading: zonesLoading } = useZonesList();
+  const { center: mapCenter, containerKey } = useLeafletMapLayout();
   const [origin, setOrigin] = useState<number | null>(null);
   const [destination, setDestination] = useState<number | null>(null);
   const { data: routeData, isLoading: routeLoading, error: routeError } = useZoneRoute(origin, destination);
@@ -274,7 +274,7 @@ export function RouteComparisonMap() {
 
       {/* Map */}
       <div className="flex-1 relative">
-        <MapContainer center={BRNO_CENTER} zoom={12} className="h-full w-full">
+        <MapContainer key={containerKey} center={mapCenter} zoom={12} className="h-full w-full">
           <TileLayer
             attribution='&copy; <a href="https://www.openstreetmap.org">OSM</a>'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"

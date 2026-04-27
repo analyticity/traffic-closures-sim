@@ -1,22 +1,30 @@
-import type { ValidationReport } from "../../types";
+import type { ValidationCountFit, ValidationReport } from "../../types";
+
+function CountFitSection({ label, data }: { label: string; data: ValidationCountFit }) {
+  return (
+    <div className="mb-6">
+      <h3 className="mb-2 text-sm font-semibold text-gray-600">{label}</h3>
+      <div className="grid grid-cols-4 gap-3 text-sm">
+        <Stat label="Matched" value={data.matched} />
+        <Stat label="GEH<5%" value={`${data.geh_lt5_pct?.toFixed(1)}%`} />
+        <Stat label="R²" value={data.r2?.toFixed(2) ?? "—"} />
+        <Stat label="RMSE" value={data.rmse?.toFixed(0) ?? "—"} />
+      </div>
+    </div>
+  );
+}
 
 export function ValidationCard({ data }: { data: ValidationReport }) {
-  const p = data.pentlogram;
-
   return (
     <div className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm">
       <h2 className="mb-4 text-lg font-bold text-gray-800">Validace</h2>
 
-      {p && (
-        <div className="mb-6">
-          <h3 className="mb-2 text-sm font-semibold text-gray-600">Pentlogram (referenční)</h3>
-          <div className="grid grid-cols-4 gap-3 text-sm">
-            <Stat label="Matched" value={p.matched} />
-            <Stat label="GEH<5%" value={`${p.geh_lt5_pct?.toFixed(1)}%`} />
-            <Stat label="R²" value={p.r2?.toFixed(2) ?? "—"} />
-            <Stat label="RMSE" value={p.rmse?.toFixed(0) ?? "—"} />
-          </div>
-        </div>
+      {data.pentlogram && (
+        <CountFitSection label="Pentlogram (referenční)" data={data.pentlogram} />
+      )}
+
+      {data.calibration_reference && (
+        <CountFitSection label="Kalibrační referenční data" data={data.calibration_reference} />
       )}
 
       {data.csd_observed && (

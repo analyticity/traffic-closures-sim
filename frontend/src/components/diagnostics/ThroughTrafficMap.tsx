@@ -1,9 +1,8 @@
 import { useMemo } from "react";
 import { MapContainer, TileLayer, GeoJSON, CircleMarker, Popup, Tooltip } from "react-leaflet";
 import { useThroughTrafficData } from "../../api/hooks";
+import { useLeafletMapLayout } from "../../map/useLeafletMapCenter";
 import type { GeoJSONFeature, ThroughTrafficLinkProperties } from "../../types";
-
-const BRNO_CENTER: [number, number] = [49.195, 16.608];
 
 function shareColor(share: number): string {
   if (share > 0.5) return "#C0392B";
@@ -23,6 +22,7 @@ function fmt(n: number): string {
 
 export function ThroughTrafficMap() {
   const { data, isLoading, error } = useThroughTrafficData();
+  const { center: mapCenter, containerKey } = useLeafletMapLayout();
 
   const maxThroughVol = useMemo(() => {
     if (!data?.links?.features) return 1;
@@ -75,7 +75,7 @@ export function ThroughTrafficMap() {
 
   return (
     <div className="relative h-full w-full">
-      <MapContainer center={BRNO_CENTER} zoom={12} className="h-full w-full">
+      <MapContainer key={containerKey} center={mapCenter} zoom={12} className="h-full w-full">
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org">OSM</a>'
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"

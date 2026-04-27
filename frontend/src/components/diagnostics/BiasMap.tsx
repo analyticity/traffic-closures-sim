@@ -1,9 +1,8 @@
 import { useMemo, useState } from "react";
 import { MapContainer, TileLayer, CircleMarker, Popup } from "react-leaflet";
 import { useBiasData } from "../../api/hooks";
+import { useLeafletMapLayout } from "../../map/useLeafletMapCenter";
 import type { BiasClusterProperties, BiasStationProperties } from "../../types";
-
-const BRNO_CENTER: [number, number] = [49.195, 16.608];
 
 function biasColor(ratio: number): string {
   if (ratio > 1.2) return "#C0392B";
@@ -154,6 +153,7 @@ function ClusterPopup({ c }: { c: BiasClusterProperties & { lat: number; lng: nu
 export function BiasMap() {
   const [clustered, setClustered] = useState(false);
   const { data, isLoading, error } = useBiasData(clustered);
+  const { center: mapCenter, containerKey } = useLeafletMapLayout();
 
   const stations = useMemo(() => {
     if (!data?.features || clustered) return [];
@@ -184,7 +184,7 @@ export function BiasMap() {
 
   return (
     <div className="relative h-full w-full">
-      <MapContainer center={BRNO_CENTER} zoom={12} className="h-full w-full">
+      <MapContainer key={containerKey} center={mapCenter} zoom={12} className="h-full w-full">
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org">OSM</a>'
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"

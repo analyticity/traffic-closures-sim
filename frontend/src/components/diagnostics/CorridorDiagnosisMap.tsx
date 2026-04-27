@@ -1,9 +1,8 @@
 import { useMemo, useState } from "react";
 import { MapContainer, TileLayer, GeoJSON, Polyline } from "react-leaflet";
 import { useCorridors, useCorridorDiagnosis } from "../../api/hooks";
+import { useLeafletMapLayout } from "../../map/useLeafletMapCenter";
 import type { CorridorPath } from "../../types";
-
-const BRNO_CENTER: [number, number] = [49.195, 16.608];
 
 function fmt(n: number): string {
   return Math.round(n).toLocaleString("cs-CZ");
@@ -45,6 +44,7 @@ function PathInfo({ path, color }: { path: CorridorPath; color: string }) {
 
 export function CorridorDiagnosisMap() {
   const { data: corridorsData, isLoading: corridorsLoading } = useCorridors();
+  const { center: mapCenter, containerKey } = useLeafletMapLayout();
   const [selectedName, setSelectedName] = useState<string | null>(null);
   const { data: diagnosis, isLoading: diagLoading, error: diagError } = useCorridorDiagnosis(selectedName);
 
@@ -173,7 +173,7 @@ export function CorridorDiagnosisMap() {
 
       {/* Map */}
       <div className="flex-1 relative">
-        <MapContainer center={BRNO_CENTER} zoom={13} className="h-full w-full">
+        <MapContainer key={containerKey} center={mapCenter} zoom={13} className="h-full w-full">
           <TileLayer
             attribution='&copy; <a href="https://www.openstreetmap.org">OSM</a>'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"

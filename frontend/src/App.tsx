@@ -1,5 +1,6 @@
 import { Map, BarChart3, Info, Search } from "lucide-react";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
+import { useModelMeta } from "./api/hooks";
 import { MapPage } from "./pages/MapPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { AboutPage } from "./pages/AboutPage";
@@ -14,11 +15,15 @@ const NAV = [
 
 export default function App() {
   const { pathname } = useLocation();
+  const meta = useModelMeta();
+  const title = meta.data?.title_short
+    ? `${meta.data.title_short} — Simulace dopravy`
+    : "Simulace dopravy";
 
   return (
     <div className="flex h-screen flex-col">
       <header className="flex items-center gap-6 border-b bg-white px-6 py-3 shadow-sm">
-        <h1 className="text-lg font-bold text-gray-800">Brno Traffic Simulation</h1>
+        <h1 className="text-lg font-bold text-gray-800">{title}</h1>
         <nav className="flex gap-1">
           {NAV.map(({ to, label, icon: Icon }) => (
             <Link

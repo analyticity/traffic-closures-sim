@@ -6,9 +6,8 @@ import {
   Popup,
 } from "react-leaflet";
 import { useCorridors } from "../../api/hooks";
+import { useLeafletMapLayout } from "../../map/useLeafletMapCenter";
 import type { CorridorScore } from "../../types";
-
-const BRNO_CENTER: [number, number] = [49.195, 16.608];
 
 function biasColor(bias: number): string {
   if (bias > 20) return "#C0392B";
@@ -48,6 +47,7 @@ function BiasBar({ bias }: { bias: number }) {
 
 export function CorridorScorePanel() {
   const { data, isLoading, error } = useCorridors();
+  const { center: mapCenter, containerKey } = useLeafletMapLayout();
   const [selected, setSelected] = useState<string | null>(null);
   const [sortBy, setSortBy] = useState<"bias" | "geh" | "observed">("bias");
 
@@ -160,7 +160,7 @@ export function CorridorScorePanel() {
 
       {/* Map */}
       <div className="flex-1 relative">
-        <MapContainer center={BRNO_CENTER} zoom={12} className="h-full w-full">
+        <MapContainer key={containerKey} center={mapCenter} zoom={12} className="h-full w-full">
           <TileLayer
             attribution='&copy; <a href="https://www.openstreetmap.org">OSM</a>'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"

@@ -16,10 +16,9 @@ import { ClosuresPanel } from "../components/map/ClosuresPanel";
 import { ViewToggle } from "../components/map/ViewToggle";
 import { FineZoomControls } from "../components/map/FineZoomControls";
 import { FINE_INTERACTION_MAP_OPTIONS } from "../components/map/fineMapOptions";
+import { useLeafletMapLayout } from "../map/useLeafletMapCenter";
 import type { GeoJSONFeatureCollection } from "../types";
 import { Calendar, Construction } from "lucide-react";
-
-const BRNO_CENTER: [number, number] = [49.195, 16.608];
 
 type BottomTab = "date" | "closures";
 
@@ -67,11 +66,13 @@ export function MapPage() {
       : links.data;
 
   const closureCount = closuresData?.features.length ?? 0;
+  const { center: mapCenter, containerKey: mapLayoutKey } = useLeafletMapLayout();
 
   return (
     <div className="relative h-full w-full">
       <MapContainer
-        center={BRNO_CENTER}
+        key={mapLayoutKey}
+        center={mapCenter}
         zoom={12}
         className="h-full w-full"
         zoomControl={false}

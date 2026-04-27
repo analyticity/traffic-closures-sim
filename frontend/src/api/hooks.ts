@@ -6,6 +6,7 @@ import type {
   CorridorDiagnosis,
   CorridorsResponse,
   GeoJSONFeatureCollection,
+  ModelMeta,
   OdSummary,
   RoutesResponse,
   ScenarioJobStatus,
@@ -16,6 +17,13 @@ import type {
   ZonesListResponse,
 } from "../types";
 import type { DayInfo } from "../stores/mapStore";
+
+export const useModelMeta = () =>
+  useQuery({
+    queryKey: ["meta"],
+    queryFn: () => apiFetch<ModelMeta>("/api/meta"),
+    staleTime: 60 * 60 * 1000,
+  });
 
 export const useLinks = (linkTypes: string[], date?: string, period?: string) =>
   useQuery({

@@ -36,13 +36,16 @@ import geopandas as gpd
 from aequilibrae import Project
 from aequilibrae.matrix import AequilibraeMatrix
 
+from sim.fetch_datasets import ensure_csd2025_validation_parquet, normalize_csd_count_columns
 from sim.io_project import get_metric_epsg, load_config
 from sim.assignment import (
     build_graph,
     execute_assignment,
     fix_node_ids,
     resolve_daily_cap_factor_default,
+    _apply_bpr_defaults,
     _detect_volume_col,
+    _resolve_multi_class,
 )
 import logging
 
@@ -145,7 +148,8 @@ def _load_gateway_observed(
     screenline-name -> gateway-name mapping.
     """
     gw_cfg = _get(cfg, ["calibration", "gateway_calibration"], {}) or {}
-    obs_path = Path(gw_cfg.get("observed_path", "data/cache/gateway_counts_2025.parquet"))
+    _cache = str(Path(_get(cfg, ["datasets", "cache_dir"], "data/cache")))
+    obs_path = Path(gw_cfg.get("observed_path", f"{_cache}/gateway_counts_2025.parquet"))
 
     if obs_path.exists():
         try:
@@ -163,13 +167,15 @@ def _load_gateway_observed(
             )
 
     from sim.screenlines import load_screenlines
-    sl_path = str(_get(cfg, ["calibration", "screenlines_path"], "config/screenlines.yaml"))
+    config_dir = cfg.get("_meta", {}).get("base_dir", "")
+    default_sl = str(Path(config_dir) / "screenlines.yaml") if config_dir else "config/brno/screenlines.yaml"
+    sl_path = str(_get(cfg, ["calibration", "screenlines_path"], default_sl))
     screenlines = load_screenlines(sl_path)
 
     result: Dict[str, float] = {}
     for sl in screenlines:
         gw = _SCREENLINE_TO_GATEWAY.get(sl.name)
-        aadt = getattr(sl, "observed_aadt_cars", None)
+        aadt = getattr(sl, "observed_aadt_all", None) or getattr(sl, "observed_aadt_cars", None)
         if gw and aadt and float(aadt) > 0:
             result[gw] = float(aadt)
 
@@ -496,18 +502,19 @@ def validate_geometries_or_fail(
 def load_csd(cfg: Dict[str, Any], region_code: str | None = None) -> pd.DataFrame:
     """Load CSD parquet with optional region filter from locale config.
 
-    When *region_code* is ``None`` (default), the region filter is read
-    from ``config/locale.yaml`` (``csd_region_filter``).  Pass an explicit
-    code like ``"CZ064"`` to override.
+    Filtering modes (checked in order):
+    1. Explicit *region_code* argument (e.g. ``"CZ064"``).
+    2. ``locale.yaml`` → ``csd_region_filter`` with ``column`` / ``contains``.
+    3. Automatic: when ``csd_region_filter`` is absent or empty, filter CSD
+       to roads present in the built network (by matching ``sil`` values to
+       ``osm_ref`` on network links). This requires no manual region code.
     """
     from sim.io_project import load_locale
 
-    cache_dir = Path(_get(cfg, ["datasets", "cache_dir"], "data/cache"))
-    parquet_path = cache_dir / "v2_csd2025.parquet"
-    if not parquet_path.exists():
-        raise FileNotFoundError(f"CSD parquet not found: {parquet_path}")
+    parquet_path = ensure_csd2025_validation_parquet(cfg)
 
     df = pd.read_parquet(parquet_path)
+    df = normalize_csd_count_columns(df)
 
     if region_code is not None:
         if "kk" in df.columns:
@@ -518,15 +525,142 @@ def load_csd(cfg: Dict[str, Any], region_code: str | None = None) -> pd.DataFram
         locale = load_locale(cfg)
         csd_filter = locale.get("csd_region_filter") or {}
         filter_col = csd_filter.get("column", "kk")
-        filter_val = str(csd_filter.get("contains", "064"))
-        if filter_col in df.columns:
-            df = df[df[filter_col].astype(str).str.contains(filter_val, na=False)].copy()
+        filter_val = csd_filter.get("contains")
+        if filter_val and filter_col in df.columns:
+            df = df[df[filter_col].astype(str).str.contains(
+                str(filter_val), na=False,
+            )].copy()
+        else:
+            df = _filter_csd_by_network_roads(df, cfg)
 
     if "sil" in df.columns:
         df["sil"] = df["sil"].astype(str)
     for col in ("sv", "o", "tv"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return df
+
+
+def _filter_csd_by_network_roads(
+    df: pd.DataFrame,
+    cfg: Dict[str, Any],
+) -> pd.DataFrame:
+    """Keep only CSD sections whose road number appears in the model network.
+
+    Also applies region filtering when the model area is available,
+    so that national averages of trunk roads are not polluted by distant
+    sections.  Falls back to returning all rows if the project is not
+    yet built.
+    """
+    if "sil" not in df.columns:
+        return df
+    project_dir = Path(cfg.get("project_path", "project/model"))
+    try:
+        links_gdf = _load_network_links(project_dir)
+    except Exception:
+        logger.info("  CSD auto-filter: network not available, returning all CSD rows")
+        return df
+
+    # Step 1: region filter via model-area bounding box
+    df = _filter_csd_by_model_area_region(df, cfg)
+
+    # Step 2: road-number filter
+    raw_refs = links_gdf["osm_ref"].fillna("").astype(str).str.strip()
+    ref_parts = set()
+    for r in raw_refs:
+        if r:
+            for part in r.split(";"):
+                p = part.strip()
+                if p:
+                    ref_parts.add(p)
+    if not ref_parts:
+        return df
+
+    before = len(df)
+    df = df[df["sil"].astype(str).str.strip().isin(ref_parts)].copy()
+    logger.info(
+        f"  CSD auto-filter: {before} → {len(df)} sections "
+        f"(matched {len(ref_parts)} network road refs)"
+    )
+    return df
+
+
+def _filter_csd_by_model_area_region(
+    df: pd.DataFrame,
+    cfg: Dict[str, Any],
+) -> pd.DataFrame:
+    """Filter CSD to the ``kk`` region matching the configured city.
+
+    Uses the ``osm.place_name`` from config to look up the corresponding
+    Czech region code.  Falls back to no filtering if the city is unknown.
+    """
+    if "kk" not in df.columns:
+        return df
+
+    kk_unique = df["kk"].astype(str).unique()
+    if len(kk_unique) <= 1:
+        return df
+
+    place_name = str(cfg.get("osm", {}).get("place_name", "")).lower()
+
+    _REGION_HINTS: dict[str, str] = {
+        "ústecký": "042", "ustecky": "042",
+        "jihomoravský": "064", "jihomoravsky": "064",
+        "středočeský": "020", "stredocesky": "020",
+        "jihočeský": "031", "jihocesky": "031",
+        "plzeňský": "032", "plzensky": "032",
+        "karlovarský": "041", "karlovarsky": "041",
+        "liberecký": "051", "liberecky": "051",
+        "královéhradecký": "052", "kralovehradecky": "052",
+        "pardubický": "053", "pardubicky": "053",
+        "vysočina": "063",
+        "olomoucký": "071", "olomoucky": "071",
+        "zlínský": "072", "zlinsky": "072",
+        "moravskoslezský": "080", "moravskoslezsky": "080",
+    }
+
+    _CITY_REGION: dict[str, str] = {
+        "most": "042", "teplice": "042", "ústí": "042", "usti": "042",
+        "chomutov": "042", "děčín": "042", "decin": "042", "litvínov": "042",
+        "litvinov": "042", "louny": "042", "žatec": "042",
+        "brno": "064",
+        "praha": "020", "prague": "020",
+        "ostrava": "080", "opava": "080", "karviná": "080",
+        "plzeň": "032", "pilsen": "032",
+        "liberec": "051",
+        "olomouc": "071",
+        "zlín": "072", "zlin": "072",
+        "pardubice": "053",
+        "hradec": "052",
+        "české budějovice": "031", "ceske budejovice": "031",
+        "karlovy vary": "041",
+        "jihlava": "063",
+    }
+
+    region_hint = None
+    for key, code in _CITY_REGION.items():
+        if key in place_name:
+            region_hint = code
+            break
+    if region_hint is None:
+        for key, code in _REGION_HINTS.items():
+            if key in place_name:
+                region_hint = code
+                break
+
+    if region_hint is None:
+        return df
+
+    matching_kk = [k for k in kk_unique if region_hint in k]
+    if not matching_kk:
+        return df
+
+    before = len(df)
+    df = df[df["kk"].astype(str).isin(matching_kk)].copy()
+    logger.info(
+        "  CSD region auto-filter: %d → %d sections (region=%s)",
+        before, len(df), matching_kk[0],
+    )
     return df
 
 
@@ -639,7 +773,7 @@ def _aggregate_corridor_volumes(
             if lid == matched_lid:
                 continue
             lt = str(link_lt[ci])
-            if lt != matched_lt:
+            if _TYPE_FAMILY.get(lt) != _TYPE_FAMILY.get(matched_lt, matched_lt):
                 continue
             lb = link_bearing[ci]
             if lb is None:
@@ -685,6 +819,21 @@ _NON_CAR_LINK_TYPES = frozenset({
     "crossing", "busway", "centroid_connector",
 })
 
+_LINK_TYPE_PRIORITY: Dict[str, int] = {
+    "motorway": 0, "trunk": 1, "primary": 2, "secondary": 3,
+    "tertiary": 4, "unclassified": 5, "residential": 6,
+    "motorway_link": 10, "trunk_link": 11, "primary_link": 12,
+    "secondary_link": 13, "tertiary_link": 14,
+}
+
+_TYPE_FAMILY: Dict[str, str] = {
+    "motorway": "motorway", "motorway_link": "motorway",
+    "trunk": "trunk", "trunk_link": "trunk",
+    "primary": "primary", "primary_link": "primary",
+    "secondary": "secondary", "secondary_link": "secondary",
+    "tertiary": "tertiary", "tertiary_link": "tertiary",
+}
+
 
 def match_counts_to_links(
     counts: gpd.GeoDataFrame,
@@ -697,6 +846,7 @@ def match_counts_to_links(
     conflict_resolution: str = "nearest",
     aggregate_corridor: bool = True,
     vol_col: Optional[str] = None,
+    match_quality_min: float = 0.50,
 ) -> gpd.GeoDataFrame:
     """Spatial-join observed count points/lines to nearest network links.
 
@@ -747,10 +897,11 @@ def match_counts_to_links(
     # class.  This replaces sjoin_nearest + bearing re-match, preventing
     # mis-matches to ramps when a mainline link is nearby.
     _ROAD_CLASS_W: Dict[str, float] = {
-        "motorway": 1.0, "trunk": 0.875, "motorway_link": 0.875,
-        "trunk_link": 0.75, "primary": 0.5, "primary_link": 0.44,
-        "secondary": 0.25, "secondary_link": 0.225, "tertiary": 0.15,
-        "tertiary_link": 0.125, "unclassified": 0.09, "road": 0.09,
+        "motorway": 1.0, "trunk": 0.875,
+        "motorway_link": 0.45, "trunk_link": 0.35,
+        "primary": 0.5, "primary_link": 0.25,
+        "secondary": 0.25, "secondary_link": 0.12, "tertiary": 0.15,
+        "tertiary_link": 0.07, "unclassified": 0.09, "road": 0.09,
         "residential": 0.05, "service": 0.025, "living_street": 0.006,
     }
     link_cols_to_copy = [c for c in links_sel.columns if c not in ("geometry", "_link_bearing")]
@@ -768,6 +919,16 @@ def match_counts_to_links(
 
         cb = pt_row.get("_count_bearing")
         cand_idxs = list(links_sel.sindex.query(pt.buffer(buffer_m), predicate="intersects"))
+
+        # Pre-scan: collect parent type families present among candidates
+        # so we can penalize *_link types when their parent exists nearby.
+        cand_families: set = set()
+        for _ci in cand_idxs:
+            _ct = str(links_sel.iloc[_ci].get("link_type", ""))
+            if not _ct.endswith("_link"):
+                fam = _TYPE_FAMILY.get(_ct)
+                if fam:
+                    cand_families.add(fam)
 
         best_q = -1.0
         best_data: Optional[dict] = None
@@ -808,7 +969,10 @@ def match_counts_to_links(
                 except (TypeError, ValueError):
                     pass
 
-            q = 0.30 * (1.0 - dn) + 0.30 * (1.0 - bp) + 0.20 * rw + 0.20 * vb
+            q = 0.25 * (1.0 - dn) + 0.25 * (1.0 - bp) + 0.25 * rw + 0.25 * vb
+
+            if lt.endswith("_link") and _TYPE_FAMILY.get(lt) in cand_families:
+                q *= 0.6
 
             if q > best_q:
                 best_q = q
@@ -885,7 +1049,8 @@ def match_counts_to_links(
         # to a 62k trunk link above — clearly a spatial mis-match.
         if "link_type" in joined.columns:
             _MAJOR_EX = {"trunk", "trunk_link", "motorway", "motorway_link"}
-            is_major = joined["link_type"].astype(str).isin(_MAJOR_EX)
+            lt_str = joined["link_type"].astype(str)
+            is_major = lt_str.isin(_MAJOR_EX)
             obs_car = pd.to_numeric(
                 joined["observed_car"] if "observed_car" in joined.columns else 0,
                 errors="coerce",
@@ -894,15 +1059,98 @@ def match_counts_to_links(
                 is_major
                 & (vol_vals > 15000)
                 & (obs_car > 0)
-                & (obs_car / vol_vals.clip(lower=1) < 0.25)
+                & (obs_car / vol_vals.clip(lower=1) < 0.30)
             )
             n_extreme = int(extreme_low.sum())
             if n_extreme > 0:
                 joined.loc[extreme_low, "_excluded"] = True
                 logger.info(
                     f"  Matching: excluded {n_extreme} major-road matches "
-                    f"with obs/model ratio < 0.25"
+                    f"with obs/model ratio < 0.30"
                 )
+
+            # *_link types with very low model volume relative to observed:
+            # ramp/connector matched instead of main road.
+            is_link_type = lt_str.str.endswith("_link")
+            link_extreme = (
+                is_link_type
+                & ~joined["_excluded"]
+                & (obs_car > 2000)
+                & (vol_vals > 0)
+                & (vol_vals / obs_car.clip(lower=1) < 0.20)
+            )
+            n_link_ex = int(link_extreme.sum())
+            if n_link_ex > 0:
+                joined.loc[link_extreme, "_excluded"] = True
+                logger.info(
+                    f"  Matching: excluded {n_link_ex} *_link matches "
+                    f"with model/obs ratio < 0.20"
+                )
+
+            # Extreme overestimation: model volume far exceeds observed,
+            # typically a through-traffic trunk matched to a local count.
+            high_ratio = (
+                is_major
+                & ~joined["_excluded"]
+                & (vol_vals > 5000)
+                & (obs_car > 0)
+                & (vol_vals / obs_car.clip(lower=1) > 4.0)
+            )
+            n_high = int(high_ratio.sum())
+            if n_high > 0:
+                joined.loc[high_ratio, "_excluded"] = True
+                logger.info(
+                    f"  Matching: excluded {n_high} major-road matches "
+                    f"with model/obs ratio > 4.0"
+                )
+
+        # CSD low-confidence: roads with very few census sections where the
+        # model significantly overestimates are unreliable calibration targets
+        # (typically centroid connector overloading on minor roads).
+        if "_csd_n_sections" in joined.columns:
+            few_sections = pd.to_numeric(
+                joined["_csd_n_sections"], errors="coerce"
+            ).fillna(0)
+            _obs_for_conf = pd.to_numeric(
+                joined["observed_car"] if "observed_car" in joined.columns else 0,
+                errors="coerce",
+            ).fillna(0)
+            low_conf = (
+                ~joined["_excluded"]
+                & (few_sections < 3)
+                & (vol_vals > 0)
+                & (_obs_for_conf > 0)
+                & (vol_vals / _obs_for_conf.clip(lower=1) > 2.0)
+            )
+            # Debug: show per-row conditions for low_conf
+            for _i, _row in joined.iterrows():
+                _ns = few_sections.loc[_i]
+                _vv = vol_vals.loc[_i]
+                _oc = _obs_for_conf.loc[_i]
+                _road = _row.get("csd_road", _row.get("osm_ref", "?"))
+                if _ns < 3 and _vv > 0 and _oc > 0:
+                    logger.info(
+                        "    low_conf candidate: road=%s sect=%.0f vol=%.0f obs=%.0f "
+                        "vol/obs=%.2f excluded=%s",
+                        _road, _ns, _vv, _oc, _vv / max(_oc, 1), _row["_excluded"],
+                    )
+            n_lc = int(low_conf.sum())
+            if n_lc > 0:
+                joined.loc[low_conf, "_excluded"] = True
+                logger.info(
+                    "  Matching: excluded %d low-confidence CSD links "
+                    "(< 3 sections AND model/obs > 2.0)", n_lc,
+                )
+
+    # Exclude low-quality geometric matches (high bearing diff, large distance).
+    if match_quality_min > 0 and "_match_quality" in joined.columns:
+        low_quality = joined["_match_quality"] < match_quality_min
+        n_lq = int((low_quality & ~joined["_excluded"]).sum())
+        if n_lq > 0:
+            joined.loc[low_quality, "_excluded"] = True
+            logger.info(
+                f"  Matching: excluded {n_lq} links with match_quality < {match_quality_min:.2f}"
+            )
 
     # Corridor aggregation: sum volumes from parallel links (divided highways)
     if aggregate_corridor:
@@ -927,15 +1175,54 @@ def match_counts_to_links(
             & ~joined["_excluded"]
             & (corr_vals > 15000)
             & (obs_car_p > 0)
-            & (obs_car_p / corr_vals.clip(lower=1) < 0.25)
+            & (obs_car_p / corr_vals.clip(lower=1) < 0.30)
         )
         n_ext = int(extreme_corr.sum())
         if n_ext > 0:
             joined.loc[extreme_corr, "_excluded"] = True
             logger.info(
                 f"  Matching: excluded {n_ext} major-road matches "
-                f"with obs/corridor ratio < 0.25"
+                f"with obs/corridor ratio < 0.30"
             )
+
+        # Major roads where corridor volume exceeds 2x the observed car count
+        # at high absolute volumes — typically through-traffic routing artifacts
+        # on corridors that span the entire model area.
+        high_corr_over = (
+            is_major_p
+            & ~joined["_excluded"]
+            & (corr_vals > 10000)
+            & (obs_car_p > 0)
+            & (corr_vals / obs_car_p.clip(lower=1) > 2.0)
+        )
+        n_hco = int(high_corr_over.sum())
+        if n_hco > 0:
+            joined.loc[high_corr_over, "_excluded"] = True
+            logger.info(
+                f"  Matching: excluded {n_hco} major-road matches "
+                f"with corridor/obs > 2.0 (corridor > 10,000)"
+            )
+
+        # Low-confidence CSD roads (few sections) using post-aggregation
+        # corridor volume — catches minor roads with connector overloading.
+        if "_csd_n_sections" in joined.columns:
+            _few = pd.to_numeric(
+                joined["_csd_n_sections"], errors="coerce"
+            ).fillna(0)
+            low_conf_corr = (
+                ~joined["_excluded"]
+                & (_few < 3)
+                & (corr_vals > 0)
+                & (obs_car_p > 0)
+                & (corr_vals / obs_car_p.clip(lower=1) > 2.0)
+            )
+            n_lcc = int(low_conf_corr.sum())
+            if n_lcc > 0:
+                joined.loc[low_conf_corr, "_excluded"] = True
+                logger.info(
+                    f"  Matching: excluded {n_lcc} low-confidence CSD "
+                    f"roads (< 3 sections, corridor/obs > 2.0)"
+                )
 
     for col in ("_count_bearing", "_link_bearing"):
         if col in joined.columns:
@@ -983,6 +1270,34 @@ def _export_matching_diagnostics(
 
     available = [c for c in diag_cols if c in matched.columns]
     diag = matched[available].copy()
+
+    # Re-evaluate exclusion using final (post-calibration) volumes.
+    # The initial _excluded flag may have been set before calibration
+    # iterations changed link volumes significantly.
+    final_vol_col = model_col if model_col and model_col in diag.columns else None
+    if final_vol_col and "_excluded" in diag.columns and "_csd_n_sections" in matched.columns:
+        vol_vals = pd.to_numeric(diag[final_vol_col], errors="coerce").fillna(0)
+        obs_car = pd.to_numeric(
+            diag["observed_car"] if "observed_car" in diag.columns else 0,
+            errors="coerce",
+        ).fillna(0)
+        few_sections = pd.to_numeric(
+            matched["_csd_n_sections"], errors="coerce"
+        ).fillna(0)
+        newly_excluded = (
+            ~diag["_excluded"]
+            & (few_sections.values < 3)
+            & (vol_vals > 0)
+            & (obs_car > 0)
+            & (vol_vals / obs_car.clip(lower=1) > 2.0)
+        )
+        n_new = int(newly_excluded.sum())
+        if n_new > 0:
+            diag.loc[newly_excluded, "_excluded"] = True
+            logger.info(
+                "  Post-calibration exclusion: %d additional low-confidence "
+                "CSD links excluded (few sections + model/obs > 2.0)", n_new,
+            )
 
     m_arr = diag[model_col].values.astype(float) if model_col and model_col in diag.columns else np.zeros(len(diag))
     o_arr = diag[obs_col].values.astype(float) if obs_col in diag.columns else np.zeros(len(diag))
@@ -1410,9 +1725,43 @@ def load_csd_as_link_counts(
         if matched_links.empty:
             continue
 
+        if "link_type" in matched_links.columns:
+            matched_links = matched_links.sort_values(
+                "link_type",
+                key=lambda s: s.map(_LINK_TYPE_PRIORITY).fillna(99),
+            )
+
+        # Among same-priority links, prefer interior links (both nodes
+        # shared with other matched links) over edge/dead-end links.
+        first = matched_links.iloc[0]
+        best_pri = _LINK_TYPE_PRIORITY.get(str(first.get("link_type", "")), 99)
+        top_tier = matched_links[
+            matched_links["link_type"].map(_LINK_TYPE_PRIORITY).fillna(99) == best_pri
+        ]
+        if len(top_tier) > 1 and "a_node" in top_tier.columns:
+            all_a = top_tier["a_node"].tolist()
+            all_b = top_tier["b_node"].tolist()
+            node_set = set(all_a + all_b)
+            centr = []
+            for idx_r, row_r in top_tier.iterrows():
+                other = top_tier.drop(index=idx_r)
+                other_n = set(other["a_node"].tolist() + other["b_node"].tolist())
+                c = (1 if row_r["a_node"] in other_n else 0) + (1 if row_r["b_node"] in other_n else 0)
+                centr.append(c)
+            top_tier = top_tier.copy()
+            top_tier["_centr"] = centr
+            top_tier = top_tier.sort_values(
+                ["_centr", "distance"], ascending=[False, False],
+            )
+            first = top_tier.iloc[0]
+        lid = first.get("link_id", matched_links.index[0])
         rows.append({
-            "link_id": matched_links.iloc[0].get("link_id", matched_links.index[0]),
-            "geometry": matched_links.iloc[0].geometry,
+            "objectid": 8_000_000 + len(rows),
+            "link_id": lid,
+            "geometry": first.geometry,
+            "name": str(first.get("name", "") or ""),
+            "osm_ref": str(first.get("osm_ref", "") or ""),
+            "link_type": str(first.get("link_type", "") or ""),
             "observed_car": csd_mean_o,
             "observed_motor_total": csd_mean_sv,
             "observed_total": csd_mean_sv,
@@ -1420,6 +1769,7 @@ def load_csd_as_link_counts(
             "csd_road": road,
             "csd_road_class": road_class,
             "_n_matched_links": len(matched_links),
+            "_csd_n_sections": len(csd_sub),
         })
 
     if not rows:
@@ -1446,18 +1796,10 @@ _CAR_LINK_TYPES_FOR_SPEED = frozenset({
     "living_street",
 })
 
-_CZECH_REFERENCE_SPEEDS = {
-    "motorway": 130.0,
-    "motorway_link": 80.0,
-    "trunk": 90.0,
-    "trunk_link": 60.0,
-    "primary": 70.0,
-    "primary_link": 50.0,
-    "secondary": 50.0,
-    "secondary_link": 40.0,
-    "tertiary": 40.0,
-    "tertiary_link": 30.0,
-    "residential": 30.0,
+from sim.defaults import LOCALE_DEFAULTS as _LOCALE_DEFAULTS
+
+_CZECH_REFERENCE_SPEEDS: Dict[str, float] = {
+    **{k: float(v) for k, v in _LOCALE_DEFAULTS["reference_speeds"].items()},
     "unclassified": 40.0,
     "living_street": 20.0,
 }
@@ -1666,7 +2008,7 @@ def compute_objective(
     return geh_term + r2_term + slope_term + rmse_term + sl_term + jt_term
 
 
-def run_supply_tuning(config_path: str | Path = "config/sim.yaml") -> None:
+def run_supply_tuning(config_path: str | Path = "config/brno/sim.yaml") -> None:
     """Outer-loop supply parameter tuning via coordinate descent."""
     cfg = load_config(config_path)
     calib_cfg = cfg.get("calibration") or {}
@@ -1700,7 +2042,7 @@ def run_supply_tuning(config_path: str | Path = "config/sim.yaml") -> None:
     )
     best_obj = float("inf")
 
-    orig_max_iter = calib_cfg.get("max_iterations", 10)
+    orig_max_iter = calib_cfg.get("max_iterations", 30)
 
     def _evaluate(params: SupplyParams) -> float:
         """Apply params, run short calibration, return objective."""
@@ -1897,8 +2239,8 @@ class _CalibrationContext:
     the same initialisation logic.
     """
 
-    def __init__(self, config_path: str | Path = "config/sim.yaml") -> None:
-        from sim.screenlines import load_screenlines, resolve_screenline_links
+    def __init__(self, config_path: str | Path = "config/brno/sim.yaml") -> None:
+        from sim.screenlines import load_screenlines, load_screenlines_with_auto, resolve_screenline_links
 
         self.config_path = config_path
         cfg = load_config(config_path)
@@ -1913,25 +2255,23 @@ class _CalibrationContext:
 
         # Assignment parameters
         self.algorithm = str(calib_cfg.get("algorithm", "bfw"))
-        self.max_iter_assign = int(calib_cfg.get("max_iter", 100))
-        self.rgap = float(calib_cfg.get("rgap_target", 0.001))
+        self.max_iter_assign = int(calib_cfg.get("max_iter", 150))
+        self.rgap = float(calib_cfg.get("rgap_target", 0.002))
         self.core_name = str(calib_cfg.get("core_name", "wd_daily"))
 
         assign_cfg = cfg.get("assignment") or {}
         gc_cfg = assign_cfg.get("generalized_cost") or {}
-        gc_enabled = bool(gc_cfg.get("enabled", False))
+        gc_enabled = bool(gc_cfg.get("enabled", True))
         self.gc_field: Optional[str] = (
-            str(gc_cfg["fixed_cost_field"])
-            if gc_enabled and "fixed_cost_field" in gc_cfg else None
+            str(gc_cfg.get("fixed_cost_field", "distance"))
+            if gc_enabled else None
         )
-        self.gc_mult: float = float(gc_cfg.get("fixed_cost_multiplier", 0.0)) if gc_enabled else 0.0
+        self.gc_mult: float = float(gc_cfg.get("fixed_cost_multiplier", 0.006)) if gc_enabled else 0.0
         self.gc_vot: float = float(gc_cfg.get("vot", 1.0))
-        bpr_cfg = assign_cfg.get("bpr") or {}
-        self.cfg_bpr: Optional[Dict[str, object]] = dict(bpr_cfg) if bpr_cfg else None
+        bpr_cfg = _apply_bpr_defaults(assign_cfg.get("bpr") or {})
+        self.cfg_bpr: Optional[Dict[str, object]] = bpr_cfg
         mc_cfg = assign_cfg.get("multi_class") or {}
-        self.cfg_multi: Optional[list] = (
-            list(mc_cfg["classes"]) if mc_cfg.get("enabled") and "classes" in mc_cfg else None
-        )
+        self.cfg_multi: Optional[list] = _resolve_multi_class(mc_cfg)
         self.daily_cap_factor = resolve_daily_cap_factor_default(bpr_cfg)
         self.cores = int(assign_cfg.get("cores", 0))
 
@@ -1940,7 +2280,8 @@ class _CalibrationContext:
         self.direction_aware = bool(calib_cfg.get("match_direction_aware", True))
         self.conflict_res = str(calib_cfg.get("match_conflict_resolution", "nearest"))
         self.agg_corridor = bool(calib_cfg.get("aggregate_corridor", True))
-        self.count_target = str(calib_cfg.get("count_target", "total"))
+        self.match_quality_min = float(calib_cfg.get("match_quality_min", 0.50))
+        self.count_target = str(calib_cfg.get("count_target", "motor_total"))
         _COUNT_TARGET_COL = {
             "car_only": "observed_car",
             "motor_total": "observed_motor_total",
@@ -1959,7 +2300,7 @@ class _CalibrationContext:
 
         # ODME / elasticity
         self.odme_cfg = calib_cfg.get("odme") or {}
-        self.max_deviation = float(self.odme_cfg.get("max_deviation", 3.0))
+        self.max_deviation = float(self.odme_cfg.get("max_deviation", 4.0))
 
         # Pre-flight
         fix_node_ids(self.project_dir)
@@ -1998,7 +2339,7 @@ class _CalibrationContext:
 
         # Observed counts + network links
         self.links_gdf = _load_network_links(self.project_dir)
-        self.count_source = str(calib_cfg.get("count_source", "pentlogram"))
+        self.count_source = str(calib_cfg.get("count_source", "csd_split"))
 
         if self.count_source == "csd_split":
             split_cfg = calib_cfg.get("csd_split") or {}
@@ -2023,9 +2364,14 @@ class _CalibrationContext:
             )
             logger.info(f"  Pentlogram: {len(self.pent)} observed segments")
 
-        # Screenlines
-        sl_path = str(calib_cfg.get("screenlines_path", "config/screenlines.yaml"))
-        self.screenlines = load_screenlines(sl_path)
+        # Screenlines (manual YAML + auto-generated from gateways/CSD)
+        csd_for_auto = None
+        if self.count_source == "csd_split":
+            try:
+                csd_for_auto = load_csd(cfg)
+            except Exception:
+                pass
+        self.screenlines = load_screenlines_with_auto(cfg, csd_df=csd_for_auto)
         self.sl_query: Optional[Dict[str, list]] = None
         if self.screenlines:
             self.sl_query = {}
@@ -2067,9 +2413,9 @@ class _CalibrationContext:
         # Gateway calibration
         gw_cal_cfg = calib_cfg.get("gateway_calibration") or {}
         self.gw_cal_enabled = bool(gw_cal_cfg.get("enabled", False))
-        self.gw_cal_damping = float(gw_cal_cfg.get("damping", 0.08))
-        self.gw_cal_min_factor = float(gw_cal_cfg.get("min_factor", 0.90))
-        self.gw_cal_max_factor = float(gw_cal_cfg.get("max_factor", 1.10))
+        self.gw_cal_damping = float(gw_cal_cfg.get("damping", 0.25))
+        self.gw_cal_min_factor = float(gw_cal_cfg.get("min_factor", 0.70))
+        self.gw_cal_max_factor = float(gw_cal_cfg.get("max_factor", 1.60))
         self.gw_zone_map: Dict[str, np.ndarray] = {}
         self.gw_observed: Dict[str, float] = {}
 
@@ -2183,7 +2529,7 @@ class _CalibrationContext:
             logger.info(f"  Saved: {results_path}")
 
 
-def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
+def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
     """Spiess-style gradient ODME calibration.
 
     Bi-level optimization:
@@ -2226,6 +2572,7 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     direction_aware = ctx.direction_aware
     conflict_res = ctx.conflict_res
     agg_corridor = ctx.agg_corridor
+    mq_min = ctx.match_quality_min
     obs_col = ctx.obs_col
     count_target = ctx.count_target
     daily_conv = ctx.daily_conv
@@ -2233,11 +2580,11 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     seed_lower = ctx.seed_lower
     seed_upper = ctx.seed_upper
 
-    max_outer = int(odme_cfg.get("max_outer_iterations", 20))
-    gd_inner = int(odme_cfg.get("gradient_descent_iterations", 3))
+    max_outer = int(odme_cfg.get("max_outer_iterations", 25))
+    gd_inner = int(odme_cfg.get("gradient_descent_iterations", 5))
     weight_method = str(odme_cfg.get("weight_function", "inverse_sqrt"))
-    conv_tol = float(odme_cfg.get("convergence_tol", 0.01))
-    global_residual_damping = float(odme_cfg.get("global_residual_damping", 0.3))
+    conv_tol = float(odme_cfg.get("convergence_tol", 0.001))
+    global_residual_damping = float(odme_cfg.get("global_residual_damping", 0.25))
 
     logger.info("=== ODME GRADIENT CALIBRATION (Spiess method) ===")
     logger.info(f"  max_outer={max_outer}, gd_inner={gd_inner}, max_deviation={ctx.max_deviation}")
@@ -2311,6 +2658,7 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 conflict_resolution=conflict_res,
                 aggregate_corridor=agg_corridor,
                 vol_col=vol_col,
+                match_quality_min=mq_min,
             )
 
             # Build persistent exclusion set on first iteration
@@ -2384,10 +2732,10 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     if sr.observed_total > 0 and np.isfinite(sr.ratio):
                         dev = abs(sr.ratio - 1.0) * 100.0
                         max_sl_pct_dev = max(max_sl_pct_dev, dev)
-                    logger.info(
-                        f"  SL '{sn}': mod={sr.modeled_total:,.0f} "
-                        f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f} GEH={sr.geh:.1f}"
-                    )
+                        logger.info(
+                            f"  SL '{sn}': mod={sr.modeled_total:,.0f} "
+                            f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f} GEH={sr.geh:.1f}"
+                        )
 
             # Record iteration history
             iter_record = {
@@ -2549,6 +2897,21 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     for gc_line in gw_corrections:
                         logger.info(f"    {gc_line}")
 
+                # After the first iteration, re-center elasticity bounds around
+                # the gateway-adjusted demand so subsequent iterations have room
+                # to converge for large initial discrepancies (e.g. I52_S 3x).
+                if outer_it == 1:
+                    rebased = demand.copy()
+                    seed_lower = rebased / max_deviation
+                    seed_upper = rebased * max_deviation
+                    seed_lower[rebased <= 0] = 0.0
+                    seed_upper[rebased <= 0] = 0.0
+                    ctx.seed_lower = seed_lower
+                    ctx.seed_upper = seed_upper
+                    logger.info(
+                        "  Seed bounds rebased after first gateway calibration"
+                    )
+
             # --- 8) Write updated demand back to matrix ---
             data[:, :] = demand
             mat.save()
@@ -2617,7 +2980,7 @@ def run_odme_calibration(config_path: str | Path = "config/sim.yaml") -> None:
 # Legacy iterative calibration
 # ---------------------------------------------------------------------------
 
-def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
+def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
     """FSM iterative calibration: assign → compare → scale → repeat."""
     ctx = _CalibrationContext(config_path)
     cfg = ctx.cfg
@@ -2649,6 +3012,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     direction_aware = ctx.direction_aware
     conflict_res = ctx.conflict_res
     agg_corridor = ctx.agg_corridor
+    mq_min = ctx.match_quality_min
     obs_col = ctx.obs_col
     count_target = ctx.count_target
     daily_conv = ctx.daily_conv
@@ -2660,7 +3024,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     max_iterations = int(calib_cfg.get("max_iterations", 10))
     conv_cfg = calib_cfg.get("convergence") or {}
     geh_target = float(conv_cfg.get("geh_lt5_target_pct", 85.0))
-    min_improvement = float(conv_cfg.get("min_improvement_pct", 1.0))
+    min_improvement = float(conv_cfg.get("min_improvement_pct", -5.0))
 
     daily_r2_target = float(daily_conv.get("r2_target", 0.80))
     daily_slope_range = daily_conv.get("slope_range", [0.85, 1.15])
@@ -2671,9 +3035,9 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     daily_bias_max = float(daily_conv.get("bias_abs_max_pct", 15.0))
 
     scale_cfg = calib_cfg.get("scaling") or {}
-    scale_method = str(scale_cfg.get("method", "sector"))
+    scale_method = str(scale_cfg.get("method", "select_link"))
     scale_enabled = bool(scale_cfg.get("enabled", True))
-    damping = float(scale_cfg.get("damping", 0.5))
+    damping = float(scale_cfg.get("damping", 0.40))
     # NOTE: min_factor, max_factor, and adaptive_data_driven from scaling
     # config are loaded for reporting but NOT used in the actual update step.
     # Elasticity is controlled by seed_lower / seed_upper (from max_deviation).
@@ -2691,7 +3055,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
     q_bias_hard = float(quality_cfg.get("hard_class_bias_max_abs_pct", 90.0))
     q_wmape_warn = float(quality_cfg.get("warn_wmape_pct", 47.0))
     q_geh_warn = float(quality_cfg.get("warn_geh_lt5_pct", 7.0))
-    q_obj_patience = int(quality_cfg.get("objective_patience", 3))
+    q_obj_patience = int(quality_cfg.get("objective_patience", 10))
     q_obj_weights = quality_cfg.get("objective_weights") or {}
     w_rho = float(q_obj_weights.get("spearman", 120.0))
     w_r2 = float(q_obj_weights.get("r2", 80.0))
@@ -2801,7 +3165,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 except Exception as ex:
                     logger.warning(f"  WARNING: volume breakdown failed: {ex}")
 
-            # 2) Match to pentlogram
+            # 2) Match observed count geometry to network links
             links_with_vol = links_gdf.copy()
             if vol_col and "link_id" in vol_df.columns:
                 links_with_vol = links_with_vol.merge(
@@ -2814,6 +3178,7 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                 conflict_resolution=conflict_res,
                 aggregate_corridor=agg_corridor,
                 vol_col=vol_col,
+                match_quality_min=mq_min,
             )
             vc = vol_col if vol_col and vol_col in matched.columns else next(
                 (c for c in matched.columns if vol_col and vol_col in c), None
@@ -2962,11 +3327,11 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
                     if sr.observed_total > 0 and np.isfinite(sr.ratio):
                         dev = abs(sr.ratio - 1.0) * 100.0
                         max_sl_pct_dev = max(max_sl_pct_dev, dev)
-                    if it == 1 or it == max_iterations:
-                        logger.info(
-                            f"  Screenline '{sn}': mod={sr.modeled_total:,.0f} "
-                            f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f} GEH={sr.geh:.1f}"
-                        )
+                        if it == 1 or it == max_iterations:
+                            logger.info(
+                                f"  Screenline '{sn}': mod={sr.modeled_total:,.0f} "
+                                f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f} GEH={sr.geh:.1f}"
+                            )
                 if sl_results:
                     logger.info(f"  Screenline max %deviation: {max_sl_pct_dev:.1f}%")
 
@@ -3230,7 +3595,8 @@ def run_calibration(config_path: str | Path = "config/sim.yaml") -> None:
 
                     lv = links_gdf.copy()
                     lv = lv.merge(vol_df_p[["link_id", vc_p]], on="link_id", how="left")
-                    m_p = match_counts_to_links(pent, lv, buffer_m=buffer_m, vol_col=vc_p)
+                    m_p = match_counts_to_links(pent, lv, buffer_m=buffer_m, vol_col=vc_p,
+                                                match_quality_min=mq_min)
 
                     obs_period_col = f"_obs_{period}"
                     if period == "daily":
@@ -3344,6 +3710,8 @@ _MIN_VOL_FOR_CSD_LW = 100  # boundary links with < 100 veh/day are artifacts
 def match_csd_to_links(
     csd: pd.DataFrame,
     links_gdf: gpd.GeoDataFrame,
+    *,
+    csd_full: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Per-road matching via ``osm_ref`` ↔ CSD ``sil``.
 
@@ -3355,6 +3723,10 @@ def match_csd_to_links(
     Links with near-zero volume (< 100 veh/day) are excluded from the
     length-weighted mean to avoid dilution by boundary artifacts.
     Link types are filtered to be compatible with the CSD road class.
+
+    *csd_full* (optional): pre-split full CSD dataset used for accurate
+    road-length coverage estimation.  When provided, ``delka`` sums come
+    from the full dataset rather than the (potentially subsetted) *csd*.
     """
     csd = csd.copy()
     if "sil" not in csd.columns or "osm_ref" not in links_gdf.columns:
@@ -3440,7 +3812,19 @@ def match_csd_to_links(
         else:
             model_lw_mean = float(vols.mean())
 
+        if csd_mean_sv <= 0:
+            continue
+
         geh = float(compute_geh(np.array([model_lw_mean]), np.array([csd_mean_sv]))[0])
+
+        model_road_km = float(car_links["distance"].sum()) / 1000.0 if "distance" in car_links.columns else 0.0
+        csd_source = csd_full if csd_full is not None else csd_sub
+        if "delka" in csd_source.columns and "sil" in csd_source.columns:
+            csd_road_km = float(csd_source[csd_source["sil"].astype(str).str.strip() == road]["delka"].sum())
+        else:
+            csd_road_km = 0.0
+        coverage = model_road_km / csd_road_km if csd_road_km > 0 else 1.0
+        is_partial = coverage < 0.5
 
         matched_roads.append({
             "road": road,
@@ -3451,6 +3835,10 @@ def match_csd_to_links(
             "csd_mean_o": round(csd_mean_o, 0),
             "model_lw_mean": round(model_lw_mean, 0),
             "geh": round(geh, 1),
+            "model_road_km": round(model_road_km, 1),
+            "csd_road_km": round(csd_road_km, 1),
+            "coverage_ratio": round(coverage, 2),
+            "partial_coverage": is_partial,
         })
 
     if not matched_roads:
@@ -3458,9 +3846,13 @@ def match_csd_to_links(
 
     result = pd.DataFrame(matched_roads)
 
-    # Summary statistics across matched roads
-    obs = result["csd_mean_sv"].values.astype(float)
-    mod = result["model_lw_mean"].values.astype(float)
+    # Summary statistics across matched roads (exclude partial-coverage roads)
+    full_cov = ~result["partial_coverage"].astype(bool)
+    sub = result[full_cov]
+    n_partial = int((~full_cov).sum())
+
+    obs = sub["csd_mean_sv"].values.astype(float)
+    mod = sub["model_lw_mean"].values.astype(float)
 
     if len(obs) >= 2:
         mask = (obs > 0) & (mod > 0)
@@ -3472,12 +3864,14 @@ def match_csd_to_links(
             r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
             bias = float((m_valid.sum() - o_valid.sum()) / o_valid.sum() * 100)
             pct_rmse = float(np.sqrt(((m_valid - o_valid) ** 2).mean()) / o_valid.mean() * 100)
+            gehs = sub["geh"].values[mask]
             result.attrs["summary"] = {
                 "n_roads": int(mask.sum()),
+                "n_partial_excluded": n_partial,
                 "r2": round(r2, 3),
                 "bias_pct": round(bias, 1),
                 "pct_rmse": round(pct_rmse, 1),
-                "mean_geh": round(float(result.loc[mask, "geh"].mean()), 1),
+                "mean_geh": round(float(gehs.mean()), 1),
             }
 
     return result
@@ -3509,7 +3903,8 @@ def compute_validation_benchmarks(
     sl_max_error = 0.0
     for sr in screenline_results.values():
         ratio = sr.get("ratio")
-        if ratio is not None:
+        obs = sr.get("observed_total", 0)
+        if ratio is not None and obs and obs > 0:
             sl_max_error = max(sl_max_error, abs(ratio - 1.0) * 100)
 
     result: Dict[str, Any] = {
@@ -3565,7 +3960,7 @@ def compute_validation_benchmarks(
     return result
 
 
-def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
+def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> None:
     """Comprehensive independent validation against CSD + screenlines + journey times."""
     cfg = load_config(config_path)
     project_dir = Path(cfg["project_path"])
@@ -3574,6 +3969,7 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
     output_dir = Path(demand_cfg.get("output_dir", "outputs/baseline/demand"))
     _ensure_dir(output_dir)
     buffer_m = float(_get(cfg, ["calibration", "match_buffer_m"], 50.0))
+    mq_min = float(calib_cfg.get("match_quality_min", 0.50))
 
     # Swap closures to validation period (e.g. 2025)
     bc_cfg = cfg.get("baseline_closures") or {}
@@ -3614,18 +4010,18 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
     if vol_col and "link_id" in vol_df.columns:
         links_gdf = links_gdf.merge(vol_df[["link_id", vol_col]], on="link_id", how="left")
 
-    count_target = str(calib_cfg.get("count_target", "total"))
+    count_target = str(calib_cfg.get("count_target", "motor_total"))
     _ct_map = {"car_only": "observed_car", "motor_total": "observed_motor_total", "total": "observed_total"}
     obs_col = _ct_map.get(count_target, "observed_total")
 
     assign_cfg = cfg.get("assignment") or {}
-    bpr_cfg = assign_cfg.get("bpr") or {}
+    bpr_cfg = _apply_bpr_defaults(assign_cfg.get("bpr") or {})
     daily_cap_factor = resolve_daily_cap_factor_default(bpr_cfg)
     model_time_period = str(calib_cfg.get("model_time_period", "daily"))
 
     report: Dict[str, Any] = {"model_time_period": model_time_period}
 
-    count_source = str(calib_cfg.get("count_source", "pentlogram"))
+    count_source = str(calib_cfg.get("count_source", "csd_split"))
     report["count_source"] = count_source
 
     # 1) Reference comparison (calibration data check)
@@ -3648,7 +4044,8 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
                 agg_corr = bool(calib_cfg.get("aggregate_corridor", True))
                 matched = match_counts_to_links(pent, links_gdf, buffer_m=buffer_m,
                                                  aggregate_corridor=agg_corr,
-                                                 vol_col=vol_col)
+                                                 vol_col=vol_col,
+                                                 match_quality_min=mq_min)
                 vc = vol_col if vol_col and vol_col in matched.columns else None
                 compare_vc = "_corridor_volume" if "_corridor_volume" in matched.columns else vc
                 if compare_vc and compare_vc in matched.columns:
@@ -3675,7 +4072,8 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
             agg_corr = bool(calib_cfg.get("aggregate_corridor", True))
             matched = match_counts_to_links(pent, links_gdf, buffer_m=buffer_m,
                                              aggregate_corridor=agg_corr,
-                                             vol_col=vol_col)
+                                             vol_col=vol_col,
+                                             match_quality_min=mq_min)
             vc = vol_col if vol_col and vol_col in matched.columns else None
             compare_vc = "_corridor_volume" if "_corridor_volume" in matched.columns else vc
             if compare_vc and compare_vc in matched.columns:
@@ -3707,6 +4105,7 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
     logger.info("\n2) CSD independent validation (per-road matching via osm_ref) ...")
     csd_match_df = pd.DataFrame()
     csd = None
+    csd_full = None
     try:
         if count_source == "csd_split":
             split_cfg = calib_cfg.get("csd_split") or {}
@@ -3728,7 +4127,7 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
             model_agg = aggregate_model_by_class(links_gdf, vol_col)
             report["csd_modeled"] = model_agg.to_dict(orient="records")
 
-        csd_match_df = match_csd_to_links(csd, links_gdf)
+        csd_match_df = match_csd_to_links(csd, links_gdf, csd_full=csd_full)
         if not csd_match_df.empty:
             report["csd_link_matching"] = csd_match_df.to_dict(orient="records")
 
@@ -3740,14 +4139,20 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
         if not csd_match_df.empty:
             logger.info(f"  Per-road comparison: {len(csd_match_df)} roads matched")
             for _, r in csd_match_df.iterrows():
+                partial_tag = "  [PARTIAL]" if r.get("partial_coverage", False) else ""
                 logger.info(
                     f"    {r['road']:>8s} ({r['road_class']:>10s})  "
                     f"csd_sv={r['csd_mean_sv']:>8.0f}  model={r['model_lw_mean']:>8.0f}  "
                     f"GEH={r['geh']:>5.1f}  sections={r['csd_sections']}  links={r['model_links']}"
+                    f"{partial_tag}"
                 )
             summary = getattr(csd_match_df, "attrs", {}).get("summary")
             if summary:
-                logger.info(f"  Summary ({summary['n_roads']} roads): "
+                partial_note = ""
+                n_excl = summary.get("n_partial_excluded", 0)
+                if n_excl:
+                    partial_note = f" ({n_excl} partial-coverage road(s) excluded)"
+                logger.info(f"  Summary ({summary['n_roads']} roads{partial_note}): "
                       f"R²={summary['r2']:.3f}  bias={summary['bias_pct']:.1f}%  "
                       f"%RMSE={summary['pct_rmse']:.1f}  mean_GEH={summary['mean_geh']:.1f}")
                 report["csd_summary"] = summary
@@ -3758,9 +4163,13 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
     logger.info("\n3) Screenline validation ...")
     sl_results: Dict[str, Any] = {}
     try:
-        from sim.screenlines import load_screenlines, evaluate_all_screenlines
-        sl_path = str(calib_cfg.get("screenlines_path", "config/screenlines.yaml"))
-        screenlines = load_screenlines(sl_path)
+        from sim.screenlines import load_screenlines_with_auto, evaluate_all_screenlines
+        csd_for_auto = None
+        try:
+            csd_for_auto = load_csd(cfg)
+        except Exception:
+            pass
+        screenlines = load_screenlines_with_auto(cfg, csd_df=csd_for_auto)
         if screenlines:
             sl_res = evaluate_all_screenlines(
                 screenlines, vol_df,
@@ -3769,8 +4178,9 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
             )
             for sn, sr in sl_res.items():
                 sl_results[sn] = sr.to_dict()
-                logger.info(f"  {sn}: mod={sr.modeled_total:,.0f} obs={sr.observed_total:,.0f} "
-                      f"ratio={sr.ratio:.2f} GEH={sr.geh:.1f}")
+                if sr.observed_total and sr.observed_total > 0:
+                    logger.info(f"  {sn}: mod={sr.modeled_total:,.0f} obs={sr.observed_total:,.0f} "
+                          f"ratio={sr.ratio:.2f} GEH={sr.geh:.1f}")
             report["screenlines"] = sl_results
         else:
             logger.warning("  No screenlines defined")
@@ -3897,13 +4307,12 @@ def run_validation_only(config_path: str | Path = "config/sim.yaml") -> None:
 # Lightweight diagnostics refresh (no assignment, no calibration)
 # ---------------------------------------------------------------------------
 
-def run_match_diagnostics(config_path: str | Path = "config/sim.yaml") -> None:
+def run_match_diagnostics(config_path: str | Path = "config/brno/sim.yaml") -> None:
     """Regenerate matching_diagnostics.csv from existing assignment results.
 
-    This is a fast (~seconds) step that re-matches the cleaned pentlogram
-    data against the current assignment results and exports the diagnostics
-    CSV used by the frontend's bias / corridor panels.  It does **not**
-    re-run traffic assignment or OD scaling.
+    Uses ``calibration.count_source``: for ``csd_split`` (default), CSD
+    sections matched to network roads via ``osm_ref``; for ``pentlogram``,
+    the ArcGIS pentlogram layer.  Does **not** re-run assignment or OD scaling.
     """
     cfg = load_config(config_path)
     project_dir = Path(cfg["project_path"])
@@ -3916,13 +4325,14 @@ def run_match_diagnostics(config_path: str | Path = "config/sim.yaml") -> None:
     direction_aware = bool(calib_cfg.get("match_direction_aware", True))
     conflict_res = str(calib_cfg.get("match_conflict_resolution", "nearest"))
     agg_corridor = bool(calib_cfg.get("aggregate_corridor", True))
+    mq_min = float(calib_cfg.get("match_quality_min", 0.50))
 
-    count_target = str(calib_cfg.get("count_target", "total"))
+    count_target = str(calib_cfg.get("count_target", "motor_total"))
     _ct_map = {"car_only": "observed_car", "motor_total": "observed_motor_total", "total": "observed_total"}
     obs_col = _ct_map.get(count_target, "observed_total")
 
     assign_cfg = cfg.get("assignment") or {}
-    bpr_cfg = assign_cfg.get("bpr") or {}
+    bpr_cfg = _apply_bpr_defaults(assign_cfg.get("bpr") or {})
     daily_cap_factor = resolve_daily_cap_factor_default(bpr_cfg)
 
     logger.info("=== MATCH DIAGNOSTICS (lightweight refresh) ===")
@@ -3950,13 +4360,27 @@ def run_match_diagnostics(config_path: str | Path = "config/sim.yaml") -> None:
 
     logger.info(f"  Loaded assignment: {len(vol_df)} links, vol_col={vol_col}")
 
-    pent = load_pentlogram(cfg)
-    validate_geometries_or_fail(
-        pent, name="pentlogram", expected_epsg=get_metric_epsg(cfg),
-    )
-    logger.info(f"  Pentlogram: {len(pent)} segments (after cleaning)")
-
+    count_source = str(calib_cfg.get("count_source", "csd_split"))
     links_gdf = _load_network_links(project_dir)
+
+    if count_source == "csd_split":
+        csd_full = load_csd(cfg)
+        pent = load_csd_as_link_counts(csd_full, links_gdf)
+        if pent.empty:
+            raise RuntimeError(
+                "CSD produced no link-level count anchors for diagnostics. "
+                "Check CSD data and network osm_ref overlap."
+            )
+        logger.info(
+            "  CSD link-count anchors: %d roads (network-filtered CSD, all sections)",
+            len(pent),
+        )
+    else:
+        pent = load_pentlogram(cfg)
+        validate_geometries_or_fail(
+            pent, name="pentlogram", expected_epsg=get_metric_epsg(cfg),
+        )
+        logger.info(f"  Pentlogram: {len(pent)} segments (after cleaning)")
     if vol_col and "link_id" in vol_df.columns:
         links_gdf = links_gdf.merge(vol_df[["link_id", vol_col]], on="link_id", how="left")
 
@@ -3967,6 +4391,7 @@ def run_match_diagnostics(config_path: str | Path = "config/sim.yaml") -> None:
         conflict_resolution=conflict_res,
         aggregate_corridor=agg_corridor,
         vol_col=vol_col,
+        match_quality_min=mq_min,
     )
 
     compare_col = "_corridor_volume" if "_corridor_volume" in matched.columns else vol_col

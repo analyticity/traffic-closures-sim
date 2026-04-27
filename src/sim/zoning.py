@@ -488,15 +488,34 @@ def _slug_token(value: Any) -> str:
 
 def _resolve_whitelist(ext_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     raw = ext_cfg.get("whitelist") or []
-    return [
-        {
-            "raw": str(item),
-            "norm": _norm_text(item),
-            "slug": _slug_token(item),
-        }
-        for item in raw
-        if str(item).strip()
-    ]
+    results: List[Dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            ref = str(item.get("ref", "")).strip()
+            if not ref:
+                continue
+            entry: Dict[str, Any] = {
+                "raw": ref,
+                "norm": _norm_text(ref),
+                "slug": _slug_token(ref),
+            }
+            if "anchor_latlon" in item:
+                ll = item["anchor_latlon"]
+                if isinstance(ll, (list, tuple)) and len(ll) == 2:
+                    entry["anchor_latlon"] = (float(ll[0]), float(ll[1]))
+            if "anchor_node_id" in item:
+                entry["anchor_node_id"] = int(item["anchor_node_id"])
+            results.append(entry)
+        else:
+            s = str(item).strip()
+            if not s:
+                continue
+            results.append({
+                "raw": s,
+                "norm": _norm_text(s),
+                "slug": _slug_token(s),
+            })
+    return results
 
 
 # ----------------------------
@@ -872,7 +891,7 @@ def _auto_discover_boundary_roads(
     model_area: Any,
     existing_refs: set[str],
     *,
-    boundary_buffer_m: float = 600.0,
+    boundary_buffer_m: float = 1000.0,
     min_link_types: Optional[List[str]] = None,
     min_lanes: int = 1,
 ) -> List[Dict[str, Any]]:
@@ -960,8 +979,8 @@ def _select_gateway_target_nodes_boundary_whitelist(
     whitelist_specs: List[Dict[str, Any]],
     *,
     nodes_per_gateway: int = 2,
-    boundary_buffer_m: float = 600.0,
-    min_gateway_separation_m: float = 1800.0,
+    boundary_buffer_m: float = 1000.0,
+    min_gateway_separation_m: float = 800.0,
     allowed_link_types: Optional[List[str]] = None,
     max_anchor_distance_m: float = 2000.0,
 ) -> Tuple[
@@ -1040,7 +1059,17 @@ def _select_gateway_target_nodes_boundary_whitelist(
     if allowed_link_types:
         allowed = {str(x).strip() for x in allowed_link_types}
         if allowed:
-            links_gdf = links_gdf[links_gdf["link_type"].astype(str).isin(allowed)].copy()
+            whitelist_refs: set[str] = set()
+            for s in whitelist_specs:
+                for k in ("norm", "raw"):
+                    v = str(s.get(k, "")).strip()
+                    if v:
+                        whitelist_refs.add(v.lower())
+            ref_col = links_gdf.get("osm_ref", pd.Series(dtype=str)).astype(str).str.strip().str.lower()
+            ref_norm = links_gdf.get("osm_ref_norm", pd.Series(dtype=str)).astype(str).str.strip().str.lower()
+            is_whitelisted = ref_col.isin(whitelist_refs) | ref_norm.isin(whitelist_refs)
+            is_allowed_type = links_gdf["link_type"].astype(str).isin(allowed)
+            links_gdf = links_gdf[is_allowed_type | is_whitelisted].copy()
 
     if links_gdf.empty:
         empty_lines = gpd.GeoDataFrame({"geometry": []}, crs=f"EPSG:{target_epsg}")
@@ -1114,6 +1143,30 @@ def _select_gateway_target_nodes_boundary_whitelist(
         )
         print(f"  boundary clusters: {len(clusters)}")
 
+        manual_anchor_pt: Optional[Point] = None
+        if "anchor_latlon" in spec:
+            lat, lon = spec["anchor_latlon"]
+            anchor_gs = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").to_crs(epsg=target_epsg)
+            manual_anchor_pt = anchor_gs.iloc[0]
+            print(f"  manual anchor_latlon -> projected ({manual_anchor_pt.x:.1f}, {manual_anchor_pt.y:.1f})")
+
+        manual_anchor_nid: Optional[int] = spec.get("anchor_node_id")
+        if manual_anchor_nid is not None:
+            print(f"  manual anchor_node_id = {manual_anchor_nid}")
+
+        best_manual_cluster: Optional[int] = None
+        if (manual_anchor_pt is not None or manual_anchor_nid is not None) and len(clusters) > 1:
+            ref_pt = manual_anchor_pt
+            if ref_pt is None and manual_anchor_nid is not None and manual_anchor_nid in node_geom:
+                ref_pt = node_geom[manual_anchor_nid]
+            if ref_pt is not None:
+                best_dist = float("inf")
+                for ci, cdf in enumerate(clusters):
+                    cd = float(cdf.geometry.distance(ref_pt).min())
+                    if cd < best_dist:
+                        best_dist = cd
+                        best_manual_cluster = ci
+
         for cl_i, cl in enumerate(clusters, start=1):
             local_nodes = sorted(
                 {
@@ -1125,25 +1178,32 @@ def _select_gateway_target_nodes_boundary_whitelist(
             if not local_nodes:
                 continue
 
-            boundary_local_nodes = [
-                nid for nid in local_nodes
-                if float(node_geom[nid].distance(boundary)) <= float(boundary_buffer_m) * 1.25
-            ]
-            target_pool = boundary_local_nodes if boundary_local_nodes else local_nodes
-
-            chosen = _pick_nodes_near_boundary(
-                target_pool,
-                node_geom,
-                boundary,
-                node_weight,
-                max_nodes=int(nodes_per_gateway),
-                min_node_sep_m=25.0,
-                scc_nodes=scc_nids,
+            use_manual = (
+                (manual_anchor_nid is not None or manual_anchor_pt is not None)
+                and (best_manual_cluster is None or best_manual_cluster == cl_i - 1)
             )
 
-            if len(chosen) < nodes_per_gateway and len(target_pool) < len(local_nodes):
+            if use_manual and manual_anchor_nid is not None and manual_anchor_nid in node_geom:
+                chosen = [manual_anchor_nid]
+                extra = [n for n in local_nodes if n != manual_anchor_nid and n in node_geom]
+                if extra:
+                    extra.sort(key=lambda n: float(node_geom[n].distance(node_geom[manual_anchor_nid])))
+                    for n in extra[: nodes_per_gateway - 1]:
+                        chosen.append(n)
+                print(f"  cluster {cl_i}: using manual anchor_node_id {manual_anchor_nid}, targets={chosen}")
+            elif use_manual and manual_anchor_pt is not None:
+                ranked = sorted(local_nodes, key=lambda n: float(node_geom[n].distance(manual_anchor_pt)))
+                chosen = ranked[: nodes_per_gateway]
+                print(f"  cluster {cl_i}: using manual anchor_latlon, nearest nodes={chosen}")
+            else:
+                boundary_local_nodes = [
+                    nid for nid in local_nodes
+                    if float(node_geom[nid].distance(boundary)) <= float(boundary_buffer_m) * 1.25
+                ]
+                target_pool = boundary_local_nodes if boundary_local_nodes else local_nodes
+
                 chosen = _pick_nodes_near_boundary(
-                    local_nodes,
+                    target_pool,
                     node_geom,
                     boundary,
                     node_weight,
@@ -1151,6 +1211,17 @@ def _select_gateway_target_nodes_boundary_whitelist(
                     min_node_sep_m=25.0,
                     scc_nodes=scc_nids,
                 )
+
+                if len(chosen) < nodes_per_gateway and len(target_pool) < len(local_nodes):
+                    chosen = _pick_nodes_near_boundary(
+                        local_nodes,
+                        node_geom,
+                        boundary,
+                        node_weight,
+                        max_nodes=int(nodes_per_gateway),
+                        min_node_sep_m=25.0,
+                        scc_nodes=scc_nids,
+                    )
 
             if not chosen:
                 print(f"  [warn] token {token_raw} cluster {cl_i}: no chosen boundary nodes")
@@ -1163,11 +1234,11 @@ def _select_gateway_target_nodes_boundary_whitelist(
                     f"{len(non_scc)} of {len(chosen)} target node(s) outside directed SCC: {non_scc}"
                 )
 
-            if len(chosen) < nodes_per_gateway:
+            if len(chosen) < nodes_per_gateway and not use_manual:
                 print(
                     f"  [warn] token {token_raw} cluster {cl_i}: only {len(chosen)} of "
-                    f"{nodes_per_gateway} target nodes found (pool={len(target_pool)} nodes, "
-                    f"boundary_buffer={boundary_buffer_m:.0f} m). "
+                    f"{nodes_per_gateway} target nodes found "
+                    f"(boundary_buffer={boundary_buffer_m:.0f} m). "
                     f"Consider increasing boundary_buffer_m or adding manual gateway nodes."
                 )
 
@@ -1831,12 +1902,16 @@ def _delete_all_connectors_and_reset_centroids(project: Project) -> int:
         conn.close()
 
 
+_MAJOR_ROAD_WEIGHT_THRESHOLD = _ROAD_CLASS_WEIGHT.get("secondary", 2.0)
+
+
 def _select_diverse_connectors(
     eligible: gpd.GeoDataFrame,
     centroid_pt: Point,
     max_connectors: int,
     max_distance_m: float,
     pool_size: int = 40,
+    min_major_connectors: int = 1,
 ) -> gpd.GeoDataFrame:
     if eligible.empty or max_connectors <= 0:
         return eligible.head(0).copy()
@@ -1884,7 +1959,54 @@ def _select_diverse_connectors(
         )
         chosen_idx.extend(remaining.index.tolist())
 
-    selected = nearby.loc[chosen_idx[:max_connectors]].copy()
+    chosen_idx = chosen_idx[:max_connectors]
+
+    # --- Minimum major-road guarantee ---
+    # If all selected connectors are below secondary level, search a wider
+    # radius (2x max_distance) for at least `min_major_connectors` nodes on
+    # secondary-or-higher roads and swap them in for the weakest choices.
+    if min_major_connectors > 0 and chosen_idx:
+        n_major = sum(
+            1 for i in chosen_idx
+            if nearby.loc[i, "road_weight"] >= _MAJOR_ROAD_WEIGHT_THRESHOLD
+        )
+        if n_major < min_major_connectors:
+            needed = min_major_connectors - n_major
+            extended_radius = max_distance_m * 2.5
+            wider = cand[cand["_dist"] <= extended_radius].copy()
+            if wider.empty:
+                wider = cand.nsmallest(min(pool_size * 2, len(cand)), "_dist").copy()
+            if not wider.empty:
+                wider["_dist"] = wider["_dist"].clip(lower=1.0)
+                major_pool = wider[
+                    (wider["road_weight"] >= _MAJOR_ROAD_WEIGHT_THRESHOLD)
+                    & (~wider.index.isin(chosen_idx))
+                ].copy()
+                if not major_pool.empty:
+                    major_pool["_score_ext"] = (
+                        major_pool["road_weight"]
+                        / np.power(major_pool["_dist"], 0.75)
+                    )
+                    best_majors = major_pool.nlargest(needed, "_score_ext")
+                    minor_sorted = sorted(
+                        chosen_idx,
+                        key=lambda i: nearby.loc[i, "road_weight"],
+                    )
+                    for j, maj_idx in enumerate(best_majors.index):
+                        if j < len(minor_sorted):
+                            chosen_idx[chosen_idx.index(minor_sorted[j])] = maj_idx
+
+    all_pool = pd.concat(
+        [nearby, cand[cand.index.isin(chosen_idx) & ~cand.index.isin(nearby.index)]],
+        ignore_index=False,
+    ).drop_duplicates(subset=["node_id"])
+    valid_idx = [i for i in chosen_idx if i in all_pool.index]
+
+    selected = all_pool.loc[valid_idx].copy()
+    if "_score" not in selected.columns:
+        selected["_score"] = (
+            selected["road_weight"] / np.power(selected["_dist"].clip(lower=1.0), 0.75)
+        )
     selected = selected.sort_values(
         ["_score", "road_weight", "_dist"],
         ascending=[False, False, True],
@@ -2429,7 +2551,7 @@ def export_gateway_seed_lookup(
 # Main
 # ----------------------------
 
-def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "config/sim.yaml") -> None:
+def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "config/brno/sim.yaml") -> None:
     print("Zoning: loading config...")
     cfg = _load_cfg(config_path)
 
@@ -2460,8 +2582,9 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
     )
 
     ext_cfg = zoning_cfg.get("external_gateways", {}) or {}
-    export_lookup = bool(ext_cfg.get("export_lookup", False))
-    export_lookup_path = _safe_path(ext_cfg.get("export_lookup_path", "data/cache/gateway_lookup_seed.parquet"))
+    export_lookup = bool(ext_cfg.get("export_lookup", True))
+    _cache = str(Path(cfg.get("datasets", {}).get("cache_dir", "data/cache")))
+    export_lookup_path = _safe_path(ext_cfg.get("export_lookup_path", f"{_cache}/gateway_lookup_seed.parquet"))
 
     print("Zoning: opening project...")
     project = Project()
@@ -2502,26 +2625,40 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
             whitelist_specs = _resolve_whitelist(ext_cfg)
 
             auto_cfg = ext_cfg.get("auto_discover") or {}
-            if bool(auto_cfg.get("enabled", False)):
+            # When whitelist is empty, auto_discover activates implicitly
+            # with all road classes so no manual road list is needed.
+            whitelist_empty = len(whitelist_specs) == 0
+            auto_enabled = bool(auto_cfg.get("enabled", False)) or whitelist_empty
+            all_auto_types: Optional[list] = None
+            if auto_enabled:
                 existing_refs = {s["raw"] for s in whitelist_specs}
-                auto_types = auto_cfg.get("link_types", [
-                    "secondary", "secondary_link",
-                ])
-                all_auto_types = list(ext_cfg.get(
-                    "allowed_link_types",
-                    ["motorway", "motorway_link", "trunk", "trunk_link",
-                     "primary", "primary_link"],
-                )) + list(auto_types)
+                if whitelist_empty:
+                    all_auto_types = [
+                        "motorway", "motorway_link", "trunk", "trunk_link",
+                        "primary", "primary_link", "secondary", "secondary_link",
+                        "tertiary", "tertiary_link",
+                    ]
+                    default_max = 30
+                else:
+                    auto_types = auto_cfg.get("link_types", [
+                        "secondary", "secondary_link",
+                    ])
+                    all_auto_types = list(ext_cfg.get(
+                        "allowed_link_types",
+                        ["motorway", "motorway_link", "trunk", "trunk_link",
+                         "primary", "primary_link"],
+                    )) + list(auto_types)
+                    default_max = 10
                 discovered = _auto_discover_boundary_roads(
                     project=project,
                     target_epsg=crs_epsg,
                     model_area=model_area,
                     existing_refs=existing_refs,
-                    boundary_buffer_m=float(ext_cfg.get("boundary_buffer_m", 600.0)) * 1.5,
+                    boundary_buffer_m=float(ext_cfg.get("boundary_buffer_m", 1000.0)) * 1.5,
                     min_link_types=all_auto_types,
                     min_lanes=int(auto_cfg.get("min_lanes", 1)),
                 )
-                max_auto = int(auto_cfg.get("max_gateways", 10))
+                max_auto = int(auto_cfg.get("max_gateways", default_max))
                 discovered = discovered[:max_auto]
                 if discovered:
                     for d in discovered:
@@ -2530,17 +2667,23 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
                     print(f"  Auto-discovered {len(discovered)} boundary roads: {refs_str}")
                     whitelist_specs.extend(discovered)
 
+            _default_allowed = (
+                all_auto_types
+                if all_auto_types is not None
+                else ["motorway", "motorway_link", "trunk", "trunk_link",
+                      "primary", "primary_link"]
+            )
             gateway_targets, gateway_meta, debug_corridors, debug_points = _select_gateway_target_nodes_boundary_whitelist(
                 project=project,
                 target_epsg=crs_epsg,
                 model_area=model_area,
                 whitelist_specs=whitelist_specs,
                 nodes_per_gateway=int(ext_cfg.get("connectors_per_gateway", 2)),
-                boundary_buffer_m=float(ext_cfg.get("boundary_buffer_m", 600.0)),
-                min_gateway_separation_m=float(ext_cfg.get("min_gateway_separation_m", 1800.0)),
+                boundary_buffer_m=float(ext_cfg.get("boundary_buffer_m", 1000.0)),
+                min_gateway_separation_m=float(ext_cfg.get("min_gateway_separation_m", 800.0)),
                 allowed_link_types=ext_cfg.get(
                     "allowed_link_types",
-                    ["motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link"],
+                    _default_allowed,
                 ),
                 max_anchor_distance_m=float(ext_cfg.get("max_anchor_distance_m", 2000.0)),
             )

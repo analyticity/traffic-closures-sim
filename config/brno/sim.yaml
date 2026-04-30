@@ -7,6 +7,13 @@ osm:
 network:
   normalization_config: "config/brno/network_normalization.yaml"
 
+assignment:
+  bpr:
+    by_link_type:
+      trunk:      { alpha: 0.55 }
+      trunk_link: { alpha: 0.60 }
+      primary:    { alpha: 0.65 }
+
 zoning:
   sources:
     - type: osm
@@ -72,9 +79,9 @@ closures_db:
 baseline_closures:
   enabled: true
   severity_map:
-    full:           { capacity_factor: 0.50, speed_factor: 0.70 }
-    lane_reduction: { capacity_factor: 0.60, speed_factor: 0.80 }
-    speed_limit:    { capacity_factor: 1.00, speed_factor: 0.60 }
+    full:           { capacity_factor: 0.15, speed_factor: 0.30 }
+    lane_reduction: { capacity_factor: 0.55, speed_factor: 0.75 }
+    speed_limit:    { capacity_factor: 1.00, speed_factor: 0.55 }
   measurement_period: { start: "2025-01-01", end: "2025-12-31" }
   calibration_period: { start: "2025-01-01", end: "2025-12-31" }
   validation_period:  { start: "2025-01-01", end: "2025-12-31" }

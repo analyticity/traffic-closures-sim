@@ -9,9 +9,9 @@ network:
 assignment:
   bpr:
     by_link_type:
-      trunk:      { alpha: 0.80 }
-      trunk_link: { alpha: 0.80 }
-      primary:    { alpha: 0.95 }
+      trunk:      { alpha: 0.50 }
+      trunk_link: { alpha: 0.55 }
+      primary:    { alpha: 0.65 }
       tertiary:   { alpha: 0.50 }
 
 zoning:

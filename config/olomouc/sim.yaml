@@ -2,7 +2,7 @@ project_path: "project/olomouc_aeq"
 
 osm:
   place_name: "Olomouc, Czechia"
-  # buffer_km: 2  # optional: km buffer around geocoded place (default 0). Omit or use 0 for full-place import.
+  buffer_km: 4  # wider buffer to capture motorway on/off-ramps near boundary (D35, D46)
 
 zoning:
   sources:
@@ -11,7 +11,7 @@ zoning:
       admin_level: "9"
   external_gateways:
     enabled: true
-    whitelist: []
+    whitelist: ["D35", "D46", "I/55", "I/46", "I/35"]
 
 demand:
   segments:

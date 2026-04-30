@@ -22,7 +22,7 @@ The pipeline supports the following workflow:
 9. **assign-warm-skims** – optional short assignment that always saves `skims.aem` for trip distribution  
 10. **distribute** – gravity calibration + IPF on the seed matrix (network skims or Euclidean; see below)  
 11. **assign** – full traffic assignment on the detailed network  
-12. **calibrate** / **calibrate-odme** – iterative demand scaling vs. link counts (default: CSD 2025; optional pentlogram)  
+12. **calibrate** / **calibrate-odme** – Spiess gradient ODME against link counts (default); set `calibration.method` for alternatives  
 13. **tune-supply** – optional outer loop on supply-side factors after demand calibration  
 14. **validate** – independent checks vs. CSD (not used in calibration)  
 15. **learn-profile** – temporal day-type factors from CSD  
@@ -190,8 +190,8 @@ python run.py --config $CFG build-demand
 python run.py --config $CFG assign-warm-skims
 python run.py --config $CFG distribute
 python run.py --config $CFG assign
-python run.py --config $CFG calibrate                 # or calibrate-odme for ODME method
-python run.py --config $CFG tune-supply
+python run.py --config $CFG calibrate                 # Spiess ODME by default
+# python run.py --config $CFG tune-supply             # optional; disabled by default
 python run.py --config $CFG validate
 python run.py --config $CFG learn-profile
 python run.py --config $CFG strip-closures            # remove closures for clean baseline
@@ -389,25 +389,34 @@ The result is an estimate of flows on individual network links.
 
 ### 12. `calibrate` / `calibrate-odme`
 
-Performs iterative model calibration.
+Performs iterative bi-level OD matrix calibration against observed link counts.
 
-This phase typically follows the loop:
+The default method is **Spiess gradient ODME** — a bi-level loop where the lower level runs AequilibraE equilibrium assignment and the upper level adjusts the OD matrix using select-link proportions from screenlines:
 
-1. assign traffic
-2. compare assigned flows with observed data
-3. scale or adjust model components
-4. repeat until convergence or stopping criteria are reached
+1. run equilibrium assignment (+ select-link OD extraction per screenline)
+2. match assigned volumes to observed counts (CSD 2025 or pentlogram)
+3. compute weighted SSE objective Z and per-screenline obs/mod ratios
+4. apply Spiess multiplicative OD update across screenlines (multiple inner gradient steps)
+5. apply global residual scaling, per-road-class residual, and gateway calibration
+6. repeat until Z converges, daily criteria are met, or stall patience is exhausted
 
-The objective is to reduce the difference between simulated and observed traffic patterns.
+Both `calibrate` and `calibrate-odme` run ODME by default. To select a different method, set `calibration.method` in your city's `sim.yaml`:
 
-Two methods are available:
-
-* **`calibrate`** — iterative demand scaling vs. link counts (default **CSD 2025** via `calibration.count_source: csd_split`; set `pentlogram` to use the Brno ArcGIS layer instead)
-* **`calibrate-odme`** — origin-destination matrix estimation (ODME) against link counts
+| `calibration.method` | Runner function | Description |
+|---|---|---|
+| `odme` (default) | `run_odme_calibration` | Spiess gradient ODME with adaptive damping and best-snapshot recovery |
+| `entropy_odme` | `run_entropy_odme` | Entropy-maximization variant (log-ratio update, better seed structure preservation) |
+| `multistage` | `run_multistage_calibration` | 4-stage pipeline: gravity re-fit, gateway pre-calib, tight-bounds ODME, screenline fine-tuning |
+| `fsm` | `run_calibration` | Legacy iterative method (1 inner step per iteration, no explicit Z objective) |
 
 **Configuration (excerpt)**
 
 * `calibration.aggregate_corridor` — when `true`, volumes on parallel divided-highway links are summed for comparison to a single count station (recommended for motorways).
+* `calibration.odme.max_outer_iterations` — maximum ODME iterations (default 40).
+* `calibration.odme.gradient_descent_iterations` — inner Spiess steps per outer iteration (default 8).
+* `calibration.odme.max_deviation` — max multiplicative deviation from seed OD (default 6.0).
+* `calibration.odme.convergence_tol` — relative Z change threshold for convergence (default 0.001).
+* `calibration.count_source` — `csd_split` (default, CSD 2025) or `pentlogram` (Brno ArcGIS layer).
 
 ---
 
@@ -565,10 +574,9 @@ This keeps iteration fast and avoids recomputing expensive earlier phases unnece
 
 The workflow is implemented in the main script and dispatches individual steps to dedicated modules such as:
 
-* `sim.network_pipeline` — OSM import
-* `sim.network_normalization` — attribute normalization, baseline closures
+* `sim.network` — OSM import, filtering, CRS helpers, map export, attribute normalization, connectivity repair, baseline closures, network export
 * `sim.zoning` — TAZ and gateway zone generation
-* `sim.fetch_datasets` — external data download (CSD, SLDB, closures)
+* `sim.datasets` — external data download & preprocessing (CSD, SLDB, closures, ArcGIS, RUIAN centroids)
 * `sim.supernetwork` — national coarse network for through-traffic
 * `sim.demand` — OD matrix construction
 * `sim.distribution` — gravity model and IPF

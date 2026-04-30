@@ -1255,9 +1255,11 @@ def apply_baseline_closures(
             link_gdf = link_gdf.to_crs(epsg=metric_epsg)
 
         # Detect CRS mismatch: if link coordinates look like WGS84 degrees
-        # (typical range 0–180) but CRS is metric, reproject from 4326.
+        # (lon in -180..180, lat in -90..90) but CRS is metric, reproject from 4326.
         sample_x = link_gdf.geometry.iloc[0].coords[0][0] if len(link_gdf) > 0 else 0
-        if link_gdf.crs and link_gdf.crs.to_epsg() == metric_epsg and abs(sample_x) < 360:
+        sample_y = link_gdf.geometry.iloc[0].coords[0][1] if len(link_gdf) > 0 else 0
+        if (link_gdf.crs and link_gdf.crs.to_epsg() == metric_epsg
+                and abs(sample_x) <= 180 and abs(sample_y) <= 90):
             logger.warning(
                 "Link coords look like WGS84 (x=%.4f) but CRS is EPSG:%d; reprojecting from 4326",
                 sample_x,
@@ -1320,6 +1322,12 @@ def apply_baseline_closures(
         else:
             logger.info("No closures matched to network links")
         return links
+
+    for col in ("speed_ab", "speed_ba", "capacity_ab", "capacity_ba",
+                "_preclosure_speed_ab", "_preclosure_speed_ba",
+                "_preclosure_capacity_ab", "_preclosure_capacity_ba"):
+        if col in links.columns:
+            links[col] = links[col].astype(float)
 
     for lid, sev in affected_link_ids.items():
         sev_cfg = severity_map.get(sev, severity_map.get("lane_reduction", {}))

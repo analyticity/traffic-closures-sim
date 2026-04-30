@@ -1215,7 +1215,10 @@ def fetch_postgres_closures(
     """
 
     try:
-        df = pd.read_sql(query, conn)
+        with conn.cursor() as cur:
+            cur.execute(query)
+            cols = [desc[0] for desc in cur.description]
+            df = pd.DataFrame(cur.fetchall(), columns=cols)
     finally:
         conn.close()
 

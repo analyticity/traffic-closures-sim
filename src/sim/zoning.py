@@ -1794,6 +1794,10 @@ def export_map_png(
             zorder=15,
         )
 
+    _gw_corridor_color = "#C0392B"
+    _gw_terminal_color = "#F39C12"
+    _gw_anchor_color = "#C0392B"
+
     if debug_corridors is not None and not debug_corridors.empty:
         dbg = debug_corridors.copy()
         if dbg.crs is None:
@@ -1803,9 +1807,9 @@ def export_map_png(
 
         dbg.plot(
             ax=ax,
-            color="#70747D",
-            linewidth=2.5,
-            alpha=0.85,
+            color=_gw_corridor_color,
+            linewidth=3.0,
+            alpha=0.88,
             zorder=18,
         )
 
@@ -1822,8 +1826,8 @@ def export_map_png(
         if not terminals.empty:
             terminals.plot(
                 ax=ax,
-                color="#5E6762",
-                markersize=35,
+                color=_gw_terminal_color,
+                markersize=40,
                 marker="o",
                 zorder=19,
             )
@@ -1831,8 +1835,8 @@ def export_map_png(
         if not anchors.empty:
             anchors.plot(
                 ax=ax,
-                color="#3A4442",
-                markersize=90,
+                color=_gw_anchor_color,
+                markersize=95,
                 marker="X",
                 zorder=20,
             )
@@ -1898,6 +1902,43 @@ def export_map_png(
             label="AOI",
         ),
     )
+    if debug_corridors is not None and not debug_corridors.empty:
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=_gw_corridor_color,
+                linewidth=3.0,
+                label="Gateway corridors",
+            ),
+        )
+    if debug_points is not None and not debug_points.empty:
+        n_term = len(terminals) if not terminals.empty else 0
+        n_anch = len(anchors) if not anchors.empty else 0
+        if n_term > 0:
+            legend_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color=_gw_terminal_color,
+                    linestyle="None",
+                    markersize=8,
+                    label=f"Gateway terminals ({n_term})",
+                ),
+            )
+        if n_anch > 0:
+            legend_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="X",
+                    color=_gw_anchor_color,
+                    linestyle="None",
+                    markersize=10,
+                    label=f"Gateway anchors ({n_anch})",
+                ),
+            )
 
     ax.legend(
         handles=legend_handles,
@@ -2696,9 +2737,8 @@ def build_zones_and_connectors(config_path: str | Path | Dict[str, Any] = "confi
                     all_auto_types = [
                         "motorway", "motorway_link", "trunk", "trunk_link",
                         "primary", "primary_link", "secondary", "secondary_link",
-                        "tertiary", "tertiary_link",
                     ]
-                    default_max = 30
+                    default_max = 20
                 else:
                     auto_types = auto_cfg.get("link_types", [
                         "secondary", "secondary_link",

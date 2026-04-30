@@ -279,7 +279,7 @@ SIM_DEFAULTS: Dict[str, Any] = {
     "calibration": {
         "algorithm": "bfw",
         "max_iter": 150,
-        "rgap_target": 0.002,
+        "rgap_target": 0.005,
         "core_name": "wd_daily",
         "model_time_period": "daily",
 
@@ -293,15 +293,15 @@ SIM_DEFAULTS: Dict[str, Any] = {
 
         "gateway_calibration": {
             "enabled": True,
-            "damping": 0.18,
-            "min_factor": 0.70,
-            "max_factor": 1.40,
+            "damping": 0.30,
+            "min_factor": 0.50,
+            "max_factor": 2.00,
         },
 
-        "match_buffer_m": 50.0,
+        "match_buffer_m": 80.0,
         "match_direction_aware": True,
         "match_conflict_resolution": "nearest",
-        "match_quality_min": 0.50,
+        "match_quality_min": 0.35,
         "count_target": "motor_total",
         "aggregate_corridor": True,
         "save_skims": False,
@@ -332,16 +332,21 @@ SIM_DEFAULTS: Dict[str, Any] = {
 
         "quality_gates": {
             "hard_class_bias_max_abs_pct": 90.0,
-            "objective_patience": 15,
+            "objective_patience": 25,
         },
 
         "odme": {
-            "max_outer_iterations": 25,
-            "gradient_descent_iterations": 5,
-            "max_deviation": 4.0,
+            "max_outer_iterations": 40,
+            "gradient_descent_iterations": 8,
+            "max_deviation": 6.0,
             "weight_function": "inverse_sqrt",
             "convergence_tol": 0.001,
             "global_residual_damping": 0.25,
+            "max_iter_change_pct": 15.0,
+            "stall_patience": 8,
+            "class_residual_enabled": True,
+            "class_residual_damping": 0.08,
+            "class_residual_min_counts": 3,
         },
 
         "matching": {
@@ -366,8 +371,20 @@ SIM_DEFAULTS: Dict[str, Any] = {
             "ratio_min": 0.2,
             "clip_min": 0.5,
             "clip_max": 2.0,
-            "global_min": 0.8,
-            "global_max": 1.25,
+            "global_min": 0.70,
+            "global_max": 1.50,
+        },
+
+        "auto_screenlines": {
+            "enabled": False,
+            "gateway_screenlines": True,
+            "csd_screenlines": True,
+            "csd_min_aadt": 5000,
+        },
+
+        "multistage": {
+            "max_total_change_pct": 50.0,
+            "multistage_max_deviation": 3.0,
         },
     },
 

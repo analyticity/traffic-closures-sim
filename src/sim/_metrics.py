@@ -53,6 +53,45 @@ def persons_to_vehicles_from_cfg(
     return _conv(work, "work") + _conv(school, "school")
 
 
+def resolve_volume_column(vol_df: pd.DataFrame, vol_col: str | None = None) -> tuple[pd.DataFrame, str | None]:
+    """Detect or build the total-volume column for an assignment result.
+
+    If *vol_col* is ``None``, tries ``_detect_volume_col`` heuristics.
+    When multiple ``*_tot`` class columns exist, sums them into
+    ``total_vehicles_tot`` so that a single column represents total flow.
+
+    Returns ``(vol_df, vol_col)`` — the dataframe may have a new column.
+    """
+    if vol_col is None:
+        from sim.assignment import _detect_volume_col
+        vol_col = _detect_volume_col(vol_df)
+
+    class_tot_cols = [
+        c for c in vol_df.columns
+        if c.endswith("_tot")
+        and c not in ("PCE_tot", "Preload_tot", "total_vehicles_tot")
+        and vol_df[c].sum() > 0
+    ]
+    if len(class_tot_cols) > 1:
+        vol_df["total_vehicles_tot"] = vol_df[class_tot_cols].sum(axis=1)
+        vol_col = "total_vehicles_tot"
+
+    return vol_df, vol_col
+
+
+# ---------------------------------------------------------------------------
+# Road-type constants (single source of truth)
+# ---------------------------------------------------------------------------
+
+MAJOR_ROAD_TYPES = frozenset({
+    "trunk", "trunk_link", "motorway", "motorway_link", "primary", "primary_link",
+})
+
+MAJOR_ROAD_TYPES_STRICT = frozenset({
+    "trunk", "trunk_link", "motorway", "motorway_link",
+})
+
+
 def aggregate_daily_volumes(df: pd.DataFrame) -> pd.DataFrame:
     """Derive ``wd_daily_{ab,ba,tot}`` from local + external-through components.
 

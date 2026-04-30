@@ -7,6 +7,21 @@ from typing import Any, Dict
 import yaml
 
 
+def get_nested(cfg: Any, path: list[str], default: Any = None) -> Any:
+    """Safely traverse a nested dict by a sequence of keys."""
+    cur = cfg
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def as_path(value: Any) -> Path:
+    """Coerce *value* to a :class:`~pathlib.Path`."""
+    return value if isinstance(value, Path) else Path(str(value))
+
+
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     """Recursive dict merge; values in ``override`` win."""
     out = dict(base)
@@ -178,8 +193,8 @@ def load_config(config_path: str | Path = "config/brno/sim.yaml") -> Dict[str, A
             if k in datasets:
                 datasets[k] = _as_abs_path(datasets[k], project_root)
         # Merge YAML sources on top of built-in CZ dataset defaults.
-        from sim.fetch_datasets import _merge_dataset_sources  # lazy to avoid circular import
-        datasets["sources"] = _merge_dataset_sources(datasets.get("sources"))
+        from sim.datasets.registry import merge_dataset_sources  # lazy to avoid circular import
+        datasets["sources"] = merge_dataset_sources(datasets.get("sources"))
         sources = datasets["sources"]
         if isinstance(sources, dict):
             for _, scfg in sources.items():
@@ -221,3 +236,85 @@ def load_locale(cfg: Dict[str, Any]) -> Dict[str, Any]:
 def get_metric_epsg(cfg: Dict[str, Any]) -> int:
     """Return the metric CRS EPSG code from config (``crs_epsg`` key)."""
     return int(cfg.get("crs_epsg", 5514))
+
+
+def load_zones(cfg: Dict[str, Any], *, normalize_columns: bool = True):
+    """Load ``zones.geojson`` from zoning output dir.
+
+    When *normalize_columns* is ``True`` (default), ensures ``name``,
+    ``is_external`` and ``gateway_name`` columns exist with safe types —
+    as required by demand building.  Set to ``False`` when only geometry
+    and ``zone_id`` are needed (e.g. trip distribution).
+    """
+    import geopandas as gpd
+    import pandas as pd
+
+    zoning_dir = get_nested(cfg, ["zoning", "output_dir"], "outputs/baseline/zones")
+    zones_path = Path(zoning_dir) / "zones.geojson"
+
+    if not zones_path.exists():
+        raise FileNotFoundError(f"zones.geojson not found: {zones_path}. Run build-zones first.")
+
+    gdf = gpd.read_file(zones_path)
+    if "zone_id" not in gdf.columns:
+        raise RuntimeError(f"zones.geojson missing 'zone_id': {zones_path}")
+
+    gdf["zone_id"] = pd.to_numeric(gdf["zone_id"], errors="coerce").astype("Int64")
+    gdf = gdf.dropna(subset=["zone_id"]).copy()
+    gdf["zone_id"] = gdf["zone_id"].astype(int)
+
+    if normalize_columns:
+        if "name" not in gdf.columns:
+            gdf["name"] = ""
+        gdf["name"] = gdf["name"].astype(str)
+
+        if "is_external" not in gdf.columns:
+            gdf["is_external"] = 0
+        gdf["is_external"] = pd.to_numeric(gdf["is_external"], errors="coerce").fillna(0).astype(int)
+
+        if "gateway_name" not in gdf.columns:
+            gdf["gateway_name"] = ""
+        gdf["gateway_name"] = gdf["gateway_name"].fillna("").astype(str)
+
+    return gdf
+
+
+def pairwise_euclidean(
+    zones_gdf,
+    zone_ids,
+    metric_epsg: int = 5514,
+):
+    """Pairwise Euclidean distance matrix between zone representative points.
+
+    Reprojects to *metric_epsg* when needed.  Returns an (n, n) float64 array
+    with distances in the CRS units (metres for most metric projections).
+    """
+    import numpy as np
+
+    gdf = zones_gdf
+    if gdf.crs is not None and gdf.crs.to_epsg() != metric_epsg:
+        gdf = gdf.to_crs(epsg=metric_epsg)
+
+    z2i = {int(z): i for i, z in enumerate(zone_ids)}
+    n = len(zone_ids)
+    coords = np.zeros((n, 2), dtype=np.float64)
+    for _, row in gdf.iterrows():
+        zid = int(row["zone_id"])
+        if zid in z2i:
+            pt = row.geometry.representative_point()
+            coords[z2i[zid]] = [pt.x, pt.y]
+
+    dx = coords[:, 0][:, None] - coords[:, 0][None, :]
+    dy = coords[:, 1][:, None] - coords[:, 1][None, :]
+    return np.sqrt(dx ** 2 + dy ** 2)
+
+
+def load_zone_population(cache_dir: Path) -> Dict[int, int]:
+    """Load zone population from parquet as ``{zone_id: population}``."""
+    import pandas as pd
+
+    pop_path = cache_dir / "zone_population.parquet"
+    if not pop_path.exists():
+        return {}
+    pop_df = pd.read_parquet(pop_path)
+    return dict(zip(pop_df["zone_id"].astype(int), pop_df["population"].astype(int)))

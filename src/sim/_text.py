@@ -1,9 +1,10 @@
 """Shared text normalization helpers used across the simulation pipeline."""
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
-from typing import Any
+from typing import Any, Optional
 
 
 def strip_diacritics(text: Any) -> str:
@@ -12,6 +13,19 @@ def strip_diacritics(text: Any) -> str:
         ch for ch in unicodedata.normalize("NFKD", str(text))
         if not unicodedata.combining(ch)
     )
+
+
+def clean_text(value: Any) -> Optional[str]:
+    """Coerce *value* to a stripped string; return ``None`` for empty/NaN."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, float) and math.isnan(value):
+            return None
+    except Exception:
+        pass
+    text = str(value).strip()
+    return text or None
 
 
 def norm_name(value: Any, *, keep_slash: bool = False) -> str:
@@ -30,6 +44,21 @@ def norm_name(value: Any, *, keep_slash: bool = False) -> str:
     pattern = r"[^\w\s\-/]" if keep_slash else r"[^\w\s\-]"
     text = re.sub(pattern, " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_name_upper(value: Any) -> str:
+    """Strip diacritics, upper-case, remove all whitespace and punctuation.
+
+    Used for fuzzy corridor-name matching in network enrichment.
+    """
+    text = clean_text(value)
+    if not text:
+        return ""
+    text = strip_diacritics(text).upper().strip()
+    text = re.sub(r"\s+", "", text)
+    for ch in ("-", "/", "\\"):
+        text = text.replace(ch, "")
+    return text
 
 
 def norm_col(name: Any) -> str:

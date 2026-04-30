@@ -1,0 +1,45 @@
+project_path: "project/olomouc_aeq"
+
+osm:
+  place_name: "Olomouc, Czechia"
+  # buffer_km: 2  # optional: km buffer around geocoded place (default 0). Omit or use 0 for full-place import.
+
+zoning:
+  sources:
+    - type: osm
+      place: "Okres Olomouc, Czechia"
+      admin_level: "9"
+  external_gateways:
+    enabled: true
+    whitelist: []
+
+demand:
+  segments:
+    external_local:
+      total_daily_trips: "auto"
+
+calibration:
+  count_source: "csd_split"
+  auto_screenlines:
+    enabled: true
+    gateway_screenlines: true
+
+datasets:
+  enabled: true
+  sources:
+    commuting_sldb2021:
+      filter:
+        enabled: true
+        origin:
+          keep_if_any_matches:
+            - field: "op_okres"
+              values: ["Olomouc"]
+            - field: "op_orp"
+              values: ["Olomouc"]
+        destination:
+          keep_all: true
+    calibration_brno_pentlogram_2024:
+      enabled: false
+    validation_csd2025_v2:
+      usage:
+        area_filter: { enabled: true, region_hint: "Olomoucký kraj" }

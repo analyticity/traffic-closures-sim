@@ -1,0 +1,5 @@
+# Screenlines for Olomouc.
+# Auto-generated from gateways + CSD when calibration.auto_screenlines.enabled
+# is true. Add manual overrides below as needed.
+
+screenlines: []

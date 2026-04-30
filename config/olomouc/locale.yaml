@@ -1,0 +1,5 @@
+# Locale for Olomouc.
+# National defaults (holidays, road_classification, reference_speeds)
+# are built into the code.
+
+municipal_parts_to_cadastral: {}

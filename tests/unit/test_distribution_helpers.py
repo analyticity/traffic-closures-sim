@@ -9,11 +9,11 @@ from shapely.geometry import Point
 
 from sim.distribution import (
     _euclidean_impedance,
-    _get_nested,
     build_pa_vectors,
     calibrate_gravity_simple,
     run_ipf,
 )
+from sim.io_project import get_nested as _get_nested
 
 
 # ---------------------------------------------------------------------------

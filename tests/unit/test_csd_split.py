@@ -499,7 +499,7 @@ class TestCsdCompatibleLinkTypes:
 
 class TestNormalizeCsdCountColumns:
     def test_maps_total_s_and_light_l(self):
-        from sim.fetch_datasets import normalize_csd_count_columns
+        from sim.datasets.csd import normalize_csd_count_columns
 
         df = pd.DataFrame({
             "sil": ["4-0131", "4-0132"],
@@ -516,7 +516,7 @@ class TestNormalizeCsdCountColumns:
         assert out["tv"].tolist()[1] == pytest.approx(3500.0)
 
     def test_preserves_official_sv_o_tv(self):
-        from sim.fetch_datasets import normalize_csd_count_columns
+        from sim.datasets.csd import normalize_csd_count_columns
 
         df = pd.DataFrame({"sil": ["13"], "sv": [12000.0], "o": [9000.0], "tv": [3000.0]})
         out = normalize_csd_count_columns(df)

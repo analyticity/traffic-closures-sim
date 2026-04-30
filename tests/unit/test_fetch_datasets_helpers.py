@@ -1,4 +1,4 @@
-"""Unit tests for helpers in sim.fetch_datasets."""
+"""Unit tests for helpers in sim.datasets."""
 from __future__ import annotations
 
 from collections import Counter

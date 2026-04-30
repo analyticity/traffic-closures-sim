@@ -8,17 +8,17 @@ import numpy as np
 import pytest
 from shapely.geometry import LineString, MultiLineString
 
-from sim.supernetwork import (
+from sim.supernetwork.graph import (
     _edge_speed_kmh,
     _highway_default_speed_kmh,
     _iter_lines,
     _meters_to_seconds,
-    _norm_obec_code,
     _parse_numeric,
     add_or_relax_edge,
     contract_graph,
     is_contractible,
 )
+from sim.supernetwork.inputs import _norm_obec_code
 
 
 # ---------------------------------------------------------------------------

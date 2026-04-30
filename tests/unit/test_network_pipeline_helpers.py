@@ -1,4 +1,4 @@
-"""Unit tests for deterministic helpers in sim.network_pipeline.
+"""Unit tests for deterministic helpers in the sim.network package.
 
 These tests cover pure-function logic that does not require AequilibraE,
 OSM downloads, or any network access.
@@ -14,17 +14,18 @@ import pandas as pd
 import pytest
 from shapely.geometry import LineString, Point, box
 
-from sim.network_pipeline import (
-    _aggregate_osm_edge_attributes,
-    _buffer_polygon_km,
-    _choose_best,
-    _clean_text,
-    _compute_urban_trim_bbox,
-    _extract_osm_ids,
-    _guess_crs_from_coords,
-    _listify,
-    _normalize_name,
-    _normalize_ref,
+from sim._text import clean_text as _clean_text, normalize_name_upper as _normalize_name
+from sim.network.crs import (
+    compute_urban_trim_bbox as _compute_urban_trim_bbox,
+    guess_crs_from_coords as _guess_crs_from_coords,
+)
+from sim.network.osm_enrichment import (
+    aggregate_osm_edge_attributes as _aggregate_osm_edge_attributes,
+    buffer_polygon_km as _buffer_polygon_km,
+    choose_best as _choose_best,
+    extract_osm_ids as _extract_osm_ids,
+    listify as _listify,
+    normalize_ref as _normalize_ref,
 )
 
 

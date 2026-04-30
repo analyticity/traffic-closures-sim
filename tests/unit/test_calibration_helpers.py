@@ -413,7 +413,7 @@ class TestScreenlineFactorsConfig:
 class TestBuildScreenlineGatewayMap:
     def test_auto_gw_screenlines(self):
         from sim.calibration import _build_screenline_gateway_map
-        from sim.screenlines import ScreenlineDef
+        from sim.calibration.screenlines import ScreenlineDef
 
         sls = [
             ScreenlineDef(name="auto_gw_D35_N"),
@@ -429,7 +429,7 @@ class TestBuildScreenlineGatewayMap:
 
     def test_legacy_fallback(self):
         from sim.calibration import _build_screenline_gateway_map
-        from sim.screenlines import ScreenlineDef
+        from sim.calibration.screenlines import ScreenlineDef
 
         sls = [ScreenlineDef(name="D1_west")]
         mapping = _build_screenline_gateway_map(sls, set())
@@ -437,7 +437,7 @@ class TestBuildScreenlineGatewayMap:
 
     def test_auto_overrides_legacy(self):
         from sim.calibration import _build_screenline_gateway_map
-        from sim.screenlines import ScreenlineDef
+        from sim.calibration.screenlines import ScreenlineDef
 
         sls = [
             ScreenlineDef(name="auto_gw_D1_NW"),
@@ -449,7 +449,7 @@ class TestBuildScreenlineGatewayMap:
 
     def test_no_gw_names_accepts_any(self):
         from sim.calibration import _build_screenline_gateway_map
-        from sim.screenlines import ScreenlineDef
+        from sim.calibration.screenlines import ScreenlineDef
 
         sls = [ScreenlineDef(name="auto_gw_ANYTHING")]
         mapping = _build_screenline_gateway_map(sls)

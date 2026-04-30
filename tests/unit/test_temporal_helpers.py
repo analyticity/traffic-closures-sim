@@ -5,7 +5,7 @@ from datetime import date
 
 import pytest
 
-from sim.temporal import (
+from sim.demand.temporal import (
     _classify_csd_road,
     classify_day,
     get_combined_factor,

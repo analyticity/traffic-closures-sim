@@ -336,7 +336,7 @@ def get_links(
     # Apply temporal scaling if date is provided
     if date and "wd_daily_tot" in gdf.columns:
         try:
-            from sim.temporal import load_profile, get_combined_factor
+            from sim.demand.temporal import load_profile, get_combined_factor
             profile = load_profile(_cfg)
             factor = get_combined_factor(date, period, profile)
             for col in ("wd_daily_tot", "wd_daily_ab", "wd_daily_ba"):
@@ -424,7 +424,7 @@ def temporal_profile():
 @app.get("/api/temporal/day-info")
 def temporal_day_info(date: str = Query(..., description="Date YYYY-MM-DD")):
     try:
-        from sim.temporal import load_profile, day_info
+        from sim.demand.temporal import load_profile, day_info
         profile = load_profile(_cfg)
         return JSONResponse(day_info(date, profile))
     except FileNotFoundError as e:
@@ -502,7 +502,7 @@ def scenario_status(scenario_id: str):
 @app.get("/api/scenarios/{scenario_id}/results")
 def scenario_results(scenario_id: str):
     from sim.scenarios import get_job
-    from sim.scenario_state import JobStatus
+    from sim.scenarios.state import JobStatus
 
     job = get_job(scenario_id)
     if job is None:
@@ -521,7 +521,7 @@ def scenario_results(scenario_id: str):
 def scenario_delta_summary(scenario_id: str):
     """Lightweight summary of delta (difference) between scenario and baseline."""
     from sim.scenarios import get_job
-    from sim.scenario_state import JobStatus
+    from sim.scenarios.state import JobStatus
 
     job = get_job(scenario_id)
     if job is None:
@@ -583,7 +583,7 @@ class ClosureScenarioRequest(BaseModel):
 @app.get("/api/closures")
 def get_closures(date: str = Query(..., description="ISO date YYYY-MM-DD")):
     """Return closures active on a given date, matched to network links."""
-    from sim.closure_scenarios import closures_geojson_for_date
+    from sim.scenarios.closures import closures_geojson_for_date
 
     try:
         link_gdf = _get_links()
@@ -600,7 +600,7 @@ def run_closure_scenario(req: ClosureScenarioRequest):
     Calls the standard scenario pipeline (full equilibrium assignment) so
     the resulting link volumes are valid.
     """
-    from sim.closure_scenarios import closures_for_date
+    from sim.scenarios.closures import closures_for_date
     from sim.scenarios import submit_scenario
 
     try:
@@ -654,6 +654,41 @@ def _diag_falsy(s: pd.Series) -> pd.Series:
     return ~s.astype(str).str.lower().isin(("true", "1", "yes", "t"))
 
 
+def _classify_station_status(row: pd.Series) -> str:
+    """Return 'usable', 'excluded', or 'unmatched' for a diagnostics row."""
+    if "_matched" in row.index:
+        matched = row["_matched"]
+        if isinstance(matched, (bool, np.bool_)):
+            is_matched = bool(matched)
+        elif pd.isna(matched):
+            is_matched = False
+        else:
+            is_matched = str(matched).lower() in ("true", "1", "yes", "t")
+        if not is_matched:
+            return "unmatched"
+    if "_excluded" in row.index:
+        excluded = row["_excluded"]
+        if isinstance(excluded, (bool, np.bool_)):
+            is_excluded = bool(excluded)
+        elif pd.isna(excluded):
+            is_excluded = False
+        else:
+            is_excluded = str(excluded).lower() in ("true", "1", "yes", "t")
+        if is_excluded:
+            return "excluded"
+    return "usable"
+
+
+def _station_status_column(df: pd.DataFrame) -> pd.Series:
+    """Vectorised version of _classify_station_status."""
+    status = pd.Series("usable", index=df.index)
+    if "_matched" in df.columns:
+        status[~_diag_truthy(df["_matched"])] = "unmatched"
+    if "_excluded" in df.columns:
+        status[(status == "usable") & _diag_truthy(df["_excluded"])] = "excluded"
+    return status
+
+
 def _filter_matching_diag_bias(df: pd.DataFrame) -> pd.DataFrame:
     """Rows with matched link + observed + modeled corridor volume.
 
@@ -674,17 +709,107 @@ def _filter_matching_diag_bias(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _bias_all_stations(raw_df: pd.DataFrame) -> JSONResponse:
+    """Return *all* count stations with a ``status`` field (usable/excluded/unmatched)."""
+    df = raw_df.copy()
+    df["_status"] = _station_status_column(df)
+
+    links = _get_links()
+    link_geom = links[["link_id", "geometry"]].drop_duplicates("link_id")
+    link_geom_map = dict(zip(link_geom["link_id"], link_geom["geometry"]))
+
+    has_coords = "_count_lat" in df.columns and "_count_lng" in df.columns
+    features = []
+
+    for _, row in df.iterrows():
+        status = str(row["_status"])
+        lid = row.get("link_id")
+        has_lid = lid is not None and not pd.isna(lid)
+
+        # Determine point coordinates: prefer link midpoint, fall back to count coords.
+        lng, lat = None, None
+        if has_lid:
+            lid_int = int(lid)
+            geom = link_geom_map.get(lid_int)
+            if geom is not None and not geom.is_empty:
+                midpoint = geom.interpolate(0.5, normalized=True)
+                lng, lat = midpoint.x, midpoint.y
+
+        if lng is None and has_coords:
+            _lat = row.get("_count_lat")
+            _lng = row.get("_count_lng")
+            if _lat is not None and not pd.isna(_lat) and _lng is not None and not pd.isna(_lng):
+                lng, lat = float(_lng), float(_lat)
+
+        if lng is None:
+            continue
+
+        observed = float(row.get("observed_car", 0) or 0)
+        mod_val = row.get("_corridor_volume", None)
+        modeled = float(mod_val) if mod_val is not None and not pd.isna(mod_val) else 0.0
+        ratio = modeled / observed if observed > 0 else 0.0
+        error = modeled - observed
+
+        name_val = row.get("name", "")
+        if pd.isna(name_val):
+            name_val = ""
+        lt_val = row.get("link_type", "")
+        if pd.isna(lt_val):
+            lt_val = ""
+        geh_val = row.get("GEH", 0)
+        if pd.isna(geh_val):
+            geh_val = 0.0
+        cn_val = row.get("_corridor_n_links", 1)
+        if pd.isna(cn_val):
+            cn_val = 1
+
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [lng, lat]},
+            "properties": {
+                "link_id": int(lid) if has_lid else None,
+                "name": str(name_val),
+                "link_type": str(lt_val),
+                "observed": round(observed),
+                "modeled": round(modeled),
+                "ratio": round(ratio, 3),
+                "error": round(error),
+                "geh": round(float(geh_val), 1),
+                "corridor_n_links": int(cn_val),
+                "status": status,
+            },
+        })
+
+    summary = {"usable": 0, "excluded": 0, "unmatched": 0}
+    for f in features:
+        s = f["properties"]["status"]
+        if s in summary:
+            summary[s] += 1
+
+    return JSONResponse({
+        "type": "FeatureCollection",
+        "features": features,
+        "summary": summary,
+    })
+
+
 @app.get("/api/diagnostics/bias")
 def diagnostics_bias(
     cluster: bool = Query(False, description="Aggregate nearby stations into spatial clusters"),
     eps: float = Query(100.0, description="Cluster radius in metres (DBSCAN eps)"),
+    show_all: bool = Query(False, description="Include excluded and unmatched stations"),
 ):
     """Count-station bias map: observed vs modeled at each pentlogram station."""
     diag_path = _out("demand") / "matching_diagnostics.csv"
     if not diag_path.exists():
         raise HTTPException(404, "matching_diagnostics.csv not found. Run calibrate first.")
 
-    df = _filter_matching_diag_bias(pd.read_csv(diag_path))
+    raw_df = pd.read_csv(diag_path)
+
+    if show_all and not cluster:
+        return _bias_all_stations(raw_df)
+
+    df = _filter_matching_diag_bias(raw_df)
     if df.empty:
         return JSONResponse({
             "type": "FeatureCollection",
@@ -734,6 +859,7 @@ def diagnostics_bias(
                     "error": round(error),
                     "geh": round(float(geh_val), 1),
                     "corridor_n_links": int(row.get("_corridor_n_links", 1)),
+                    "status": "usable",
                 },
             })
 
@@ -744,7 +870,7 @@ def diagnostics_bias(
 
     # --- Clustered mode ---
     from sklearn.cluster import DBSCAN
-    from sim.calibration import compute_geh as _geh
+    from sim._metrics import compute_geh as _geh
 
     merged_gdf = gpd.GeoDataFrame(merged, geometry="geometry", crs=links.crs)
     epsg = get_metric_epsg(_cfg)
@@ -881,7 +1007,7 @@ def diagnostics_through_traffic():
             gw_gdf = gw_gdf.to_crs(epsg=4326)
         gateways_geojson = json.loads(gw_gdf[["gateway_name", "graph_node", "geometry"]].to_json())
 
-    from sim.screenlines import load_screenlines, resolve_screenline_links
+    from sim.calibration.screenlines import load_screenlines, resolve_screenline_links
 
     _config_dir = _cfg.get("_meta", {}).get("base_dir", "")
     _default_sl = str(Path(_config_dir) / "screenlines.yaml") if _config_dir else "config/brno/screenlines.yaml"
@@ -941,7 +1067,7 @@ def diagnostics_corridors():
         merged.loc[unnamed, "name"] = lt.astype(str) + " " + ref.astype(str)
     merged = merged[merged["name"].str.strip() != ""]
 
-    from sim.calibration import compute_geh as _geh
+    from sim._metrics import compute_geh as _geh
     from shapely.geometry import mapping
 
     corridors = []

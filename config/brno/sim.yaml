@@ -20,9 +20,13 @@ zoning:
     whitelist: ["D1", "D2", "I/43", "I/50", "I/52", "I/23", "I/385", "384", "602"]
 
 demand:
+  sldb:
+    external_processing:
+      through_traffic_scale: 0.70
+      external_commuting_scale: 0.75
   segments:
     external_local:
-      total_daily_trips: 35000
+      total_daily_trips: 45000
       corridor_weights:
         D1_NW: 2.0
         D1_E: 1.8

@@ -14,8 +14,8 @@ Workflow:
   8) assign-warm-skims  – optional short assign; always saves skims.aem for distribute
   9) distribute         – gravity + IPF (see skim vs Euclidean below)
  10) assign              – full traffic assignment (AoN / equilibrium)
- 11) calibrate           – legacy iterative: assign → compare counts → scale OD
- 12) calibrate-odme      – Spiess gradient ODME (preferred)
+ 11) calibrate           – Spiess gradient ODME (default); set calibration.method for others
+ 12) calibrate-odme      – explicit alias for Spiess ODME
  13) tune-supply         – optional outer loop on supply parameters
  14) validate            – match diagnostics + independent validation (CSD)
  15) learn-profile       – day-type factors from CSD
@@ -39,12 +39,12 @@ sys.dont_write_bytecode = True
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from sim.telemetry import setup_logging
+from sim.calibration.telemetry import setup_logging
 from sim.io_project import load_config, resolve_project_database_path
-from sim.network_pipeline import build_network_from_osm
-from sim.network_normalization import normalize_and_export_network, strip_closures
+from sim.network import build_network_from_osm
+from sim.network import normalize_and_export_network, strip_closures
 from sim.zoning import build_zones_and_connectors
-from sim.fetch_datasets import resolved_csd2025_validation_parquet_path, run_fetch_datasets
+from sim.datasets import resolved_csd2025_validation_parquet_path, run_fetch_datasets
 from sim.demand import assert_build_demand_prerequisites, load_or_build_od_matrix
 from sim.assignment import run_assignment, run_warm_skim_assignment
 from sim.calibration import (
@@ -55,7 +55,7 @@ from sim.calibration import (
     run_validation_only,
     run_match_diagnostics,
 )
-from sim.temporal import run_learn_profile
+from sim.demand.temporal import run_learn_profile
 from sim.supernetwork import run_build_supernetwork
 
 STEPS = [
@@ -72,23 +72,13 @@ STEPS = [
     "distribute",
     "assign",
     "calibrate",
-    "calibrate-odme",  # alias: calibrate --method odme
+    "calibrate-odme",  # explicit alias; calibrate also defaults to ODME
     "tune-supply",
     "validate",
     "learn-profile",
     "strip-closures",
     "serve",
 ]
-
-
-def _require_paths(cfg: dict, step: str, rel_paths: list[str]) -> None:
-    root = Path(cfg["_meta"]["project_root"])
-    missing = [rp for rp in rel_paths if not (root / rp).exists()]
-    if missing:
-        raise FileNotFoundError(
-            f"{step}: missing required inputs: {missing}. "
-            f"Run prerequisite steps first."
-        )
 
 
 def _require_abs_paths(cfg: dict, step: str, paths: list[Path]) -> None:
@@ -199,11 +189,13 @@ def main() -> None:
     elif step == "fetch-data":
         run_fetch_datasets(config_path=cfg)
     elif step == "build-demand":
-        assert_build_demand_prerequisites(load_config(cfg))
-        load_or_build_od_matrix(cfg)
+        _cfg = load_config(cfg)
+        assert_build_demand_prerequisites(_cfg)
+        load_or_build_od_matrix(cfg, cfg=_cfg)
     elif step == "assign-warm-skims":
-        _require_assign_inputs(load_config(cfg), step)
-        run_warm_skim_assignment(cfg)
+        _cfg = load_config(cfg)
+        _require_assign_inputs(_cfg, step)
+        run_warm_skim_assignment(cfg, cfg=_cfg)
     elif step == "distribute":
         from sim.distribution import run_distribution
         run_distribution(cfg)
@@ -216,15 +208,16 @@ def main() -> None:
         ])
         run_build_supernetwork(cfg)
     elif step == "assign":
-        _require_assign_inputs(load_config(cfg), step)
-        run_assignment(cfg)
+        _cfg = load_config(cfg)
+        _require_assign_inputs(_cfg, step)
+        run_assignment(cfg, cfg=_cfg)
     elif step in ("calibrate", "calibrate-odme"):
         _c = load_config(cfg)
         _require_abs_paths(_c, step, [
             Path(_c["demand"]["matrix_path"]),
             resolve_project_database_path(_c),
         ])
-        method = (_c.get("calibration") or {}).get("method", "fsm")
+        method = (_c.get("calibration") or {}).get("method", "odme")
         if step == "calibrate-odme" or method == "odme":
             run_odme_calibration(cfg)
         elif method == "entropy_odme":

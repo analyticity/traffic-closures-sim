@@ -11,6 +11,7 @@ from shapely.geometry import Point
 
 from sim.demand import (
     _build_zone_name_index,
+    _estimate_total_daily_trips_from_csd,
     _match_zone_id,
     _normalize_named_weights,
     _normalize_period_shares,
@@ -168,3 +169,73 @@ class TestZoneNameMatching:
         gdf = self._zones_gdf()
         primary, stripped = _build_zone_name_index(gdf)
         assert _match_zone_id("", primary, stripped) is None
+
+
+# ---------------------------------------------------------------------------
+# _estimate_total_daily_trips_from_csd
+# ---------------------------------------------------------------------------
+class TestEstimateTotalDailyTripsFromCsd:
+    def test_missing_diag_file(self, tmp_path):
+        result = _estimate_total_daily_trips_from_csd({}, tmp_path / "no_such.csv")
+        assert result is None
+
+    def test_basic_estimation(self, tmp_path, monkeypatch):
+        diag = pd.DataFrame({
+            "gateway_name": ["D1_NW", "52_S"],
+            "whitelist_token": ["D1", "52"],
+            "matched_ref": ["D1", "52"],
+        })
+        diag_path = tmp_path / "gateway_diagnostics.csv"
+        diag.to_csv(diag_path, index=False)
+
+        csd = pd.DataFrame({
+            "sil": ["D1", "D1", "D1", "52", "52"],
+            "sv": [30000, 28000, 32000, 10000, 12000],
+        })
+
+        import sim.calibration as _cal_mod
+        monkeypatch.setattr(_cal_mod, "load_csd", lambda cfg, **kw: csd)
+
+        result = _estimate_total_daily_trips_from_csd({}, diag_path)
+        assert result is not None
+        assert result > 0
+        expected = 30000.0 + 11000.0
+        assert result == pytest.approx(expected, rel=0.01)
+
+    def test_no_csd_match(self, tmp_path, monkeypatch):
+        diag = pd.DataFrame({
+            "gateway_name": ["D99_N"],
+            "whitelist_token": ["D99"],
+            "matched_ref": ["D99"],
+        })
+        diag_path = tmp_path / "gateway_diagnostics.csv"
+        diag.to_csv(diag_path, index=False)
+
+        csd = pd.DataFrame({"sil": ["D1", "52"], "sv": [30000, 10000]})
+
+        import sim.calibration as _cal_mod
+        monkeypatch.setattr(_cal_mod, "load_csd", lambda cfg, **kw: csd)
+
+        result = _estimate_total_daily_trips_from_csd({}, diag_path)
+        assert result is None
+
+    def test_partial_coverage_scales_up(self, tmp_path, monkeypatch):
+        diag = pd.DataFrame({
+            "gateway_name": ["D1_NW", "52_S", "384_E"],
+            "whitelist_token": ["D1", "52", "384"],
+            "matched_ref": ["D1", "52", "384"],
+        })
+        diag_path = tmp_path / "gateway_diagnostics.csv"
+        diag.to_csv(diag_path, index=False)
+
+        csd = pd.DataFrame({
+            "sil": ["D1", "52"],
+            "sv": [30000, 10000],
+        })
+
+        import sim.calibration as _cal_mod
+        monkeypatch.setattr(_cal_mod, "load_csd", lambda cfg, **kw: csd)
+
+        result = _estimate_total_daily_trips_from_csd({}, diag_path)
+        assert result is not None
+        assert result > 30000 + 10000

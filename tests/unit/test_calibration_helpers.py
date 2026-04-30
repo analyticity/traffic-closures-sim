@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -14,10 +15,12 @@ from sim.calibration import (
     _check_final_convergence,
     _coarse_road_class,
     _compute_count_weights,
+    _entropy_update_step,
     _odme_objective,
     _sr_val,
     compute_objective,
     compute_stats,
+    compute_validation_benchmarks,
 )
 
 
@@ -268,3 +271,250 @@ class TestComputeObjective:
         result = compute_objective(stats, {}, jt, weights)
         expected_jt = 1 / 2 * 100 * 1.0
         assert result == pytest.approx(expected_jt)
+
+
+# ---------------------------------------------------------------------------
+# _entropy_update_step
+# ---------------------------------------------------------------------------
+class TestEntropyUpdateStep:
+    @staticmethod
+    def _make_demand_and_sl(n: int = 4):
+        """Helper: 4x4 demand matrix, one screenline OD."""
+        demand = np.ones((n, n), dtype=np.float64) * 100.0
+        np.fill_diagonal(demand, 0.0)
+        sl_od = np.zeros((n, n), dtype=np.float64)
+        sl_od[0, 1] = 60.0
+        sl_od[0, 2] = 40.0
+        return demand, sl_od
+
+    def test_ratio_above_one_increases_demand(self):
+        demand, sl_od = self._make_demand_and_sl()
+        demand_before = demand.copy()
+        sl_matrices = {"SL_test": sl_od}
+        sl_results = {"SL_test": {"observed_total": 200, "modeled_total": 100}}
+        n = _entropy_update_step(demand, sl_matrices, sl_results, step_size=0.5)
+        assert n == 1
+        # Cells using the screenline should increase
+        assert demand[0, 1] > demand_before[0, 1]
+        assert demand[0, 2] > demand_before[0, 2]
+        # Cells not using the screenline stay the same
+        assert demand[2, 3] == pytest.approx(demand_before[2, 3])
+
+    def test_ratio_below_one_decreases_demand(self):
+        demand, sl_od = self._make_demand_and_sl()
+        demand_before = demand.copy()
+        sl_matrices = {"SL_test": sl_od}
+        sl_results = {"SL_test": {"observed_total": 50, "modeled_total": 100}}
+        _entropy_update_step(demand, sl_matrices, sl_results, step_size=0.5)
+        assert demand[0, 1] < demand_before[0, 1]
+
+    def test_extreme_ratio_skipped(self):
+        demand, sl_od = self._make_demand_and_sl()
+        demand_before = demand.copy()
+        sl_matrices = {"SL_test": sl_od}
+        sl_results = {"SL_test": {"observed_total": 1000, "modeled_total": 10}}
+        n = _entropy_update_step(demand, sl_matrices, sl_results, step_size=0.5, ratio_max=5.0)
+        assert n == 0
+        np.testing.assert_array_equal(demand, demand_before)
+
+    def test_zero_obs_skipped(self):
+        demand, sl_od = self._make_demand_and_sl()
+        demand_before = demand.copy()
+        sl_matrices = {"SL_test": sl_od}
+        sl_results = {"SL_test": {"observed_total": 0, "modeled_total": 100}}
+        n = _entropy_update_step(demand, sl_matrices, sl_results)
+        assert n == 0
+        np.testing.assert_array_equal(demand, demand_before)
+
+    def test_step_size_zero_no_change(self):
+        demand, sl_od = self._make_demand_and_sl()
+        demand_before = demand.copy()
+        sl_matrices = {"SL_test": sl_od}
+        sl_results = {"SL_test": {"observed_total": 200, "modeled_total": 100}}
+        _entropy_update_step(demand, sl_matrices, sl_results, step_size=0.0)
+        np.testing.assert_array_almost_equal(demand, demand_before)
+
+    def test_adjustment_clipped(self):
+        demand, sl_od = self._make_demand_and_sl()
+        sl_matrices = {"SL_test": sl_od}
+        sl_results = {"SL_test": {"observed_total": 400, "modeled_total": 100}}
+        _entropy_update_step(
+            demand, sl_matrices, sl_results,
+            step_size=1.0, clip_min=0.8, clip_max=1.2,
+        )
+        # Even with large step size, clipping prevents extreme changes
+        assert demand.max() <= 120.1  # 100 * 1.2 + tolerance
+
+
+# ---------------------------------------------------------------------------
+# compute_validation_benchmarks — config-driven thresholds
+# ---------------------------------------------------------------------------
+class TestValidationBenchmarksConfigDriven:
+    def test_default_geh_threshold_85(self):
+        stats = {"geh_lt5_pct": 86.0}
+        result = compute_validation_benchmarks(stats, {}, [])
+        assert result["geh_benchmark_pass_hourly"] is True
+
+    def test_custom_geh_threshold_90(self):
+        stats = {"geh_lt5_pct": 86.0}
+        result = compute_validation_benchmarks(
+            stats, {}, [], benchmarks={"geh_lt5_pass_pct": 90.0},
+        )
+        assert result["geh_benchmark_pass_hourly"] is False
+
+    def test_default_jt_threshold_85(self):
+        jt = [{"pass": True}] * 84 + [{"pass": False}] * 16
+        stats = {"geh_lt5_pct": 90.0}
+        result = compute_validation_benchmarks(stats, {}, jt)
+        assert result["jt_benchmark_pass"] is False
+
+    def test_custom_jt_threshold_80(self):
+        jt = [{"pass": True}] * 84 + [{"pass": False}] * 16
+        stats = {"geh_lt5_pct": 90.0}
+        result = compute_validation_benchmarks(
+            stats, {}, jt, benchmarks={"jt_pass_pct": 80.0},
+        )
+        assert result["jt_benchmark_pass"] is True
+
+
+# ---------------------------------------------------------------------------
+# Screenline factors config wiring (smoke test)
+# ---------------------------------------------------------------------------
+class TestScreenlineFactorsConfig:
+    """Verify that _CalibrationContext reads screenline_factors from config."""
+
+    def test_defaults_match_sim_defaults(self):
+        from sim.defaults import SIM_DEFAULTS
+        sf = SIM_DEFAULTS["calibration"]["screenline_factors"]
+        assert sf["ratio_max"] == 5.0
+        assert sf["ratio_min"] == 0.2
+        assert sf["clip_min"] == 0.5
+        assert sf["clip_max"] == 2.0
+        assert sf["global_min"] == 0.70
+        assert sf["global_max"] == 1.50
+
+    def test_gateway_defaults_match_sim_defaults(self):
+        from sim.defaults import SIM_DEFAULTS
+        gw = SIM_DEFAULTS["calibration"]["gateway_calibration"]
+        assert gw["damping"] == 0.30
+        assert gw["min_factor"] == 0.50
+        assert gw["max_factor"] == 2.00
+
+    def test_auto_screenlines_defaults(self):
+        from sim.defaults import SIM_DEFAULTS
+        asl = SIM_DEFAULTS["calibration"]["auto_screenlines"]
+        assert asl["gateway_screenlines"] is True
+        assert asl["csd_screenlines"] is True
+
+
+# ---------------------------------------------------------------------------
+# Dynamic screenline-gateway mapping
+# ---------------------------------------------------------------------------
+class TestBuildScreenlineGatewayMap:
+    def test_auto_gw_screenlines(self):
+        from sim.calibration import _build_screenline_gateway_map
+        from sim.screenlines import ScreenlineDef
+
+        sls = [
+            ScreenlineDef(name="auto_gw_D35_N"),
+            ScreenlineDef(name="auto_gw_D46_E"),
+            ScreenlineDef(name="auto_gw_I46_S"),
+        ]
+        gw_names = {"D35_N", "D46_E", "I46_S"}
+        mapping = _build_screenline_gateway_map(sls, gw_names)
+
+        assert mapping["auto_gw_D35_N"] == "D35_N"
+        assert mapping["auto_gw_D46_E"] == "D46_E"
+        assert mapping["auto_gw_I46_S"] == "I46_S"
+
+    def test_legacy_fallback(self):
+        from sim.calibration import _build_screenline_gateway_map
+        from sim.screenlines import ScreenlineDef
+
+        sls = [ScreenlineDef(name="D1_west")]
+        mapping = _build_screenline_gateway_map(sls, set())
+        assert mapping["D1_west"] == "D1_NW"
+
+    def test_auto_overrides_legacy(self):
+        from sim.calibration import _build_screenline_gateway_map
+        from sim.screenlines import ScreenlineDef
+
+        sls = [
+            ScreenlineDef(name="auto_gw_D1_NW"),
+            ScreenlineDef(name="D1_west"),
+        ]
+        mapping = _build_screenline_gateway_map(sls, {"D1_NW"})
+        assert mapping["auto_gw_D1_NW"] == "D1_NW"
+        assert mapping["D1_west"] == "D1_NW"
+
+    def test_no_gw_names_accepts_any(self):
+        from sim.calibration import _build_screenline_gateway_map
+        from sim.screenlines import ScreenlineDef
+
+        sls = [ScreenlineDef(name="auto_gw_ANYTHING")]
+        mapping = _build_screenline_gateway_map(sls)
+        assert mapping["auto_gw_ANYTHING"] == "ANYTHING"
+
+
+# ---------------------------------------------------------------------------
+# Benchmark save/restore
+# ---------------------------------------------------------------------------
+class TestBenchmarkSaveRestore:
+    def test_save_creates_file(self, tmp_path):
+        """save_seed copies the OD matrix to the benchmark directory."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
+
+        # Create a fake matrix file
+        demand_dir = tmp_path / "data" / "brno" / "demand"
+        demand_dir.mkdir(parents=True)
+        matrix_file = demand_dir / "od_matrix.aem"
+        matrix_file.write_bytes(b"fake-aem-content")
+
+        # Create a minimal config
+        import yaml
+        cfg_dir = tmp_path / "config" / "brno"
+        cfg_dir.mkdir(parents=True)
+        cfg_path = cfg_dir / "sim.yaml"
+        cfg_path.write_text(yaml.dump({
+            "project_path": str(tmp_path / "project" / "brno_aeq"),
+            "demand": {
+                "matrix_path": str(matrix_file),
+                "output_dir": str(tmp_path / "outputs" / "brno" / "baseline" / "demand"),
+            },
+        }), encoding="utf-8")
+
+        from calibration_benchmark import save_seed
+        snapshot = save_seed(str(cfg_path))
+        assert Path(snapshot).exists()
+        assert Path(snapshot).read_bytes() == b"fake-aem-content"
+
+    def test_restore_overwrites(self, tmp_path):
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
+
+        demand_dir = tmp_path / "data" / "brno" / "demand"
+        demand_dir.mkdir(parents=True)
+        matrix_file = demand_dir / "od_matrix.aem"
+        matrix_file.write_bytes(b"modified-content")
+
+        snap_file = tmp_path / "snapshot.aem"
+        snap_file.write_bytes(b"original-content")
+
+        import yaml
+        cfg_dir = tmp_path / "config" / "brno"
+        cfg_dir.mkdir(parents=True)
+        cfg_path = cfg_dir / "sim.yaml"
+        cfg_path.write_text(yaml.dump({
+            "project_path": str(tmp_path / "project" / "brno_aeq"),
+            "demand": {
+                "matrix_path": str(matrix_file),
+                "output_dir": str(tmp_path / "outputs" / "brno" / "baseline" / "demand"),
+            },
+        }), encoding="utf-8")
+
+        from calibration_benchmark import restore_seed
+        restore_seed(str(cfg_path), str(snap_file))
+        assert matrix_file.read_bytes() == b"original-content"
+        orig = matrix_file.with_suffix(".aem.orig")
+        assert orig.read_bytes() == b"original-content"

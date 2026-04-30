@@ -79,15 +79,14 @@ config/
 The fastest way is to use the built-in config generator:
 
 ```bash
-# Interactive — answers a few questions (city, district, region, trip estimate):
+# Interactive — answers a few questions (city, district, region):
 python scripts/generate_city_config.py
 
 # Or non-interactive:
 python scripts/generate_city_config.py \
     --city "Olomouc" \
     --okres "Olomouc" \
-    --kraj "Olomoucký kraj" \
-    --trips 20000
+    --kraj "Olomoucký kraj"
 ```
 
 This creates `config/olomouc/sim.yaml`, `locale.yaml`, and `screenlines.yaml`.
@@ -108,7 +107,7 @@ A minimal `sim.yaml` (~40 lines) only contains values unique to that city:
 | `osm.buffer_km` | *(optional)* When using `place_name` without `model_bbox`, buffer the geocoded polygon by this many km for import/trim (default `0` = no extra buffer; e.g. `2` for a 2 km belt) | `2` |
 | `zoning.sources` | Admin boundaries for TAZ zones | `Okres Olomouc, Czechia` |
 | `zoning.external_gateways.whitelist` | Explicit gateway roads (empty = auto-discover) | `[]` |
-| `demand.segments.external_local.total_daily_trips` | Scale of external traffic | `20000` |
+| `demand.segments.external_local.total_daily_trips` | Scale of external traffic (`"auto"` = estimate from CSD data on gateway roads; or explicit number) | `"auto"` |
 | `datasets.enabled` | Turn off all dataset fetching when `false` (omit or `true` to run `fetch-data`) | `true` |
 | `datasets.sources.commuting_sldb2021.filter` | SLDB commuting district filter | `Olomouc` |
 | `datasets.sources.validation_csd2025_v2.usage.area_filter.region_hint` | CSD region | `Olomoucký kraj` |

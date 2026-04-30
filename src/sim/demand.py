@@ -984,6 +984,88 @@ def _build_external_local_seed(
     return od
 
 
+def _estimate_total_daily_trips_from_csd(
+    cfg: Dict[str, Any],
+    gw_diag_path: Path,
+) -> Optional[float]:
+    """Estimate external-local daily trips by summing CSD AADT on gateway roads.
+
+    Reads gateway diagnostics (whitelist_token / matched_ref) and matches
+    them to CSD road numbers (``sil``).  For each gateway corridor, takes
+    the mean CSD ``sv`` (all motor vehicles) of matching sections as a
+    proxy for the corridor volume, then sums across all gateways.
+
+    Returns ``None`` when data is insufficient (missing CSD, no matches).
+    """
+    if not gw_diag_path.exists():
+        return None
+
+    try:
+        gw_diag = pd.read_csv(gw_diag_path)
+    except Exception:
+        return None
+
+    if "whitelist_token" not in gw_diag.columns and "matched_ref" not in gw_diag.columns:
+        return None
+
+    try:
+        from sim.calibration import load_csd
+        csd = load_csd(cfg)
+    except Exception:
+        logger.debug("CSD data unavailable for trip estimation", exc_info=True)
+        return None
+
+    if csd.empty or "sil" not in csd.columns or "sv" not in csd.columns:
+        return None
+
+    csd["sil"] = csd["sil"].astype(str).str.strip().str.upper()
+    csd["sv"] = pd.to_numeric(csd["sv"], errors="coerce").fillna(0)
+
+    def _norm_road(ref: Any) -> str:
+        s = str(ref or "").strip().upper()
+        s = s.replace("/", "").replace(" ", "").replace("\\", "")
+        return s
+
+    gateway_refs: Dict[str, str] = {}
+    for _, row in gw_diag.iterrows():
+        gw_name = str(row.get("gateway_name", ""))
+        token = _norm_road(row.get("whitelist_token") or row.get("matched_ref", ""))
+        if token:
+            gateway_refs[gw_name] = token
+
+    if not gateway_refs:
+        return None
+
+    unique_roads = set(gateway_refs.values())
+    total = 0.0
+    matched_gateways = 0
+
+    for gw_name, road_code in gateway_refs.items():
+        csd_match = csd[csd["sil"] == road_code]
+        if csd_match.empty:
+            csd_match = csd[csd["sil"].str.replace("M", "", regex=False) == road_code.replace("M", "")]
+        if csd_match.empty:
+            continue
+        mean_aadt = float(csd_match["sv"].mean())
+        if mean_aadt > 0:
+            total += mean_aadt
+            matched_gateways += 1
+
+    if matched_gateways == 0:
+        return None
+
+    coverage = matched_gateways / max(len(gateway_refs), 1)
+    if coverage < 1.0 and matched_gateways > 0:
+        total = total / coverage
+
+    logger.info(
+        "Auto-estimated total_daily_trips=%.0f from CSD "
+        "(%d/%d gateways matched, %d unique roads)",
+        total, matched_gateways, len(gateway_refs), len(unique_roads),
+    )
+    return total
+
+
 def _build_external_through_seed(
     zone_ids: np.ndarray,
     gateways: Dict[str, List[Tuple[int, float]]],
@@ -1582,17 +1664,32 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
 
     # --- Residual synthetic external_local (optional) ---
     _el_source = external_local_cfg.get("source", "gateway_local") if external_local_cfg else None
+    zoning_out = Path(cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones"))
+    gw_diag_path = zoning_out / "gateway_diagnostics.csv"
+
+    _el_trips_raw = external_local_cfg.get("total_daily_trips", "auto") if external_local_cfg else 0
+    _el_trips_mode = str(_el_trips_raw).strip().lower()
+
+    if _el_trips_mode == "auto" or _el_trips_raw is None:
+        _el_trips_val = _estimate_total_daily_trips_from_csd(cfg, gw_diag_path)
+        if _el_trips_val is None:
+            logger.warning(
+                "total_daily_trips='auto' but CSD estimation failed; "
+                "falling back to 0 (no external-local seed)"
+            )
+            _el_trips_val = 0.0
+    else:
+        _el_trips_val = float(_el_trips_raw)
+
     if (
         external_local_cfg
         and bool(external_local_cfg.get("enabled", True))
         and _el_source == "gateway_local"
         and gateways
-        and float(external_local_cfg.get("total_daily_trips", 0.0)) > 0
+        and _el_trips_val > 0
     ):
         logger.info("Building residual synthetic external-local trips (gateway ↔ internal)")
         gw_link_types: Optional[Dict[str, str]] = None
-        zoning_out = Path(cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones"))
-        gw_diag_path = zoning_out / "gateway_diagnostics.csv"
         if gw_diag_path.exists():
             _gd = pd.read_csv(gw_diag_path)
             if "gateway_name" in _gd.columns:
@@ -1603,7 +1700,7 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml") ->
             zone_ids,
             gateways,
             zone_population,
-            total_daily_trips=float(external_local_cfg.get("total_daily_trips", 0.0)),
+            total_daily_trips=_el_trips_val,
             corridor_weights=external_local_cfg.get("corridor_weights", {}) or {},
             gateway_link_types=gw_link_types,
         )

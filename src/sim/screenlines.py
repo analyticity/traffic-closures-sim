@@ -457,6 +457,7 @@ def auto_generate_screenlines(
     cfg: Dict[str, Any],
     *,
     csd_df: Optional[pd.DataFrame] = None,
+    csd_df_full: Optional[pd.DataFrame] = None,
 ) -> List[ScreenlineDef]:
     """Generate screenlines automatically from gateway diagnostics and CSD.
 
@@ -466,6 +467,17 @@ def auto_generate_screenlines(
     2. **CSD screenlines** -- for major CSD road sections inside the model
        area (by matching ``sil`` to network ``osm_ref``), above a
        configurable AADT threshold.
+
+    Parameters
+    ----------
+    csd_df : DataFrame, optional
+        Region-filtered CSD data, used for CSD screenlines inside the model.
+    csd_df_full : DataFrame, optional
+        Unfiltered (national) CSD data, used for gateway AADT lookup.
+        Gateway roads may span multiple regions, so using the full CSD
+        prevents gaps like D55 being missing when the model is in CZ071 but
+        D55 only has sections in CZ064/CZ072.  Falls back to *csd_df* if
+        not provided.
 
     Returns a list of :class:`ScreenlineDef` ready for evaluation.
     Manual screenlines from YAML take precedence (caller merges).
@@ -482,26 +494,118 @@ def auto_generate_screenlines(
     result: List[ScreenlineDef] = []
 
     # --- 1) Gateway-based screenlines ---------------------------------------
-    if bool(auto_cfg.get("gateway_screenlines", False)):
+    if bool(auto_cfg.get("gateway_screenlines", True)):
         gw_diag_path = zoning_out / "gateway_diagnostics.csv"
         if gw_diag_path.exists():
             gw_df = pd.read_csv(gw_diag_path)
             transformer = pyproj.Transformer.from_crs(
                 f"EPSG:{crs_epsg}", "EPSG:4326", always_xy=True,
             )
+
+            # Build per-road CSD lookup for gateway AADT.  We use the
+            # unfiltered (national) CSD when available, because gateway
+            # roads can span multiple regions (e.g. D55 is absent from
+            # CZ071 but present in CZ064).
+            csd_mean_by_road: Dict[str, Dict[str, float]] = {}
+            _gw_csd = csd_df_full if csd_df_full is not None else csd_df
+            if _gw_csd is not None and not _gw_csd.empty and "sil" in _gw_csd.columns and "sv" in _gw_csd.columns:
+                _gw_csd = _gw_csd.copy()
+                for col in ("sv", "o"):
+                    if col in _gw_csd.columns:
+                        _gw_csd[col] = pd.to_numeric(_gw_csd[col], errors="coerce").fillna(0)
+
+                for road_sil, grp in _gw_csd.groupby("sil"):
+                    road_raw = str(road_sil).strip().upper().replace(" ", "")
+                    try:
+                        road_key = str(int(road_raw))
+                    except ValueError:
+                        road_key = road_raw.lstrip("0") or road_raw
+
+                    sv_vals = grp["sv"].values
+                    o_vals = grp["o"].values if "o" in grp.columns else sv_vals
+
+                    csd_mean_by_road[road_key] = {
+                        "sv": float(sv_vals.mean()),
+                        "o": float(o_vals.mean()),
+                    }
+
+            # Pre-load network links for anchor-node matching.
+            links_gdf: Optional[gpd.GeoDataFrame] = None
+            network_gpkg = Path(cfg.get("demand", {}).get(
+                "network_dir", "outputs/baseline/network",
+            )) / "network_links.gpkg"
+            network_geojson = network_gpkg.with_suffix(".geojson")
+            for net_path in (network_gpkg, network_geojson):
+                if net_path.exists():
+                    try:
+                        links_gdf = gpd.read_file(net_path)
+                    except Exception:
+                        pass
+                    break
+
             for _, row in gw_df.iterrows():
                 gw_name = str(row.get("gateway_name", ""))
                 if not gw_name:
                     continue
                 bx = row.get("boundary_x")
                 by = row.get("boundary_y")
-                odx = row.get("outward_dx", 0)
-                ody = row.get("outward_dy", 0)
                 if pd.isna(bx) or pd.isna(by):
                     continue
 
+                ref = str(row.get("matched_ref", "")).strip()
+                anchor_raw = row.get("anchor_node_id")
+                target_nodes_raw = str(row.get("target_node_ids", ""))
+
+                # --- resolve explicit links from anchor/target nodes ------
+                explicit_links: List[Tuple[int, int]] = []
+                if links_gdf is not None and target_nodes_raw:
+                    try:
+                        tnodes = {int(float(x.strip()))
+                                  for x in target_nodes_raw.split(",")
+                                  if x.strip()}
+                    except (ValueError, TypeError):
+                        tnodes = set()
+
+                    if tnodes:
+                        for nid in tnodes:
+                            adj = links_gdf[
+                                (links_gdf["a_node"] == nid)
+                                | (links_gdf["b_node"] == nid)
+                            ]
+                            if ref:
+                                ref_lower = ref.lower()
+                                adj = adj[adj["osm_ref_norm"].apply(
+                                    lambda v, rl=ref_lower: (
+                                        rl in str(v).lower().split(";")
+                                        if pd.notna(v) else False
+                                    )
+                                )]
+                            for _, lrow in adj.iterrows():
+                                lid = int(lrow["link_id"])
+                                if lid not in {l[0] for l in explicit_links}:
+                                    explicit_links.append((lid, 0))
+
+                # --- CSD observed AADT ------------------------------------
+                obs_all = 0.0
+                obs_cars = 0.0
+                ref_norm = ""
+                if ref:
+                    ref_norm = ref.upper().replace(" ", "")
+                    try:
+                        ref_norm = str(int(ref_norm))
+                    except ValueError:
+                        ref_norm = ref_norm.lstrip("0") or ref_norm
+
+                    if csd_mean_by_road:
+                        csd_hit = csd_mean_by_road.get(ref_norm)
+                        if csd_hit:
+                            obs_all = csd_hit["sv"]
+                            obs_cars = csd_hit["o"]
+
+                # --- build fallback WKT for resolution when no network ----
+                odx = row.get("outward_dx", 0)
+                ody = row.get("outward_dy", 0)
                 bx, by = float(bx), float(by)
-                # Perpendicular to outward direction, ~200m cut-line
                 perp_dx, perp_dy = -float(ody), float(odx)
                 norm = (perp_dx ** 2 + perp_dy ** 2) ** 0.5
                 if norm < 1e-9:
@@ -509,30 +613,44 @@ def auto_generate_screenlines(
                 else:
                     perp_dx = perp_dx / norm * 200
                     perp_dy = perp_dy / norm * 200
-
                 p1 = transformer.transform(bx - perp_dx, by - perp_dy)
                 p2 = transformer.transform(bx + perp_dx, by + perp_dy)
                 wkt = f"LINESTRING({p1[0]:.6f} {p1[1]:.6f}, {p2[0]:.6f} {p2[1]:.6f})"
 
-                ref = str(row.get("matched_ref", "")).strip()
                 attr_filter: Dict[str, str] = {}
                 if ref:
                     attr_filter["osm_ref_norm"] = ref
 
-                result.append(ScreenlineDef(
-                    name=f"auto_gw_{gw_name}",
-                    description=f"Auto-generated gateway screenline for {gw_name}",
-                    sl_type="radial",
-                    geometry_wkt=wkt,
-                    attr_filter=attr_filter,
-                    expected_links=2,
-                ))
-            logger.info("Auto-generated %d gateway screenlines", len(result))
+                if explicit_links:
+                    result.append(ScreenlineDef(
+                        name=f"auto_gw_{gw_name}",
+                        description=f"Auto-generated gateway screenline for {gw_name}",
+                        sl_type="radial",
+                        links=explicit_links,
+                        has_explicit_links=True,
+                        observed_aadt_all=obs_all if obs_all > 0 else None,
+                        observed_aadt_cars=obs_cars if obs_cars > 0 else None,
+                    ))
+                else:
+                    result.append(ScreenlineDef(
+                        name=f"auto_gw_{gw_name}",
+                        description=f"Auto-generated gateway screenline for {gw_name}",
+                        sl_type="radial",
+                        geometry_wkt=wkt,
+                        attr_filter=attr_filter,
+                        expected_links=2,
+                        observed_aadt_all=obs_all if obs_all > 0 else None,
+                        observed_aadt_cars=obs_cars if obs_cars > 0 else None,
+                    ))
+            n_with_obs = sum(1 for s in result if getattr(s, "observed_aadt_all", None))
+            logger.info(
+                "Auto-generated %d gateway screenlines (%d with CSD observed AADT)",
+                len(result), n_with_obs,
+            )
 
     # --- 2) CSD-based screenlines -------------------------------------------
     csd_min_aadt = float(auto_cfg.get("csd_min_aadt", 5000))
     if csd_df is not None and not csd_df.empty and bool(auto_cfg.get("csd_screenlines", True)):
-        gw_names_generated = {sl.name for sl in result}
         for col in ("sv", "o", "tv"):
             if col in csd_df.columns:
                 csd_df[col] = pd.to_numeric(csd_df[col], errors="coerce").fillna(0)
@@ -574,9 +692,6 @@ def auto_generate_screenlines(
             for _, row in major.iterrows():
                 road = str(row["sil"]).strip()
 
-                # Normalize CSD road id to match osm_ref_norm format:
-                # strip leading zeros from numeric road IDs (CSD uses "00732"
-                # but OSM ref is just "732").
                 road_norm = road.upper().replace(" ", "")
                 try:
                     road_norm = str(int(road_norm))
@@ -584,8 +699,6 @@ def auto_generate_screenlines(
                     road_norm = road_norm.lstrip("0") or road_norm
 
                 name = f"auto_csd_{road_norm}"
-                if name in gw_names_generated:
-                    continue
                 if network_refs and road_norm.lower() not in network_refs:
                     n_skipped_no_network += 1
                     continue
@@ -600,7 +713,7 @@ def auto_generate_screenlines(
             n_csd = len([s for s in result if s.name.startswith("auto_csd_")])
             logger.info(
                 "Auto-generated %d CSD screenlines (min AADT=%d, "
-                "skipped %d roads not in model network)",
+                "skipped %d no-network)",
                 n_csd, int(csd_min_aadt), n_skipped_no_network,
             )
 
@@ -610,11 +723,17 @@ def auto_generate_screenlines(
 def load_screenlines_with_auto(
     cfg: Dict[str, Any],
     csd_df: Optional[pd.DataFrame] = None,
+    csd_df_full: Optional[pd.DataFrame] = None,
 ) -> List[ScreenlineDef]:
     """Load manual screenlines from YAML, then merge auto-generated ones.
 
     Manual definitions take precedence: auto-generated screenlines whose
     name collides with a manual one are dropped.
+
+    Parameters
+    ----------
+    csd_df : region-filtered CSD (for CSD screenlines inside the model)
+    csd_df_full : unfiltered national CSD (for gateway AADT lookup)
     """
     config_dir = cfg.get("_meta", {}).get("base_dir", "")
     default_sl = str(Path(config_dir) / "screenlines.yaml") if config_dir else "config/brno/screenlines.yaml"
@@ -624,7 +743,7 @@ def load_screenlines_with_auto(
     manual = load_screenlines(sl_path)
     manual_names = {sl.name for sl in manual}
 
-    auto = auto_generate_screenlines(cfg, csd_df=csd_df)
+    auto = auto_generate_screenlines(cfg, csd_df=csd_df, csd_df_full=csd_df_full)
     for sl in auto:
         if sl.name not in manual_names:
             manual.append(sl)

@@ -68,13 +68,40 @@ def _get(cfg: Any, path: List[str], default: Any = None) -> Any:
     return cur
 
 
-_SCREENLINE_TO_GATEWAY = {
+_SCREENLINE_TO_GATEWAY_LEGACY = {
     "D1_west": "D1_NW",
     "D1_east": "D1_E",
     "D2_south": "D2_S",
     "I43_north": "I43_N",
     "I52_south": "I52_S",
 }
+
+
+def _build_screenline_gateway_map(
+    screenlines: list,
+    gateway_zone_names: Optional[set] = None,
+) -> Dict[str, str]:
+    """Auto-derive screenline_name -> gateway_zone_name mapping.
+
+    For ``auto_gw_*`` screenlines the gateway name is the suffix after the
+    prefix, validated against *gateway_zone_names* when provided.
+    Legacy manual mappings are kept as fallback.
+    """
+    mapping: Dict[str, str] = {}
+    gw_set = gateway_zone_names or set()
+
+    for sl in screenlines:
+        name = sl.name if hasattr(sl, "name") else str(sl)
+        if name.startswith("auto_gw_"):
+            gw_candidate = name[len("auto_gw_"):]
+            if not gw_set or gw_candidate in gw_set:
+                mapping[name] = gw_candidate
+
+    for k, v in _SCREENLINE_TO_GATEWAY_LEGACY.items():
+        if k not in mapping:
+            mapping[k] = v
+
+    return mapping
 
 _MAJOR_ROAD_TYPES = frozenset({
     "trunk", "trunk_link", "motorway", "motorway_link", "primary", "primary_link",
@@ -142,13 +169,15 @@ def _load_gateway_zone_map(
 
 def _load_gateway_observed(
     cfg: Dict[str, Any],
+    screenlines_list: Optional[list] = None,
+    gateway_zone_names: Optional[set] = None,
 ) -> Dict[str, float]:
     """Load observed AADT per gateway for gateway calibration.
 
     Tries the parquet at ``calibration.gateway_calibration.observed_path``
     first (columns: ``gateway_name``, ``observed_aadt``).  If not found,
-    falls back to CSD values from the screenlines YAML, using a hardcoded
-    screenline-name -> gateway-name mapping.
+    falls back to observed values from screenlines (including auto-generated
+    ones) using the dynamic screenline-to-gateway mapping.
     """
     gw_cfg = _get(cfg, ["calibration", "gateway_calibration"], {}) or {}
     _cache = str(Path(_get(cfg, ["datasets", "cache_dir"], "data/cache")))
@@ -165,19 +194,38 @@ def _load_gateway_observed(
                 }
         except Exception:
             logger.debug(
-                "Failed to load gateway observed counts from parquet; falling back to YAML",
+                "Failed to load gateway observed counts from parquet; falling back to screenlines",
                 exc_info=True,
             )
 
-    from sim.screenlines import load_screenlines
-    config_dir = cfg.get("_meta", {}).get("base_dir", "")
-    default_sl = str(Path(config_dir) / "screenlines.yaml") if config_dir else "config/brno/screenlines.yaml"
-    sl_path = str(_get(cfg, ["calibration", "screenlines_path"], default_sl))
-    screenlines = load_screenlines(sl_path)
+    if screenlines_list is None:
+        from sim.screenlines import load_screenlines_with_auto
+        try:
+            _csd = None
+            _csd_full = None
+            try:
+                _csd = load_csd(cfg)
+            except Exception:
+                pass
+            try:
+                _csd_full = load_csd_unfiltered(cfg)
+            except Exception:
+                pass
+            screenlines_list = load_screenlines_with_auto(
+                cfg, csd_df=_csd, csd_df_full=_csd_full,
+            )
+        except Exception:
+            from sim.screenlines import load_screenlines
+            config_dir = cfg.get("_meta", {}).get("base_dir", "")
+            default_sl = str(Path(config_dir) / "screenlines.yaml") if config_dir else ""
+            sl_path = str(_get(cfg, ["calibration", "screenlines_path"], default_sl))
+            screenlines_list = load_screenlines(sl_path) if sl_path else []
+
+    sl_gw_map = _build_screenline_gateway_map(screenlines_list, gateway_zone_names)
 
     result: Dict[str, float] = {}
-    for sl in screenlines:
-        gw = _SCREENLINE_TO_GATEWAY.get(sl.name)
+    for sl in screenlines_list:
+        gw = sl_gw_map.get(sl.name)
         aadt = getattr(sl, "observed_aadt_all", None) or getattr(sl, "observed_aadt_cars", None)
         if gw and aadt and float(aadt) > 0:
             result[gw] = float(aadt)
@@ -249,6 +297,7 @@ def _compute_gateway_modeled_volumes(
     vol_df: pd.DataFrame,
     screenlines: list,
     vol_col: str,
+    sl_gw_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, float]:
     """Sum modeled volume on each screenline and map to gateway names."""
     from sim.screenlines import _get_link_volume
@@ -257,8 +306,11 @@ def _compute_gateway_modeled_volumes(
     if not screenlines or not vol_col:
         return result
 
+    if sl_gw_map is None:
+        sl_gw_map = _build_screenline_gateway_map(screenlines)
+
     for sl in screenlines:
-        gw = _SCREENLINE_TO_GATEWAY.get(sl.name)
+        gw = sl_gw_map.get(sl.name)
         if not gw or not sl.links:
             continue
 
@@ -534,6 +586,24 @@ def load_csd(cfg: Dict[str, Any], region_code: str | None = None) -> pd.DataFram
         else:
             df = _filter_csd_by_network_roads(df, cfg)
 
+    if "sil" in df.columns:
+        df["sil"] = df["sil"].astype(str)
+    for col in ("sv", "o", "tv"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return df
+
+
+def load_csd_unfiltered(cfg: Dict[str, Any]) -> pd.DataFrame:
+    """Load the full national CSD parquet without any region filtering.
+
+    Used for gateway AADT lookup where the gateway road may span regions
+    outside the model area (e.g. D55 absent from CZ071 but present in
+    CZ064/CZ072).
+    """
+    parquet_path = ensure_csd2025_validation_parquet(cfg)
+    df = pd.read_parquet(parquet_path)
+    df = normalize_csd_count_columns(df)
     if "sil" in df.columns:
         df["sil"] = df["sil"].astype(str)
     for col in ("sv", "o", "tv"):
@@ -1213,6 +1283,33 @@ def match_counts_to_links(
         if col in joined.columns:
             joined = joined.drop(columns=[col])
 
+    # Diagnostic summary of matched vs unmatched/excluded
+    n_total = len(joined)
+    n_matched = int(joined["_matched"].sum()) if "_matched" in joined.columns else 0
+    n_excluded = int(joined["_excluded"].sum()) if "_excluded" in joined.columns else 0
+    n_usable = n_matched - n_excluded
+    logger.info(
+        f"  Match summary: {n_total} count stations -> "
+        f"{n_matched} matched, {n_excluded} excluded, {n_usable} usable"
+    )
+    if n_usable < n_total * 0.5:
+        # Log which stations failed matching for diagnosis
+        if "_matched" in joined.columns and id_col in joined.columns:
+            unmatched = joined[~joined["_matched"]]
+            if not unmatched.empty:
+                ids = unmatched[id_col].tolist()[:20]
+                logger.warning(
+                    f"  {len(unmatched)} count station(s) found no link match "
+                    f"(buffer={buffer_m}m): {ids}"
+                )
+        if "_excluded" in joined.columns and id_col in joined.columns:
+            excluded = joined[joined["_excluded"]]
+            if not excluded.empty:
+                ids = excluded[id_col].tolist()[:20]
+                logger.warning(
+                    f"  {len(excluded)} count station(s) excluded: {ids}"
+                )
+
     return joined
 
 
@@ -1379,6 +1476,235 @@ def _coarse_road_class(link_type: object) -> str:
         if rc in s:
             return rc
     return "other"
+
+
+def _compute_class_residuals(
+    valid: pd.DataFrame,
+    obs_col: str,
+    compare_col: str,
+    *,
+    min_counts: int = 3,
+) -> Dict[str, float]:
+    """Per-road-class obs/mod ratio for class-specific OD correction.
+
+    Returns a dict mapping coarse road class names to their aggregate
+    observed/modeled ratio.  Classes with fewer than *min_counts* matched
+    count posts are omitted.
+    """
+    if "link_type" not in valid.columns:
+        return {}
+    coarse = valid["link_type"].map(_coarse_road_class)
+    ratios: Dict[str, float] = {}
+    for rc in sorted(coarse.unique()):
+        mask = coarse == rc
+        n = int(mask.sum())
+        if n < min_counts:
+            continue
+        obs_sum = float(valid.loc[mask, obs_col].sum())
+        mod_sum = float(valid.loc[mask, compare_col].sum())
+        if mod_sum > 0 and obs_sum > 0:
+            ratios[rc] = obs_sum / mod_sum
+    return ratios
+
+
+def _supplement_class_ratios_from_screenlines(
+    sl_results: Dict[str, Any],
+    links_gdf: "gpd.GeoDataFrame",
+    pentlogram_ratios: Dict[str, float],
+) -> Dict[str, float]:
+    """Derive per-road-class obs/mod ratios from screenline evaluation results.
+
+    Screenlines carry aggregate observed/modeled totals and resolve to network
+    links with known ``link_type``.  This supplements the pentlogram-based
+    ``class_ratios`` with classes that have no pentlogram coverage (typically
+    motorway/trunk on boundary gateways).
+
+    For classes already present in *pentlogram_ratios* the pentlogram value
+    is kept (higher spatial resolution).  New classes are added from
+    screenline evidence.
+    """
+    if not sl_results or "link_type" not in links_gdf.columns:
+        return dict(pentlogram_ratios)
+
+    lt_series = links_gdf.set_index("link_id")["link_type"]
+
+    # Accumulate per-class obs/mod sums across screenlines
+    class_obs: Dict[str, float] = {}
+    class_mod: Dict[str, float] = {}
+    for sl_name, sr in sl_results.items():
+        sr_d = sr if isinstance(sr, dict) else {}
+        obs_total = float(sr_d.get("observed_total") or 0)
+        mod_total = float(sr_d.get("modeled_total") or 0)
+        if obs_total <= 0 or mod_total <= 0:
+            continue
+        ratio = obs_total / mod_total
+        if ratio > 5.0 or ratio < 0.2:
+            continue
+
+        per_link = sr_d.get("per_link", [])
+        if not per_link and hasattr(sr, "per_link"):
+            per_link = sr.per_link if sr.per_link else []
+
+        link_ids = []
+        if isinstance(per_link, list):
+            link_ids = [
+                pl.get("link_id") if isinstance(pl, dict)
+                else getattr(pl, "link_id", None)
+                for pl in per_link
+            ]
+        elif isinstance(per_link, dict):
+            link_ids = list(per_link.keys())
+
+        if not link_ids:
+            continue
+
+        from collections import Counter
+        types = [
+            _coarse_road_class(lt_series.get(lid, "other"))
+            for lid in link_ids if lid is not None
+        ]
+        if not types:
+            continue
+        dominant = Counter(types).most_common(1)[0][0]
+
+        class_obs[dominant] = class_obs.get(dominant, 0.0) + obs_total
+        class_mod[dominant] = class_mod.get(dominant, 0.0) + mod_total
+
+    merged = dict(pentlogram_ratios)
+    for rc in class_obs:
+        if rc in merged:
+            continue
+        obs_sum = class_obs[rc]
+        mod_sum = class_mod[rc]
+        if mod_sum > 0 and obs_sum > 0:
+            merged[rc] = max(0.5, min(2.0, obs_sum / mod_sum))
+
+    return merged
+
+
+def _apply_class_residual_correction(
+    demand: np.ndarray,
+    vol_df: pd.DataFrame,
+    links_gdf: "gpd.GeoDataFrame",
+    class_ratios: Dict[str, float],
+    sl_matrices: Optional[Dict[str, Any]],
+    sl_results: Dict[str, Any],
+    *,
+    damping: float = 0.15,
+    clip_min: float = 0.5,
+    clip_max: float = 2.0,
+    reference_total: Optional[float] = None,
+) -> List[str]:
+    """Apply per-road-class OD correction using screenline select-link shares.
+
+    For each road class with a non-unity ratio, identifies which screenlines
+    belong to that class (via their matched link types) and applies a damped
+    multiplicative correction using those screenlines' select-link OD shares.
+
+    Falls back to a uniform scalar when no select-link data is available for
+    a class.
+
+    *reference_total*: when supplied, the volume-neutral rescale targets this
+    value instead of the pre-correction demand total.  This allows callers to
+    preserve gains from prior steps (e.g. gateway calibration).
+
+    Returns a list of log messages describing corrections applied.
+    """
+    if not class_ratios:
+        return []
+
+    total_before = reference_total if reference_total is not None else float(demand.sum())
+
+    # Map screenlines to their dominant road class
+    sl_class_map: Dict[str, str] = {}
+    if sl_results:
+        for sl_name, sr in sl_results.items():
+            sr_d = sr if isinstance(sr, dict) else {}
+            per_link = sr_d.get("per_link", [])
+            if not per_link and hasattr(sr, "per_link"):
+                per_link = sr.per_link if sr.per_link else []
+            link_ids = []
+            if isinstance(per_link, list):
+                link_ids = [pl.get("link_id") if isinstance(pl, dict) else getattr(pl, "link_id", None) for pl in per_link]
+            elif isinstance(per_link, dict):
+                link_ids = list(per_link.keys())
+
+            if link_ids and "link_type" in links_gdf.columns:
+                lt_series = links_gdf.set_index("link_id")["link_type"]
+                types = [_coarse_road_class(lt_series.get(lid, "other")) for lid in link_ids if lid is not None]
+                if types:
+                    from collections import Counter
+                    sl_class_map[sl_name] = Counter(types).most_common(1)[0][0]
+
+    corrections: List[str] = []
+
+    for rc, ratio in class_ratios.items():
+        if abs(ratio - 1.0) < 0.02:
+            continue
+
+        # Try select-link approach: use screenlines belonging to this class
+        applied_via_sl = False
+        if sl_matrices and sl_class_map:
+            class_sl_names = [sn for sn, sc in sl_class_map.items() if sc == rc and sn in sl_matrices]
+            if class_sl_names:
+                class_factor = 1.0 + damping * (ratio - 1.0)
+                class_factor = float(np.clip(class_factor, clip_min, clip_max))
+                for sl_name in class_sl_names:
+                    sl_od_raw = sl_matrices[sl_name]
+                    sl_od = np.asarray(sl_od_raw, dtype=np.float64).reshape(demand.shape)
+                    proportion = np.where(
+                        demand > 0,
+                        np.clip(sl_od / np.maximum(demand, 1e-9), 0.0, 1.0),
+                        0.0,
+                    )
+                    adjustment = 1.0 + damping * (ratio - 1.0) * proportion
+                    np.clip(adjustment, clip_min, clip_max, out=adjustment)
+                    demand *= adjustment
+                applied_via_sl = True
+                corrections.append(
+                    f"{rc}: ratio={ratio:.3f} factor={class_factor:.4f} "
+                    f"via {len(class_sl_names)} screenline(s)"
+                )
+
+        if not applied_via_sl:
+            # Fallback: build road-class weight from link volumes
+            if "link_id" in vol_df.columns and "link_type" in links_gdf.columns:
+                lt_map = links_gdf.set_index("link_id")["link_type"]
+                merged_lt = vol_df["link_id"].map(lt_map).map(_coarse_road_class)
+                vol_col_name = None
+                for c in vol_df.columns:
+                    if c.endswith("_tot") or c == "tot":
+                        vol_col_name = c
+                        break
+                if vol_col_name is None:
+                    vol_col_name = [c for c in vol_df.columns if c not in ("link_id",) and vol_df[c].dtype in (np.float64, np.float32, np.int64)]
+                    vol_col_name = vol_col_name[0] if vol_col_name else None
+
+                if vol_col_name is not None:
+                    class_mask = merged_lt == rc
+                    class_vol = float(vol_df.loc[class_mask, vol_col_name].sum()) if class_mask.any() else 0.0
+                    total_vol = float(vol_df[vol_col_name].sum())
+                    if total_vol > 0 and class_vol > 0:
+                        weight = class_vol / total_vol
+                        effective_factor = 1.0 + damping * weight * (ratio - 1.0)
+                        effective_factor = float(np.clip(effective_factor, clip_min, clip_max))
+                        if abs(effective_factor - 1.0) > 0.002:
+                            demand *= effective_factor
+                            corrections.append(
+                                f"{rc}: ratio={ratio:.3f} vol_share={weight:.2f} "
+                                f"factor={effective_factor:.4f} (fallback)"
+                            )
+
+    # Volume-neutral rescale: class correction only redistributes, total
+    # volume adjustment is handled by global_residual separately.
+    total_after = float(demand.sum())
+    if total_before > 0 and total_after > 0 and abs(total_after - total_before) > 1.0:
+        demand *= total_before / total_after
+        corrections.append(
+            f"volume-neutral rescale: {total_after:,.0f} → {total_before:,.0f}"
+        )
+
+    return corrections
 
 
 def compute_extended_link_metrics(
@@ -2273,6 +2599,15 @@ class _CalibrationContext:
         self.odme_cfg = calib_cfg.get("odme") or {}
         self.max_deviation = float(self.odme_cfg.get("max_deviation", 4.0))
 
+        # Screenline factor bounds (shared by ODME and FSM Spiess updates)
+        sl_factors = calib_cfg.get("screenline_factors") or {}
+        self.sl_ratio_max = float(sl_factors.get("ratio_max", 5.0))
+        self.sl_ratio_min = float(sl_factors.get("ratio_min", 0.2))
+        self.sl_clip_min = float(sl_factors.get("clip_min", 0.5))
+        self.sl_clip_max = float(sl_factors.get("clip_max", 2.0))
+        self.sl_global_min = float(sl_factors.get("global_min", 0.8))
+        self.sl_global_max = float(sl_factors.get("global_max", 1.25))
+
         # Pre-flight
         fix_node_ids(self.project_dir)
         if not self.matrix_path.exists():
@@ -2337,12 +2672,19 @@ class _CalibrationContext:
 
         # Screenlines (manual YAML + auto-generated from gateways/CSD)
         csd_for_auto = None
+        csd_full_for_gw = None
         if self.count_source == "csd_split":
             try:
                 csd_for_auto = load_csd(cfg)
             except Exception:
                 pass
-        self.screenlines = load_screenlines_with_auto(cfg, csd_df=csd_for_auto)
+        try:
+            csd_full_for_gw = load_csd_unfiltered(cfg)
+        except Exception:
+            pass
+        self.screenlines = load_screenlines_with_auto(
+            cfg, csd_df=csd_for_auto, csd_df_full=csd_full_for_gw,
+        )
         self.sl_query: Optional[Dict[str, list]] = None
         if self.screenlines:
             self.sl_query = {}
@@ -2381,25 +2723,39 @@ class _CalibrationContext:
         self.project.open(str(self.project_dir))
         self.cached_graph = build_graph(self.project, self.mat, bpr_parameters=self.cfg_bpr)
 
-        # Gateway calibration
+        # Gateway calibration — fallbacks match defaults.py
         gw_cal_cfg = calib_cfg.get("gateway_calibration") or {}
-        self.gw_cal_enabled = bool(gw_cal_cfg.get("enabled", False))
-        self.gw_cal_damping = float(gw_cal_cfg.get("damping", 0.25))
+        self.gw_cal_enabled = bool(gw_cal_cfg.get("enabled", True))
+        self.gw_cal_damping = float(gw_cal_cfg.get("damping", 0.18))
         self.gw_cal_min_factor = float(gw_cal_cfg.get("min_factor", 0.70))
-        self.gw_cal_max_factor = float(gw_cal_cfg.get("max_factor", 1.60))
+        self.gw_cal_max_factor = float(gw_cal_cfg.get("max_factor", 1.40))
         self.gw_zone_map: Dict[str, np.ndarray] = {}
         self.gw_observed: Dict[str, float] = {}
 
+        self.sl_gw_map: Dict[str, str] = {}
         if self.gw_cal_enabled:
             try:
                 self.gw_zone_map = _load_gateway_zone_map(cfg, self.mat.index[:])
-                self.gw_observed = _load_gateway_observed(cfg)
+                gw_names = set(self.gw_zone_map.keys())
+                self.sl_gw_map = _build_screenline_gateway_map(
+                    self.screenlines, gw_names,
+                )
+                self.gw_observed = _load_gateway_observed(
+                    cfg,
+                    screenlines_list=self.screenlines,
+                    gateway_zone_names=gw_names,
+                )
                 if self.gw_zone_map and self.gw_observed:
                     active = set(self.gw_zone_map) & set(self.gw_observed)
                     logger.info(
                         f"  Gateway calibration: {len(active)} gateways with observed data "
                         f"({', '.join(sorted(active))})"
                     )
+                    if self.sl_gw_map:
+                        logger.info(
+                            f"  Screenline→gateway map: {len(self.sl_gw_map)} entries "
+                            f"({', '.join(f'{k}→{v}' for k, v in sorted(self.sl_gw_map.items()))})"
+                        )
                 else:
                     logger.info(
                         "  Gateway calibration: no matching zone/observed data — disabled"
@@ -2556,11 +2912,23 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
     weight_method = str(odme_cfg.get("weight_function", "inverse_sqrt"))
     conv_tol = float(odme_cfg.get("convergence_tol", 0.001))
     global_residual_damping = float(odme_cfg.get("global_residual_damping", 0.25))
+    class_res_enabled = bool(odme_cfg.get("class_residual_enabled", True))
+    class_res_damping = float(odme_cfg.get("class_residual_damping", 0.15))
+    class_res_min_counts = int(odme_cfg.get("class_residual_min_counts", 3))
+    max_iter_change_pct = float(odme_cfg.get("max_iter_change_pct", 15.0))
+
+    sl_ratio_max = ctx.sl_ratio_max
+    sl_ratio_min = ctx.sl_ratio_min
+    sl_clip_min = ctx.sl_clip_min
+    sl_clip_max = ctx.sl_clip_max
+    sl_global_min = ctx.sl_global_min
+    sl_global_max = ctx.sl_global_max
 
     logger.info("=== ODME GRADIENT CALIBRATION (Spiess method) ===")
     logger.info(f"  max_outer={max_outer}, gd_inner={gd_inner}, max_deviation={ctx.max_deviation}")
     logger.info(f"  weight_function={weight_method}, convergence_tol={conv_tol}")
-    logger.info(f"  global_residual_damping={global_residual_damping}")
+    logger.info(f"  global_residual_damping={global_residual_damping}, max_iter_change={max_iter_change_pct}%")
+    logger.info(f"  class_residual: enabled={class_res_enabled}, damping={class_res_damping}")
 
     history = ctx.history
     prev_Z = float("inf")
@@ -2568,6 +2936,9 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
     best_demand = ctx.best_demand
     best_iteration = ctx.best_iteration
     effective_global_damping = global_residual_damping
+    consecutive_improvements = 0
+    consecutive_deteriorations = 0
+    post_gateway_total: Optional[float] = None
     sl_results: Dict[str, Any] = {}
 
     try:
@@ -2680,12 +3051,34 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
                 best_demand = mat.matrix[core_name][:, :].copy()
                 best_iteration = outer_it
 
-            # Adaptive damping: if Z increased, reduce global damping
+            # Adaptive damping: decay on Z increase, reset after consecutive improvements
             if outer_it > 1 and Z_current > prev_Z:
                 effective_global_damping = max(effective_global_damping * 0.7, 0.05)
-                logger.warning(
-                    f"  WARNING: Z increased — reducing global_damping to {effective_global_damping:.3f}"
-                )
+                consecutive_improvements = 0
+                consecutive_deteriorations += 1
+
+                if consecutive_deteriorations >= 3 and best_demand is not None:
+                    mat.matrix[core_name][:, :] = best_demand
+                    mat.save()
+                    logger.info(
+                        f"  REVERT: Z deteriorated {consecutive_deteriorations}x → "
+                        f"restoring best demand from iteration {best_iteration}"
+                    )
+                    consecutive_deteriorations = 0
+                else:
+                    logger.warning(
+                        f"  WARNING: Z increased — reducing global_damping to "
+                        f"{effective_global_damping:.3f}"
+                    )
+            elif outer_it > 1 and Z_current < prev_Z:
+                consecutive_improvements += 1
+                consecutive_deteriorations = 0
+                if consecutive_improvements >= 2 and effective_global_damping < global_residual_damping:
+                    effective_global_damping = global_residual_damping
+                    consecutive_improvements = 0
+                    logger.info(
+                        f"  Damping reset to {effective_global_damping:.3f} after 2 consecutive improvements"
+                    )
 
             logger.info(f"  Z={Z_current:,.1f}  (prev={prev_Z:,.1f}  delta={Z_current - prev_Z:+,.1f})")
             logger.info(f"  R²={r2}  slope={slope}  %RMSE={pct_rmse}  bias={bias_pct}%")
@@ -2708,7 +3101,7 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
                             f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f} GEH={sr.geh:.1f}"
                         )
 
-            # Record iteration history
+            # Record iteration history with per-class metrics
             iter_record = {
                 "iteration": outer_it,
                 "demand_total": round(total_demand, 0),
@@ -2718,6 +3111,20 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
                 "max_screenline_pct_dev": round(max_sl_pct_dev, 1),
                 "n_count_posts": len(valid),
             }
+            if class_res_enabled and len(valid) > 0 and compare_col:
+                cr = _compute_class_residuals(
+                    valid, obs_col, compare_col,
+                    min_counts=class_res_min_counts,
+                )
+                cr = _supplement_class_ratios_from_screenlines(
+                    sl_results, links_gdf, cr,
+                )
+                if cr:
+                    iter_record["class_ratios"] = {k: round(v, 3) for k, v in cr.items()}
+                    logger.info(
+                        f"  Per-class obs/mod: "
+                        + ", ".join(f"{k}={v:.3f}" for k, v in cr.items())
+                    )
             history.append(iter_record)
 
             # --- 4) Convergence check ---
@@ -2727,8 +3134,9 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
                     logger.info(f"  CONVERGED: |delta Z|/Z = {rel_change:.6f} < {conv_tol}")
                     break
 
-            # Stall detection: if best Z hasn't improved in 4 outer iterations
-            if outer_it - best_iteration >= 4:
+            # Stall detection: if best Z hasn't improved in 8 outer iterations
+            odme_stall_patience = int(odme_cfg.get("stall_patience", 8))
+            if outer_it - best_iteration >= odme_stall_patience:
                 logger.info(f"  STALLED: no Z improvement since iteration {best_iteration}")
                 break
 
@@ -2786,8 +3194,7 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
                         if obs_sl <= 0 or mod_sl <= 0:
                             continue
                         ratio = obs_sl / mod_sl
-                        # Skip extreme ratios (connectivity issue, not demand)
-                        if ratio > 5.0 or ratio < 0.2:
+                        if ratio > sl_ratio_max or ratio < sl_ratio_min:
                             continue
 
                         sl_od = np.asarray(sl_od_raw, dtype=np.float64).reshape(demand.shape)
@@ -2797,16 +3204,14 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
                             0.0,
                         )
 
-                        # Multiplicative Spiess update
                         adjustment = 1.0 + sl_damping * (ratio - 1.0) * proportion
-                        np.clip(adjustment, 0.5, 2.0, out=adjustment)
+                        np.clip(adjustment, sl_clip_min, sl_clip_max, out=adjustment)
                         demand *= adjustment
                         corrections_applied.append((sl_name, round(ratio, 3)))
 
                     if gd_it == 1:
                         n_sl_used = len(corrections_applied)
 
-                    # Elasticity: clip to [seed/max_dev, seed*max_dev]
                     np.clip(demand, seed_lower, seed_upper, out=demand)
                     np.maximum(demand, 0.0, out=demand)
 
@@ -2822,20 +3227,13 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
                     )
 
             # --- 6) Global residual correction from ALL count posts ---
-            # After the select-link gradient step, compute aggregate bias
-            # from ALL 2000+ matched count posts and apply a damped
-            # uniform correction.  Stratified (per-road-class) correction
-            # was tested but is counterproductive: it cuts through-traffic
-            # uniformly when some corridors need more and others less.
-            # The screenline gradient handles the directional component;
-            # the global scalar handles only the aggregate level.
             if len(valid) > 0 and total_vol > 0:
                 sum_obs = float(obs_all.sum())
                 sum_mod = float(mod_all.sum())
                 if sum_mod > 0 and sum_obs > 0:
                     global_ratio = sum_obs / sum_mod
                     global_factor = 1.0 + effective_global_damping * (global_ratio - 1.0)
-                    global_factor = float(np.clip(global_factor, 0.8, 1.25))
+                    global_factor = float(np.clip(global_factor, sl_global_min, sl_global_max))
 
                     if abs(global_factor - 1.0) > 0.003:
                         demand *= global_factor
@@ -2847,10 +3245,36 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
                             f"demand={demand.sum():,.0f}"
                         )
 
+            # --- 6b) Road-class residual correction ---
+            if class_res_enabled and len(valid) > 0 and compare_col:
+                class_ratios = _compute_class_residuals(
+                    valid, obs_col, compare_col,
+                    min_counts=class_res_min_counts,
+                )
+                class_ratios = _supplement_class_ratios_from_screenlines(
+                    sl_results, links_gdf, class_ratios,
+                )
+                if class_ratios:
+                    cr_logs = _apply_class_residual_correction(
+                        demand, vol_df, links_gdf, class_ratios,
+                        sl_matrices, sl_results,
+                        damping=class_res_damping,
+                        clip_min=sl_clip_min,
+                        clip_max=sl_clip_max,
+                        reference_total=post_gateway_total,
+                    )
+                    np.clip(demand, seed_lower, seed_upper, out=demand)
+                    np.maximum(demand, 0.0, out=demand)
+                    if cr_logs:
+                        logger.info(f"  Class residual corrections:")
+                        for crl in cr_logs:
+                            logger.info(f"    {crl}")
+
             # --- 7) Gateway calibration — per-gateway OD scaling ---
             if ctx.gw_cal_enabled and vol_col:
                 gw_modeled = _compute_gateway_modeled_volumes(
                     vol_df, screenlines, vol_col,
+                    sl_gw_map=ctx.sl_gw_map,
                 )
                 gw_corrections = _apply_gateway_calibration(
                     demand,
@@ -2868,6 +3292,8 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
                     for gc_line in gw_corrections:
                         logger.info(f"    {gc_line}")
 
+                post_gateway_total = float(demand.sum())
+
                 # After the first iteration, re-center elasticity bounds around
                 # the gateway-adjusted demand so subsequent iterations have room
                 # to converge for large initial discrepancies (e.g. I52_S 3x).
@@ -2883,7 +3309,22 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
                         "  Seed bounds rebased after first gateway calibration"
                     )
 
-            # --- 8) Write updated demand back to matrix ---
+            # --- 8) Per-iteration demand cap ---
+            iter_total = float(demand.sum())
+            if total_demand > 0 and max_iter_change_pct > 0:
+                change_pct = (iter_total - total_demand) / total_demand * 100
+                if abs(change_pct) > max_iter_change_pct:
+                    cap_factor = total_demand * (
+                        1.0 + np.sign(change_pct) * max_iter_change_pct / 100.0
+                    ) / max(iter_total, 1.0)
+                    demand *= cap_factor
+                    logger.info(
+                        f"  Iter demand cap: {change_pct:+.1f}% exceeds "
+                        f"±{max_iter_change_pct:.0f}%, clamped to "
+                        f"{demand.sum():,.0f}"
+                    )
+
+            # --- 9) Write updated demand back to matrix ---
             data[:, :] = demand
             mat.save()
             logger.info(f"  Matrix saved. Total demand: {demand.sum():,.0f}")
@@ -2947,6 +3388,816 @@ def run_odme_calibration(config_path: str | Path = "config/brno/sim.yaml") -> No
         logger.info(f"  Final assignment: {out_path}")
 
 
+# --- Entropy-maximization ODME ---
+
+def _entropy_update_step(
+    demand: np.ndarray,
+    sl_matrices: Dict[str, Any],
+    sl_results: Dict[str, Any],
+    *,
+    step_size: float = 0.3,
+    ratio_max: float = 5.0,
+    ratio_min: float = 0.2,
+    clip_min: float = 0.5,
+    clip_max: float = 2.0,
+) -> int:
+    """Single entropy-maximization multiplicative update across all screenlines.
+
+    For each screenline *a* with select-link OD proportions p_ij_a, apply:
+        T_ij *= (obs_a / mod_a) ^ (step_size * p_ij_a)
+
+    This is the multiplicative form of the Lagrangian solution for the
+    maximum-entropy problem: max -sum(T_ij * ln(T_ij / T_ij^seed))
+    subject to link-count constraints.  The exponentiated form
+    preserves the seed structure better than an additive Spiess update.
+
+    Returns the number of screenlines applied.
+    """
+    n_applied = 0
+    for sl_name, sl_od_raw in sl_matrices.items():
+        obs_sl = _sr_val(sl_results.get(sl_name, {}), "observed_total")
+        mod_sl = _sr_val(sl_results.get(sl_name, {}), "modeled_total")
+        if obs_sl <= 0 or mod_sl <= 0:
+            continue
+        ratio = obs_sl / mod_sl
+        if ratio > ratio_max or ratio < ratio_min:
+            continue
+
+        sl_od = np.asarray(sl_od_raw, dtype=np.float64).reshape(demand.shape)
+        proportion = np.where(
+            demand > 0,
+            np.clip(sl_od / np.maximum(demand, 1e-9), 0.0, 1.0),
+            0.0,
+        )
+
+        # Multiplicative entropy update: exponentiate the ratio by proportion
+        log_ratio = np.log(max(ratio, 1e-12))
+        adjustment = np.exp(step_size * proportion * log_ratio)
+        np.clip(adjustment, clip_min, clip_max, out=adjustment)
+        demand *= adjustment
+        n_applied += 1
+
+    return n_applied
+
+
+def run_entropy_odme(config_path: str | Path = "config/brno/sim.yaml") -> None:
+    """Maximum-entropy ODME calibration.
+
+    Maximizes the entropy H(T) = -sum(T_ij * ln(T_ij / T_ij^seed))
+    subject to link-count constraints, using an iterative multiplicative
+    update derived from the Lagrangian.  Less greedy than Spiess-style
+    gradient descent; preserves seed structure via information-theoretic
+    regularization.
+    """
+    ctx = _CalibrationContext(config_path)
+    calib_cfg = ctx.calib_cfg
+    odme_cfg = ctx.odme_cfg
+
+    from sim.screenlines import evaluate_all_screenlines
+
+    mat = ctx.mat
+    project = ctx.project
+    cached_graph = ctx.cached_graph
+    links_gdf = ctx.links_gdf
+    pent = ctx.pent
+    sl_query = ctx.sl_query
+    screenlines = ctx.screenlines
+    output_dir = ctx.output_dir
+    core_name = ctx.core_name
+    algorithm = ctx.algorithm
+    max_iter_assign = ctx.max_iter_assign
+    rgap = ctx.rgap
+    gc_field = ctx.gc_field
+    gc_mult = ctx.gc_mult
+    gc_vot = ctx.gc_vot
+    cfg_bpr = ctx.cfg_bpr
+    cfg_multi = ctx.cfg_multi
+    daily_cap_factor = ctx.daily_cap_factor
+    cores = ctx.cores
+    buffer_m = ctx.buffer_m
+    direction_aware = ctx.direction_aware
+    conflict_res = ctx.conflict_res
+    agg_corridor = ctx.agg_corridor
+    mq_min = ctx.match_quality_min
+    obs_col = ctx.obs_col
+    count_target = ctx.count_target
+    daily_conv = ctx.daily_conv
+    max_deviation = ctx.max_deviation
+    seed_lower = ctx.seed_lower
+    seed_upper = ctx.seed_upper
+
+    max_outer = int(odme_cfg.get("max_outer_iterations", 25))
+    gd_inner = int(odme_cfg.get("gradient_descent_iterations", 5))
+    weight_method = str(odme_cfg.get("weight_function", "inverse_sqrt"))
+    conv_tol = float(odme_cfg.get("convergence_tol", 0.001))
+    global_residual_damping = float(odme_cfg.get("global_residual_damping", 0.25))
+    entropy_step_size = float(odme_cfg.get("entropy_step_size", 0.3))
+    class_res_enabled = bool(odme_cfg.get("class_residual_enabled", True))
+    class_res_damping = float(odme_cfg.get("class_residual_damping", 0.15))
+    class_res_min_counts = int(odme_cfg.get("class_residual_min_counts", 3))
+    max_iter_change_pct = float(odme_cfg.get("max_iter_change_pct", 15.0))
+
+    sl_ratio_max = ctx.sl_ratio_max
+    sl_ratio_min = ctx.sl_ratio_min
+    sl_clip_min = ctx.sl_clip_min
+    sl_clip_max = ctx.sl_clip_max
+    sl_global_min = ctx.sl_global_min
+    sl_global_max = ctx.sl_global_max
+
+    logger.info("=== ENTROPY-MAXIMIZATION ODME ===")
+    logger.info(f"  max_outer={max_outer}, gd_inner={gd_inner}, max_deviation={max_deviation}")
+    logger.info(f"  entropy_step_size={entropy_step_size}, conv_tol={conv_tol}, max_iter_change={max_iter_change_pct}%")
+    logger.info(f"  class_residual: enabled={class_res_enabled}, damping={class_res_damping}")
+
+    history = ctx.history
+    prev_Z = float("inf")
+    best_Z = ctx.best_Z
+    best_demand = ctx.best_demand
+    best_iteration = ctx.best_iteration
+    effective_global_damping = global_residual_damping
+    consecutive_improvements = 0
+    consecutive_deteriorations = 0
+    post_gateway_total: Optional[float] = None
+    sl_results: Dict[str, Any] = {}
+
+    try:
+        for outer_it in range(1, max_outer + 1):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"  Entropy ODME Iteration {outer_it}/{max_outer}")
+            logger.info(f"{'='*60}")
+
+            total_demand = float(mat.matrix_view.sum())
+            logger.info(f"  Demand total: {total_demand:,.0f}")
+
+            # 1) Equilibrium assignment with select-link
+            save_skims_now = bool(calib_cfg.get("save_skims", False)) and outer_it == 1
+            vol_df, skims, sl_matrices = execute_assignment(
+                project, mat,
+                algorithm=algorithm,
+                max_iter=max_iter_assign,
+                rgap_target=rgap,
+                save_skims=save_skims_now,
+                select_links=sl_query,
+                fixed_cost_field=gc_field,
+                fixed_cost_multiplier=gc_mult,
+                vot=gc_vot,
+                bpr_parameters=cfg_bpr,
+                multi_class=cfg_multi,
+                graph=cached_graph,
+                cores=cores,
+            )
+            if skims is not None and outer_it == 1:
+                skim_path = output_dir / "skims.aem"
+                try:
+                    skims.export(str(skim_path))
+                except Exception:
+                    logger.debug("Skim export failed", exc_info=True)
+
+            vol_col = _detect_volume_col(vol_df)
+            class_tot_cols = [
+                c for c in vol_df.columns
+                if c.endswith("_tot") and c not in ("PCE_tot", "Preload_tot")
+                and vol_df[c].sum() > 0
+            ]
+            if len(class_tot_cols) > 1:
+                vol_df["total_vehicles_tot"] = vol_df[class_tot_cols].sum(axis=1)
+                vol_col = "total_vehicles_tot"
+
+            total_vol = float(vol_df[vol_col].sum()) if vol_col else 0.0
+            logger.info(f"  Assigned volume: {total_vol:,.0f}  (col={vol_col})")
+
+            # 2) Match counts to links
+            links_with_vol = links_gdf.copy()
+            if vol_col and "link_id" in vol_df.columns:
+                links_with_vol = links_with_vol.merge(
+                    vol_df[["link_id", vol_col]], on="link_id", how="left",
+                )
+            matched = match_counts_to_links(
+                pent, links_with_vol, buffer_m=buffer_m,
+                direction_aware=direction_aware,
+                conflict_resolution=conflict_res,
+                aggregate_corridor=agg_corridor,
+                vol_col=vol_col,
+                match_quality_min=mq_min,
+            )
+            if outer_it == 1:
+                if "_excluded" in matched.columns and "objectid" in matched.columns:
+                    excl_ids = set(matched.loc[matched["_excluded"], "objectid"].dropna().astype(int))
+                    if excl_ids:
+                        n_before = len(pent)
+                        pent = pent[~pent["objectid"].isin(excl_ids)].copy()
+                        logger.info(f"  Pre-filter: removed {n_before - len(pent)} excluded stations")
+                _export_matching_diagnostics(
+                    matched,
+                    "_corridor_volume" if "_corridor_volume" in matched.columns else vol_col,
+                    obs_col, output_dir,
+                )
+
+            compare_col = "_corridor_volume" if "_corridor_volume" in matched.columns else vol_col
+
+            # 3) Objective
+            valid = matched.dropna(subset=[compare_col, obs_col])
+            valid = valid[valid[obs_col] > 0].copy()
+            if "_excluded" in valid.columns:
+                valid = valid[~valid["_excluded"]].copy()
+            if valid.empty:
+                logger.warning("  No valid matched counts")
+                continue
+
+            mod_all = valid[compare_col].values.astype(np.float64)
+            obs_all = valid[obs_col].values.astype(np.float64)
+            w_all = _compute_count_weights(obs_all, method=weight_method)
+            Z_current = _odme_objective(mod_all, obs_all, w_all)
+
+            stats = compute_stats(mod_all, obs_all, daily_capacity_factor=daily_cap_factor)
+            geh5 = float(stats.get("geh_lt5_pct", 0))
+            r2 = stats.get("r2")
+            slope = stats.get("slope")
+            pct_rmse = stats.get("pct_rmse")
+            bias_pct = stats.get("bias_pct")
+
+            if Z_current < best_Z:
+                best_Z = Z_current
+                best_demand = mat.matrix[core_name][:, :].copy()
+                best_iteration = outer_it
+
+            if outer_it > 1 and Z_current > prev_Z:
+                effective_global_damping = max(effective_global_damping * 0.7, 0.05)
+                consecutive_improvements = 0
+                consecutive_deteriorations += 1
+
+                if consecutive_deteriorations >= 3 and best_demand is not None:
+                    mat.matrix[core_name][:, :] = best_demand
+                    mat.save()
+                    logger.info(
+                        f"  REVERT: Z deteriorated {consecutive_deteriorations}x → "
+                        f"restoring best demand from iteration {best_iteration}"
+                    )
+                    consecutive_deteriorations = 0
+                else:
+                    logger.warning(
+                        f"  WARNING: Z increased — reducing global_damping to "
+                        f"{effective_global_damping:.3f}"
+                    )
+            elif outer_it > 1 and Z_current < prev_Z:
+                consecutive_improvements += 1
+                consecutive_deteriorations = 0
+                if consecutive_improvements >= 2 and effective_global_damping < global_residual_damping:
+                    effective_global_damping = global_residual_damping
+                    consecutive_improvements = 0
+                    logger.info(
+                        f"  Damping reset to {effective_global_damping:.3f} after 2 consecutive improvements"
+                    )
+
+            logger.info(f"  Z={Z_current:,.1f}  R²={r2}  slope={slope}  %RMSE={pct_rmse}  bias={bias_pct}%")
+            logger.info(f"  GEH<5: {geh5:.1f}%  n_counts={len(valid)}")
+
+            # Screenlines
+            sl_results = {}
+            max_sl_pct_dev: float = 0.0
+            if screenlines and vol_col:
+                sl_res = evaluate_all_screenlines(
+                    screenlines, vol_df, matched, vol_col, obs_col, links_gdf,
+                )
+                for sn, sr in sl_res.items():
+                    sl_results[sn] = sr.to_dict()
+                    if sr.observed_total > 0 and np.isfinite(sr.ratio):
+                        dev = abs(sr.ratio - 1.0) * 100.0
+                        max_sl_pct_dev = max(max_sl_pct_dev, dev)
+                        logger.info(
+                            f"  SL '{sn}': mod={sr.modeled_total:,.0f} "
+                            f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f}"
+                        )
+
+            entropy_iter_record = {
+                "iteration": outer_it,
+                "demand_total": round(total_demand, 0),
+                "assigned_total": round(total_vol, 0),
+                "Z_objective": round(Z_current, 1),
+                **stats,
+                "max_screenline_pct_dev": round(max_sl_pct_dev, 1),
+                "n_count_posts": len(valid),
+            }
+            if class_res_enabled and len(valid) > 0 and compare_col:
+                cr = _compute_class_residuals(
+                    valid, obs_col, compare_col,
+                    min_counts=class_res_min_counts,
+                )
+                cr = _supplement_class_ratios_from_screenlines(
+                    sl_results, links_gdf, cr,
+                )
+                if cr:
+                    entropy_iter_record["class_ratios"] = {k: round(v, 3) for k, v in cr.items()}
+                    logger.info(
+                        f"  Per-class obs/mod: "
+                        + ", ".join(f"{k}={v:.3f}" for k, v in cr.items())
+                    )
+            history.append(entropy_iter_record)
+
+            # Convergence checks
+            if outer_it > 1:
+                rel_change = abs(Z_current - prev_Z) / max(prev_Z, 1.0)
+                if rel_change < conv_tol:
+                    logger.info(f"  CONVERGED: |delta Z|/Z = {rel_change:.6f}")
+                    break
+            entropy_stall_patience = int(odme_cfg.get("stall_patience", 8))
+            if outer_it - best_iteration >= entropy_stall_patience:
+                logger.info(f"  STALLED: no Z improvement since iteration {best_iteration}")
+                break
+
+            cur_r2 = float(stats.get("r2") or 0.0)
+            cur_slope = float(stats.get("slope") or 0.0)
+            cur_prmse = float(stats.get("pct_rmse") or 999.0)
+            cur_bias = abs(float(stats.get("bias_pct") or 999.0))
+            daily_r2_target = float(daily_conv.get("r2_target", 0.80))
+            daily_slope_range = daily_conv.get("slope_range", [0.85, 1.15])
+            daily_pct_rmse_max = float(daily_conv.get("pct_rmse_max", 35.0))
+            daily_bias_max = float(daily_conv.get("bias_abs_max_pct", 15.0))
+            daily_sl_max_dev = float(daily_conv.get("screenline_max_pct_deviation", 15.0))
+            daily_ok = (
+                cur_r2 >= daily_r2_target
+                and float(daily_slope_range[0]) <= cur_slope <= float(daily_slope_range[1])
+                and cur_prmse <= daily_pct_rmse_max
+                and cur_bias <= daily_bias_max
+                and (max_sl_pct_dev <= daily_sl_max_dev if sl_results else True)
+            )
+            if daily_ok:
+                logger.info("  CONVERGED: all daily criteria met")
+                break
+
+            prev_Z = Z_current
+
+            # 5) Entropy multiplicative update via screenlines
+            data = mat.matrix[core_name]
+            demand = data[:, :].copy().astype(np.float64)
+
+            if sl_matrices:
+                for gd_it in range(1, gd_inner + 1):
+                    n_applied = _entropy_update_step(
+                        demand, sl_matrices, sl_results,
+                        step_size=entropy_step_size,
+                        ratio_max=sl_ratio_max,
+                        ratio_min=sl_ratio_min,
+                        clip_min=sl_clip_min,
+                        clip_max=sl_clip_max,
+                    )
+                    np.clip(demand, seed_lower, seed_upper, out=demand)
+                    np.maximum(demand, 0.0, out=demand)
+                    logger.info(
+                        f"    Entropy inner {gd_it}: {n_applied} SLs, "
+                        f"demand_total={demand.sum():,.0f}"
+                    )
+
+            # 6) Global residual
+            if len(valid) > 0 and total_vol > 0:
+                sum_obs = float(obs_all.sum())
+                sum_mod = float(mod_all.sum())
+                if sum_mod > 0 and sum_obs > 0:
+                    global_ratio = sum_obs / sum_mod
+                    global_factor = 1.0 + effective_global_damping * (global_ratio - 1.0)
+                    global_factor = float(np.clip(global_factor, sl_global_min, sl_global_max))
+                    if abs(global_factor - 1.0) > 0.003:
+                        demand *= global_factor
+                        np.clip(demand, seed_lower, seed_upper, out=demand)
+                        np.maximum(demand, 0.0, out=demand)
+                        logger.info(
+                            f"  Global residual: obs/mod={global_ratio:.3f} "
+                            f"→ factor={global_factor:.4f}"
+                        )
+
+            # 6b) Road-class residual correction
+            if class_res_enabled and len(valid) > 0 and compare_col:
+                class_ratios = _compute_class_residuals(
+                    valid, obs_col, compare_col,
+                    min_counts=class_res_min_counts,
+                )
+                class_ratios = _supplement_class_ratios_from_screenlines(
+                    sl_results, links_gdf, class_ratios,
+                )
+                if class_ratios:
+                    cr_logs = _apply_class_residual_correction(
+                        demand, vol_df, links_gdf, class_ratios,
+                        sl_matrices, sl_results,
+                        damping=class_res_damping,
+                        clip_min=sl_clip_min,
+                        clip_max=sl_clip_max,
+                        reference_total=post_gateway_total,
+                    )
+                    np.clip(demand, seed_lower, seed_upper, out=demand)
+                    np.maximum(demand, 0.0, out=demand)
+                    if cr_logs:
+                        logger.info(f"  Class residual corrections:")
+                        for crl in cr_logs:
+                            logger.info(f"    {crl}")
+
+            # 7) Gateway calibration
+            if ctx.gw_cal_enabled and vol_col:
+                gw_modeled = _compute_gateway_modeled_volumes(
+                    vol_df, screenlines, vol_col,
+                    sl_gw_map=ctx.sl_gw_map,
+                )
+                gw_corrections = _apply_gateway_calibration(
+                    demand, ctx.gw_zone_map, ctx.gw_observed, gw_modeled,
+                    damping=ctx.gw_cal_damping,
+                    min_factor=ctx.gw_cal_min_factor,
+                    max_factor=ctx.gw_cal_max_factor,
+                    seed_lower=seed_lower, seed_upper=seed_upper,
+                )
+                if gw_corrections:
+                    for gc_line in gw_corrections:
+                        logger.info(f"    {gc_line}")
+                post_gateway_total = float(demand.sum())
+                if outer_it == 1:
+                    rebased = demand.copy()
+                    seed_lower = rebased / max_deviation
+                    seed_upper = rebased * max_deviation
+                    seed_lower[rebased <= 0] = 0.0
+                    seed_upper[rebased <= 0] = 0.0
+                    ctx.seed_lower = seed_lower
+                    ctx.seed_upper = seed_upper
+
+            # Per-iteration demand cap
+            iter_total = float(demand.sum())
+            if total_demand > 0 and max_iter_change_pct > 0:
+                change_pct = (iter_total - total_demand) / total_demand * 100
+                if abs(change_pct) > max_iter_change_pct:
+                    cap_factor = total_demand * (
+                        1.0 + np.sign(change_pct) * max_iter_change_pct / 100.0
+                    ) / max(iter_total, 1.0)
+                    demand *= cap_factor
+                    logger.info(
+                        f"  Iter demand cap: {change_pct:+.1f}% exceeds "
+                        f"±{max_iter_change_pct:.0f}%, clamped to "
+                        f"{demand.sum():,.0f}"
+                    )
+
+            data[:, :] = demand
+            mat.save()
+            logger.info(f"  Matrix saved. Total demand: {demand.sum():,.0f}")
+
+    finally:
+        ctx.best_Z = best_Z
+        ctx.best_demand = best_demand
+        ctx.best_iteration = best_iteration
+        ctx.restore_best_and_close()
+
+    best_vol_df = ctx.finalize_best_state()
+    if best_vol_df is not None:
+        vol_df = best_vol_df
+
+    model_time_period = str(calib_cfg.get("model_time_period", "daily"))
+    best_final = history[best_iteration - 1] if history and 0 < best_iteration <= len(history) else (history[-1] if history else {})
+
+    report = {
+        "method": "entropy_odme",
+        "iterations": len(history),
+        "converged": len(history) > 0 and (
+            (len(history) >= 2 and abs(history[-1].get("Z_objective", 0) - history[-2].get("Z_objective", 1)) / max(abs(history[-2].get("Z_objective", 1)), 1) < conv_tol)
+            or _check_final_convergence(history, model_time_period, 85.0, daily_conv)
+        ),
+        "history": history,
+        "final": best_final,
+        "config": {
+            "max_outer_iterations": max_outer,
+            "gradient_descent_iterations": gd_inner,
+            "entropy_step_size": entropy_step_size,
+            "max_deviation": max_deviation,
+            "weight_function": weight_method,
+            "convergence_tol": conv_tol,
+        },
+        "screenlines": sl_results,
+    }
+    report_path = output_dir / "calibration_report.json"
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info(f"\nEntropy ODME report: {report_path}")
+
+    if history:
+        z_start = history[0].get("Z_objective", 0)
+        z_end = best_Z if best_Z < float("inf") else history[-1].get("Z_objective", 0)
+        logger.info(
+            f"  Z: {z_start:,.1f} → {z_end:,.1f}  "
+            f"(reduction: {(1 - z_end / max(z_start, 1)) * 100:.1f}%)  "
+            f"best at iteration {best_iteration}"
+        )
+        out_path = output_dir / "assignment_results.parquet"
+        vol_df.to_parquet(str(out_path), index=False)
+        logger.info(f"  Final assignment: {out_path}")
+
+
+# --- Multi-stage pipeline calibration ---
+
+def run_multistage_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
+    """Multi-stage pipeline: gravity recalib → gateway pre-calib → ODME → screenline fine-tune.
+
+    Stage 1: Re-calibrate gravity model + IPF using skims to improve seed.
+    Stage 2: Gateway pre-calibration with higher damping to fix external demand.
+    Stage 3: ODME with tighter elasticity bounds (seed is already improved).
+    Stage 4: Screenline-only fine-tuning pass with low damping.
+    """
+    import copy as _copy
+    import yaml as _yaml
+
+    cfg = load_config(config_path)
+    calib_cfg = cfg.get("calibration") or {}
+    demand_cfg = cfg.get("demand") or {}
+    output_dir = Path(demand_cfg.get("output_dir", "outputs/baseline/demand"))
+    _ensure_dir(output_dir)
+    matrix_path = Path(demand_cfg.get("matrix_path", "data/demand/od_matrix.aem"))
+    core_name = str(calib_cfg.get("core_name", "wd_daily"))
+    ms_cfg = calib_cfg.get("multistage") or {}
+    max_total_change_pct = float(ms_cfg.get("max_total_change_pct", 50.0))
+
+    stage_reports: List[Dict[str, Any]] = []
+
+    logger.info("=== MULTI-STAGE PIPELINE CALIBRATION ===")
+
+    # ---- Stage 1: Gravity recalibration + IPF ----
+    logger.info("\n--- Stage 1: Gravity recalibration + IPF ---")
+    skim_path = output_dir / "skims.aem"
+    stage1_improved = False
+    if skim_path.exists():
+        try:
+            from sim.distribution import calibrate_gravity_simple, run_ipf
+
+            mat = AequilibraeMatrix()
+            mat.load(str(matrix_path))
+            mat.computational_view([core_name])
+            seed = mat.matrix[core_name][:, :].copy().astype(np.float64)
+            seed_total = float(seed.sum())
+
+            skim_mat = AequilibraeMatrix()
+            skim_mat.load(str(skim_path))
+            skim_names = list(skim_mat.names)
+            impedance = skim_mat.matrix[skim_names[0]][:, :].copy() if skim_names else None
+            skim_mat.close()
+
+            if impedance is not None:
+                params = calibrate_gravity_simple(seed, impedance)
+                logger.info(f"  Gravity params: {params}")
+
+                beta = params.get("beta", 0.0001)
+                gravity = np.exp(-beta * impedance)
+                np.fill_diagonal(gravity, 0)
+
+                row_targets = seed.sum(axis=1)
+                col_targets = seed.sum(axis=0)
+                valid_rc = (row_targets > 0) & (col_targets > 0)
+                if valid_rc.any():
+                    ipf_result = run_ipf(gravity, row_targets, col_targets)
+                    blended = 0.7 * ipf_result + 0.3 * seed
+                    blended_total = float(blended.sum())
+                    if blended_total > 0:
+                        blended *= seed_total / blended_total
+                    # Guard-rail: cap total demand change
+                    final_total = float(blended.sum())
+                    change_pct = abs(final_total - seed_total) / max(seed_total, 1) * 100
+                    if change_pct > max_total_change_pct:
+                        logger.warning(
+                            f"  Stage 1: demand change {change_pct:.1f}% exceeds "
+                            f"cap {max_total_change_pct:.0f}%, rescaling to seed total"
+                        )
+                        blended *= seed_total / max(final_total, 1.0)
+                    mat.matrix[core_name][:, :] = blended
+                    mat.save()
+                    stage1_improved = True
+                    logger.info(f"  Stage 1 complete: demand total {float(blended.sum()):,.0f} (seed was {seed_total:,.0f})")
+
+            mat.close()
+        except Exception:
+            logger.exception("Stage 1 (gravity recalibration) failed, continuing with seed")
+
+    stage_reports.append({
+        "stage": 1,
+        "name": "gravity_recalibration",
+        "applied": stage1_improved,
+    })
+    if not stage1_improved:
+        logger.info("  Stage 1 skipped (no skims or error)")
+
+    # ---- Stage 2: Gateway pre-calibration with higher damping ----
+    logger.info("\n--- Stage 2: Gateway pre-calibration ---")
+    stage2_applied = False
+    gw_cal_cfg = calib_cfg.get("gateway_calibration") or {}
+    if gw_cal_cfg.get("enabled", True):
+        try:
+            ctx_tmp = _CalibrationContext(config_path)
+
+            if ctx_tmp.gw_cal_enabled and ctx_tmp.gw_zone_map and ctx_tmp.gw_observed:
+                data = ctx_tmp.mat.matrix[core_name]
+                demand = data[:, :].copy().astype(np.float64)
+
+                # Run one assignment to get current volumes
+                vol_df_gw, _, _ = ctx_tmp.run_assignment()
+                vol_col_gw = _detect_volume_col(vol_df_gw)
+
+                if vol_col_gw:
+                    from sim.screenlines import evaluate_all_screenlines
+                    gw_modeled = _compute_gateway_modeled_volumes(
+                        vol_df_gw, ctx_tmp.screenlines, vol_col_gw,
+                        sl_gw_map=ctx_tmp.sl_gw_map,
+                    )
+                    # Higher damping for pre-calibration (0.4 vs default 0.18)
+                    pre_damping = float(gw_cal_cfg.get("pre_damping", 0.4))
+                    gw_corrections = _apply_gateway_calibration(
+                        demand, ctx_tmp.gw_zone_map, ctx_tmp.gw_observed, gw_modeled,
+                        damping=pre_damping,
+                        min_factor=0.5,
+                        max_factor=2.0,
+                        seed_lower=ctx_tmp.seed_lower,
+                        seed_upper=ctx_tmp.seed_upper,
+                    )
+                    if gw_corrections:
+                        data[:, :] = demand
+                        ctx_tmp.mat.save()
+                        stage2_applied = True
+                        for gc_line in gw_corrections:
+                            logger.info(f"    {gc_line}")
+
+            ctx_tmp.mat.close()
+            ctx_tmp.project.close()
+        except Exception:
+            logger.exception("Stage 2 (gateway pre-calibration) failed")
+
+    stage_reports.append({
+        "stage": 2,
+        "name": "gateway_pre_calibration",
+        "applied": stage2_applied,
+    })
+
+    # ---- Stage 3: ODME with tighter bounds ----
+    logger.info("\n--- Stage 3: ODME (tight bounds) ---")
+    # Capture pre-ODME demand total for the post-stage cap
+    pre_odme_total = 0.0
+    try:
+        _pre_mat = AequilibraeMatrix()
+        _pre_mat.load(str(matrix_path))
+        _pre_mat.computational_view([core_name])
+        pre_odme_total = float(_pre_mat.matrix[core_name][:, :].sum())
+        _pre_mat.close()
+    except Exception:
+        pass
+
+    raw_yaml_path = Path(config_path).expanduser().resolve()
+    raw = _yaml.safe_load(raw_yaml_path.read_text(encoding="utf-8")) or {}
+    raw_calib = raw.get("calibration") or {}
+    raw_calib.setdefault("odme", {})
+    ms_max_dev = float(
+        ms_cfg.get("multistage_max_deviation", 3.0)
+    )
+    raw_calib["odme"]["max_deviation"] = ms_max_dev
+    raw_calib["method"] = "odme"
+    raw["calibration"] = raw_calib
+
+    tmp_cfg = raw_yaml_path.parent / "_tmp_multistage_odme.yaml"
+    tmp_cfg.write_text(
+        _yaml.dump(raw, default_flow_style=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    try:
+        run_odme_calibration(str(tmp_cfg))
+        # Read ODME report for stage metrics
+        report_path = output_dir / "calibration_report.json"
+        stage3_report = {}
+        if report_path.exists():
+            stage3_report = json.loads(report_path.read_text(encoding="utf-8"))
+        stage_reports.append({
+            "stage": 3,
+            "name": "odme_tight_bounds",
+            "applied": True,
+            "final": stage3_report.get("final", {}),
+            "iterations": stage3_report.get("iterations", 0),
+        })
+    except Exception:
+        logger.exception("Stage 3 (ODME) failed")
+        stage_reports.append({"stage": 3, "name": "odme_tight_bounds", "applied": False})
+    finally:
+        tmp_cfg.unlink(missing_ok=True)
+
+    # Post-Stage-3 demand cap: prevent runaway inflation
+    if pre_odme_total > 0:
+        try:
+            _post_mat = AequilibraeMatrix()
+            _post_mat.load(str(matrix_path))
+            _post_mat.computational_view([core_name])
+            _post_data = _post_mat.matrix[core_name]
+            post_total = float(_post_data[:, :].sum())
+            pct_change = (post_total - pre_odme_total) / pre_odme_total * 100
+            if abs(pct_change) > max_total_change_pct:
+                logger.warning(
+                    f"  Post-ODME demand change {pct_change:+.1f}% exceeds cap "
+                    f"{max_total_change_pct:.0f}%, rescaling to pre-ODME total"
+                )
+                _post_data[:, :] = (
+                    _post_data[:, :].astype(np.float64)
+                    * (pre_odme_total / max(post_total, 1.0))
+                )
+                _post_mat.save()
+            else:
+                logger.info(f"  Post-ODME demand change: {pct_change:+.1f}% (within cap)")
+            _post_mat.close()
+        except Exception:
+            logger.exception("Post-ODME demand cap check failed")
+
+    # ---- Stage 4: Screenline fine-tuning ----
+    logger.info("\n--- Stage 4: Screenline fine-tuning ---")
+    stage4_applied = False
+    try:
+        ctx_final = _CalibrationContext(config_path)
+        # Disable matrix reset so we keep the ODME-calibrated matrix
+        # (the backup was already made by ODME in stage 3)
+        mat_f = ctx_final.mat
+        data_f = mat_f.matrix[core_name]
+        demand_f = data_f[:, :].copy().astype(np.float64)
+
+        vol_df_f, _, sl_matrices_f = ctx_final.run_assignment()
+        vol_col_f = _detect_volume_col(vol_df_f)
+
+        if vol_col_f and ctx_final.screenlines and sl_matrices_f:
+            from sim.screenlines import evaluate_all_screenlines
+
+            links_with_vol_f = ctx_final.links_gdf.copy()
+            links_with_vol_f = links_with_vol_f.merge(
+                vol_df_f[["link_id", vol_col_f]], on="link_id", how="left",
+            )
+            matched_f = match_counts_to_links(
+                ctx_final.pent, links_with_vol_f,
+                buffer_m=ctx_final.buffer_m,
+                direction_aware=ctx_final.direction_aware,
+                vol_col=vol_col_f,
+                match_quality_min=ctx_final.match_quality_min,
+            )
+            sl_res_f = evaluate_all_screenlines(
+                ctx_final.screenlines, vol_df_f, matched_f,
+                vol_col_f, ctx_final.obs_col, ctx_final.links_gdf,
+            )
+            sl_results_f = {sn: sr.to_dict() for sn, sr in sl_res_f.items()}
+
+            fine_damping = 0.1
+            n_sl_active_f = sum(
+                1 for sn in sl_matrices_f
+                if _sr_val(sl_results_f.get(sn, {}), "observed_total") > 0
+                and _sr_val(sl_results_f.get(sn, {}), "modeled_total") > 0
+            )
+            sl_damp_f = fine_damping / max(np.sqrt(n_sl_active_f), 1.0)
+
+            for sl_name, sl_od_raw in sl_matrices_f.items():
+                obs_sl = _sr_val(sl_results_f.get(sl_name, {}), "observed_total")
+                mod_sl = _sr_val(sl_results_f.get(sl_name, {}), "modeled_total")
+                if obs_sl <= 0 or mod_sl <= 0:
+                    continue
+                ratio = obs_sl / mod_sl
+                if ratio > ctx_final.sl_ratio_max or ratio < ctx_final.sl_ratio_min:
+                    continue
+
+                sl_od = np.asarray(sl_od_raw, dtype=np.float64).reshape(demand_f.shape)
+                proportion = np.where(
+                    demand_f > 0,
+                    np.clip(sl_od / np.maximum(demand_f, 1e-9), 0.0, 1.0),
+                    0.0,
+                )
+                adjustment = 1.0 + sl_damp_f * (ratio - 1.0) * proportion
+                np.clip(adjustment, ctx_final.sl_clip_min, ctx_final.sl_clip_max, out=adjustment)
+                demand_f *= adjustment
+
+            np.clip(demand_f, ctx_final.seed_lower, ctx_final.seed_upper, out=demand_f)
+            np.maximum(demand_f, 0.0, out=demand_f)
+            data_f[:, :] = demand_f
+            mat_f.save()
+            stage4_applied = True
+            logger.info(f"  Stage 4 complete: demand total={demand_f.sum():,.0f}")
+
+        mat_f.close()
+        ctx_final.project.close()
+    except Exception:
+        logger.exception("Stage 4 (screenline fine-tuning) failed")
+
+    stage_reports.append({
+        "stage": 4,
+        "name": "screenline_fine_tuning",
+        "applied": stage4_applied,
+    })
+
+    # Final report
+    report = {
+        "method": "multistage",
+        "stages": stage_reports,
+    }
+    report_path = output_dir / "calibration_report.json"
+    # Merge with ODME report if it exists
+    if report_path.exists():
+        try:
+            odme_report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["final"] = odme_report.get("final", {})
+            report["history"] = odme_report.get("history", [])
+            report["iterations"] = odme_report.get("iterations", 0)
+            report["converged"] = odme_report.get("converged", False)
+            report["screenlines"] = odme_report.get("screenlines", {})
+        except Exception:
+            pass
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info(f"\nMulti-stage report: {report_path}")
+
+
 # --- Legacy iterative calibration ---
 
 def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
@@ -2989,6 +4240,10 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
     seed_upper = ctx.seed_upper
 
     model_time_period = str(calib_cfg.get("model_time_period", "daily"))
+    weight_method = str(
+        calib_cfg.get("weight_function")
+        or (calib_cfg.get("odme") or {}).get("weight_function", "inverse_sqrt")
+    )
 
     max_iterations = int(calib_cfg.get("max_iterations", 10))
     conv_cfg = calib_cfg.get("convergence") or {}
@@ -3002,6 +4257,13 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
     daily_pct_rmse_max = float(daily_conv.get("pct_rmse_max", 35.0))
     daily_sl_max_dev = float(daily_conv.get("screenline_max_pct_deviation", 15.0))
     daily_bias_max = float(daily_conv.get("bias_abs_max_pct", 15.0))
+
+    sl_ratio_max = ctx.sl_ratio_max
+    sl_ratio_min = ctx.sl_ratio_min
+    sl_clip_min = ctx.sl_clip_min
+    sl_clip_max = ctx.sl_clip_max
+    sl_global_min = ctx.sl_global_min
+    sl_global_max = ctx.sl_global_max
 
     scale_cfg = calib_cfg.get("scaling") or {}
     scale_method = str(scale_cfg.get("method", "select_link"))
@@ -3020,6 +4282,11 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
             "Scaling config params present but unused (elasticity uses max_deviation): %s",
             _unused_scale_params,
         )
+    odme_cfg_for_class = calib_cfg.get("odme") or {}
+    class_res_enabled = bool(odme_cfg_for_class.get("class_residual_enabled", True))
+    class_res_damping = float(odme_cfg_for_class.get("class_residual_damping", 0.15))
+    class_res_min_counts = int(odme_cfg_for_class.get("class_residual_min_counts", 3))
+
     quality_cfg = calib_cfg.get("quality_gates") or {}
     q_bias_hard = float(quality_cfg.get("hard_class_bias_max_abs_pct", 90.0))
     q_wmape_warn = float(quality_cfg.get("warn_wmape_pct", 47.0))
@@ -3181,7 +4448,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
             if not valid.empty and compare_col in valid.columns:
                 _mod = valid[compare_col].values.astype(np.float64)
                 _obs = valid[obs_col].values.astype(np.float64)
-                _w = _compute_count_weights(_obs)
+                _w = _compute_count_weights(_obs, method=weight_method)
                 Z_current = _odme_objective(_mod, _obs, _w)
                 if Z_current < best_Z:
                     best_Z = Z_current
@@ -3348,6 +4615,20 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                         "Quality objective computation failed",
                         exc_info=True,
                     )
+            if class_res_enabled and len(valid) > 0 and compare_col:
+                cr = _compute_class_residuals(
+                    valid, obs_col, compare_col,
+                    min_counts=class_res_min_counts,
+                )
+                cr = _supplement_class_ratios_from_screenlines(
+                    sl_results, links_gdf, cr,
+                )
+                if cr:
+                    iter_record["class_ratios"] = {k: round(v, 3) for k, v in cr.items()}
+                    logger.info(
+                        f"  Per-class obs/mod: "
+                        + ", ".join(f"{k}={v:.3f}" for k, v in cr.items())
+                    )
             history.append(iter_record)
 
             # 4) Convergence check — daily vs hourly criteria
@@ -3433,7 +4714,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                         if obs_sl <= 0 or mod_sl <= 0:
                             continue
                         ratio = obs_sl / mod_sl
-                        if ratio > 5.0 or ratio < 0.2:
+                        if ratio > sl_ratio_max or ratio < sl_ratio_min:
                             continue
 
                         sl_od = np.asarray(sl_od_raw, dtype=np.float64).reshape(demand.shape)
@@ -3443,7 +4724,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                             0.0,
                         )
                         adjustment = 1.0 + sl_damp * (ratio - 1.0) * proportion
-                        np.clip(adjustment, 0.5, 2.0, out=adjustment)
+                        np.clip(adjustment, sl_clip_min, sl_clip_max, out=adjustment)
                         demand *= adjustment
                         corrections_log.append(f"{sl_name}={ratio:.2f}")
 
@@ -3459,7 +4740,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                 if sum_mod > 0 and sum_obs > 0:
                     global_ratio = sum_obs / sum_mod
                     global_factor = 1.0 + damping * (global_ratio - 1.0)
-                    global_factor = float(np.clip(global_factor, 0.8, 1.25))
+                    global_factor = float(np.clip(global_factor, sl_global_min, sl_global_max))
                     if abs(global_factor - 1.0) > 0.003:
                         demand *= global_factor
                         logger.info(
@@ -3467,10 +4748,33 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                             f"→ factor={global_factor:.4f}"
                         )
 
+                # (b2) Road-class residual correction
+                if class_res_enabled and compare_col:
+                    class_ratios = _compute_class_residuals(
+                        valid, obs_col, compare_col,
+                        min_counts=class_res_min_counts,
+                    )
+                    class_ratios = _supplement_class_ratios_from_screenlines(
+                        sl_results, links_gdf, class_ratios,
+                    )
+                    if class_ratios:
+                        cr_logs = _apply_class_residual_correction(
+                            demand, vol_df, links_gdf, class_ratios,
+                            sl_matrices, sl_results,
+                            damping=class_res_damping,
+                            clip_min=sl_clip_min,
+                            clip_max=sl_clip_max,
+                        )
+                        if cr_logs:
+                            logger.info(f"  Class residual corrections:")
+                            for crl in cr_logs:
+                                logger.info(f"    {crl}")
+
                 # (c) Gateway calibration — per-gateway OD scaling
                 if ctx.gw_cal_enabled and vol_col:
                     gw_modeled = _compute_gateway_modeled_volumes(
                         vol_df, screenlines, vol_col,
+                        sl_gw_map=ctx.sl_gw_map,
                     )
                     gw_corrections = _apply_gateway_calibration(
                         demand,
@@ -3852,20 +5156,27 @@ def compute_validation_benchmarks(
     *,
     model_time_period: str = "daily",
     daily_thresholds: Optional[Dict[str, Any]] = None,
+    benchmarks: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Check validation benchmarks for the model's time aggregation.
 
     For daily models: R², slope, %RMSE, bias, screenline deviations.
     GEH is diagnostic only (FHWA target is for hourly flows).
     Thresholds default to calibration.convergence.daily if not provided.
+    *benchmarks* overrides GEH and JT pass-rate thresholds from
+    calibration.benchmarks config.
     """
+    bm = benchmarks or {}
+    geh_pass_pct = float(bm.get("geh_lt5_pass_pct", 85.0))
+    jt_pass_pct_thr = float(bm.get("jt_pass_pct", 85.0))
+
     geh5 = float(count_stats.get("geh_lt5_pct", 0))
-    geh_pass_hourly = geh5 >= 85.0
+    geh_pass_hourly = geh5 >= geh_pass_pct
 
     jt_pass_count = sum(1 for r in jt_results if r.get("pass", False))
     jt_total = len(jt_results) if jt_results else 0
     jt_pct = jt_pass_count / max(jt_total, 1) * 100
-    jt_pass = jt_pct >= 85.0 if jt_total > 0 else None
+    jt_pass = jt_pct >= jt_pass_pct_thr if jt_total > 0 else None
 
     sl_max_error = 0.0
     for sr in screenline_results.values():
@@ -4132,11 +5443,18 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
     try:
         from sim.screenlines import load_screenlines_with_auto, evaluate_all_screenlines
         csd_for_auto = None
+        csd_full_for_gw = None
         try:
             csd_for_auto = load_csd(cfg)
         except Exception:
             pass
-        screenlines = load_screenlines_with_auto(cfg, csd_df=csd_for_auto)
+        try:
+            csd_full_for_gw = load_csd_unfiltered(cfg)
+        except Exception:
+            pass
+        screenlines = load_screenlines_with_auto(
+            cfg, csd_df=csd_for_auto, csd_df_full=csd_full_for_gw,
+        )
         if screenlines:
             sl_res = evaluate_all_screenlines(
                 screenlines, vol_df,
@@ -4201,10 +5519,12 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
     # 5) Benchmark summary
     logger.info(f"\n5) Validation benchmarks (model_time_period={model_time_period}) ...")
     daily_conv = _get(cfg, ["calibration", "convergence", "daily"], {})
+    bm_cfg = _get(cfg, ["calibration", "benchmarks"], {})
     benchmarks = compute_validation_benchmarks(
         pent_stats, sl_results, jt_results,
         model_time_period=model_time_period,
         daily_thresholds=daily_conv,
+        benchmarks=bm_cfg,
     )
     report["benchmarks"] = benchmarks
     qcfg = (calib_cfg.get("quality_gates") or {})

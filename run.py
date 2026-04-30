@@ -47,7 +47,14 @@ from sim.zoning import build_zones_and_connectors
 from sim.fetch_datasets import resolved_csd2025_validation_parquet_path, run_fetch_datasets
 from sim.demand import assert_build_demand_prerequisites, load_or_build_od_matrix
 from sim.assignment import run_assignment, run_warm_skim_assignment
-from sim.calibration import run_calibration, run_odme_calibration, run_validation_only, run_match_diagnostics
+from sim.calibration import (
+    run_calibration,
+    run_odme_calibration,
+    run_entropy_odme,
+    run_multistage_calibration,
+    run_validation_only,
+    run_match_diagnostics,
+)
 from sim.temporal import run_learn_profile
 from sim.supernetwork import run_build_supernetwork
 
@@ -220,6 +227,10 @@ def main() -> None:
         method = (_c.get("calibration") or {}).get("method", "fsm")
         if step == "calibrate-odme" or method == "odme":
             run_odme_calibration(cfg)
+        elif method == "entropy_odme":
+            run_entropy_odme(cfg)
+        elif method == "multistage":
+            run_multistage_calibration(cfg)
         else:
             run_calibration(cfg)
     elif step == "tune-supply":

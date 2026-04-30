@@ -3,7 +3,7 @@
 
 Usage:
     python scripts/generate_city_config.py
-    python scripts/generate_city_config.py --city "Olomouc" --okres "Olomouc" --kraj "Olomoucký kraj" --trips 20000
+    python scripts/generate_city_config.py --city "Olomouc" --okres "Olomouc" --kraj "Olomoucký kraj"
 
 Creates config/<slug>/sim.yaml, locale.yaml, and screenlines.yaml
 ready for:
@@ -77,7 +77,8 @@ def generate(
     city: str,
     okres: str,
     kraj: str,
-    total_daily_trips: int,
+    total_daily_trips: int | str = "auto",
+    gateways: list[str] | None = None,
     output_dir: Path,
 ) -> Path:
     slug = _slug(city)
@@ -86,6 +87,8 @@ def generate(
 
     city_name = city if "," in city else f"{city}, Czechia"
     okres_name = okres if "," in okres else f"Okres {okres}, Czechia"
+    gw_list = gateways or []
+    gw_yaml = str(gw_list) if gw_list else "[]"
 
     # --- sim.yaml ---
     sim_yaml = textwrap.dedent(f"""\
@@ -102,17 +105,18 @@ def generate(
               admin_level: "9"
           external_gateways:
             enabled: true
-            whitelist: []
+            whitelist: {gw_yaml}
 
         demand:
           segments:
             external_local:
-              total_daily_trips: {total_daily_trips}
+              total_daily_trips: {total_daily_trips if isinstance(total_daily_trips, int) else '"auto"'}
 
         calibration:
           count_source: "csd_split"
           auto_screenlines:
             enabled: true
+            gateway_screenlines: true
 
         datasets:
           enabled: true
@@ -160,6 +164,19 @@ def generate(
     return config_dir
 
 
+_PIPELINE_STEPS = [
+    "build-network",
+    "fetch-data",
+    "normalize-network",
+    "build-zones",
+    "build-supernetwork",
+    "build-demand",
+    "assign",
+    "calibrate-odme",
+    "validate",
+]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Generate city configuration for the simulation pipeline.",
@@ -168,7 +185,9 @@ def main() -> None:
     ap.add_argument("--city", help='City name, e.g. "Olomouc" or "Olomouc, Czechia"')
     ap.add_argument("--okres", help='District (okres) name for SLDB filter, e.g. "Olomouc"')
     ap.add_argument("--kraj", help='Region (kraj) for CSD filter, e.g. "Olomoucký kraj"')
-    ap.add_argument("--trips", type=int, help="Estimated external_local daily trips")
+    ap.add_argument("--trips", type=int, default=None,
+                        help="External-local daily trips (omit for auto-estimation from CSD)")
+    ap.add_argument("--gateways", help='Comma-separated major gateway road refs, e.g. "D1,D2,I/43" (empty for auto-detect)')
     ap.add_argument("--output-dir", default="config", help="Parent dir for city configs")
     args = ap.parse_args()
 
@@ -186,17 +205,32 @@ def main() -> None:
     city_short = city.split(",")[0].strip()
     slug = _slug(city)
 
+    gateways: list[str] = []
     if interactive:
         okres = _prompt("Okres (district) for SLDB filter", city_short)
         kraj = _prompt_choice("Select kraj (region) for CSD:", _KRAJE)
-        trips = _prompt_int(
-            "Estimated external-local daily trips (small city ~10k, medium ~20k, large ~40k)",
-            15000,
+        trips_str = _prompt(
+            "External-local daily trips (number, or 'auto' for CSD estimation)",
+            "auto",
         )
+        trips: int | str = "auto"
+        if trips_str.strip().lower() != "auto":
+            try:
+                trips = int(trips_str)
+            except ValueError:
+                print(f"  Invalid number, using 'auto'")
+        gw_str = _prompt(
+            "Major gateway road refs, comma-separated (e.g. D1,D2,I/43; empty for auto-detect)",
+            "",
+        )
+        if gw_str.strip():
+            gateways = [g.strip() for g in gw_str.split(",") if g.strip()]
     else:
         okres = args.okres or city_short
         kraj = args.kraj or ""
-        trips = args.trips or 15000
+        trips = args.trips if args.trips is not None else "auto"
+        if args.gateways:
+            gateways = [g.strip() for g in args.gateways.split(",") if g.strip()]
 
     output_dir = Path(args.output_dir)
     config_dir = generate(
@@ -204,6 +238,7 @@ def main() -> None:
         okres=okres,
         kraj=kraj,
         total_daily_trips=trips,
+        gateways=gateways or None,
         output_dir=output_dir,
     )
 
@@ -211,12 +246,13 @@ def main() -> None:
     print(f"  sim.yaml")
     print(f"  locale.yaml")
     print(f"  screenlines.yaml")
-    print(f"\nRun the pipeline:")
-    print(f"  python run.py --config {config_dir}/sim.yaml build-network")
-    print(f"  python run.py --config {config_dir}/sim.yaml fetch-data")
-    print(f"  python run.py --config {config_dir}/sim.yaml normalize-network")
-    print(f"  python run.py --config {config_dir}/sim.yaml build-zones")
-    print(f"  ...")
+    print(f"\nRun the full pipeline:")
+    cfg = f"{config_dir}/sim.yaml"
+    for step in _PIPELINE_STEPS:
+        print(f"  python run.py --config {cfg} {step}")
+    print(f"\nOr run all steps at once:")
+    steps_str = " ".join(_PIPELINE_STEPS)
+    print(f'  for step in {steps_str}; do python run.py --config {cfg} $step; done')
 
 
 if __name__ == "__main__":

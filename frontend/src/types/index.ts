@@ -214,8 +214,10 @@ export interface OdSummary {
 // Diagnostics
 // ---------------------------------------------------------------------------
 
+export type BiasStationStatus = "usable" | "excluded" | "unmatched";
+
 export interface BiasStationProperties {
-  link_id: number;
+  link_id: number | null;
   name: string;
   link_type: string;
   observed: number;
@@ -224,6 +226,7 @@ export interface BiasStationProperties {
   error: number;
   geh: number;
   corridor_n_links: number;
+  status?: BiasStationStatus;
 }
 
 export interface BiasClusterProperties {

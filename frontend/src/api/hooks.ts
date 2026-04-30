@@ -85,14 +85,17 @@ export const useOdSummary = () =>
 // Diagnostics
 // ---------------------------------------------------------------------------
 
-export const useBiasData = (clustered = false, eps = 100) =>
+export const useBiasData = (clustered = false, eps = 100, showAll = false) =>
   useQuery({
-    queryKey: ["diagnostics", "bias", clustered, eps],
+    queryKey: ["diagnostics", "bias", clustered, eps, showAll],
     queryFn: () => {
       const params = new URLSearchParams();
       if (clustered) {
         params.set("cluster", "true");
         params.set("eps", String(eps));
+      }
+      if (showAll) {
+        params.set("show_all", "true");
       }
       const qs = params.toString();
       return apiFetch<GeoJSONFeatureCollection | BiasClusteredResponse>(

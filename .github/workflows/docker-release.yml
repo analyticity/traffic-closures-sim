@@ -58,8 +58,7 @@ jobs:
       - name: Download external data sources
         if: steps.guard.outputs.skip == 'false'
         run: |
-          mkdir -p data/sources/rsd/csd2025 \
-                   data/sources/csu/sldb2021 \
+          mkdir -p data/sources/csu/sldb2021 \
                    data/sources/cz/places \
                    data/sources/osm
 
@@ -73,8 +72,7 @@ jobs:
             curl -fsSL --retry 3 --retry-delay 5 -o "$dest.part" "$url" && mv "$dest.part" "$dest"
           }
 
-          dl "https://www.rsd.cz/documents/38144/3734982/V2_CSD_2025.xlsx/50663492-395b-0fd4-f365-d18440997ca5?t=1773922634346" \
-             data/sources/rsd/csd2025/V2_CSD2025.xlsx
+          # CSD (V2_CSD2025.xlsx) is committed in the repo — no download needed.
 
           dl "https://csu.gov.cz/docs/107508/4dbdab3b-905c-deff-4cfa-e4828a6fa2de/dojizdka_obce.csv?version=1.0" \
              data/sources/csu/sldb2021/dojizdka_obce.csv

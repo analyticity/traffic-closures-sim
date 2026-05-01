@@ -477,7 +477,13 @@ class _CalibrationContext:
         self._transition(CalibrationState.STALLED)
 
     def check_convergence(self, stats: Dict[str, Any], max_sl_pct_dev: float, sl_results: Dict[str, Any]) -> bool:
-        """Unified daily/hourly convergence check. Returns True if converged."""
+        """Unified daily convergence check.  Returns True if converged.
+
+        GEH is intentionally excluded for daily models — it was designed for
+        hourly flows and its Poisson assumption breaks down at daily volumes.
+        Daily convergence relies on R², slope, %RMSE, bias, and screenline
+        deviation instead.
+        """
         daily_conv = self.daily_conv
         cur_r2 = float(stats.get("r2") or 0.0)
         cur_slope = float(stats.get("slope") or 0.0)

@@ -111,14 +111,23 @@ def compute_objective(
     screenline_results: Dict[str, Any],
     jt_results: List[Dict[str, Any]],
     weights: Dict[str, float],
+    *,
+    model_time_period: str = "hourly",
 ) -> float:
     """Weighted composite objective for supply calibration (lower is better).
 
-    Includes R², slope, and %RMSE terms so that daily-model supply tuning
-    optimises for regression fit rather than hourly-specific GEH.
+    GEH terms (``geh_mean`` and ``geh_lt5_pct``) are only included for hourly
+    models.  For daily models the objective relies on R², slope, %RMSE,
+    screenlines, and journey times — GEH is statistically inappropriate at
+    daily volumes (its Poisson assumption breaks down).
     """
     w = weights
-    geh_term = (100.0 - float(count_stats.get("geh_lt5_pct", 0))) * w.get("geh", 1.0)
+
+    geh_terms = 0.0
+    if model_time_period != "daily":
+        geh_mean = float(count_stats.get("geh_mean") or 0.0)
+        geh_terms += geh_mean * w.get("geh_mean", 2.0)
+        geh_terms += (100.0 - float(count_stats.get("geh_lt5_pct", 0))) * w.get("geh", 1.0)
 
     r2 = float(count_stats.get("r2") or 0.0)
     r2_term = (1.0 - r2) * 100.0 * w.get("r2", 1.0)
@@ -139,7 +148,7 @@ def compute_objective(
     jt_fail = sum(1 for r in jt_results if not r.get("pass", True))
     jt_term = jt_fail / max(len(jt_results), 1) * 100 * w.get("jt", 1.0) if jt_results else 0.0
 
-    return geh_term + r2_term + slope_term + rmse_term + sl_term + jt_term
+    return geh_terms + r2_term + slope_term + rmse_term + sl_term + jt_term
 
 
 def run_supply_tuning(config_path: str | Path = "config/brno/sim.yaml") -> None:
@@ -157,11 +166,12 @@ def run_supply_tuning(config_path: str | Path = "config/brno/sim.yaml") -> None:
     output_dir = Path(demand_cfg.get("output_dir", "outputs/baseline/demand"))
     _ensure_dir(output_dir)
 
+    model_time_period = str(calib_cfg.get("model_time_period", "daily"))
     road_classes = tuning_cfg.get("road_classes", ["motorway", "trunk", "primary", "secondary", "tertiary"])
     speed_range = tuning_cfg.get("speed_factor_range", [0.8, 0.9, 1.0, 1.1, 1.2])
     cap_range = tuning_cfg.get("capacity_factor_range", [0.8, 0.9, 1.0, 1.1, 1.2])
     inner_max_iter = int(tuning_cfg.get("inner_max_iterations", 3))
-    obj_weights = {"geh": 1.0, "screenline": 2.0, "jt": 1.0}
+    obj_weights = {"geh": 1.0, "geh_mean": 2.0, "screenline": 2.0, "jt": 1.0}
 
     logger.info("=== SUPPLY PARAMETER TUNING ===")
     logger.info("  Road classes: %s", road_classes)
@@ -223,7 +233,7 @@ def run_supply_tuning(config_path: str | Path = "config/brno/sim.yaml") -> None:
                         exc_info=True,
                     )
 
-        return compute_objective(count_stats, sl_results, jt_results, obj_weights)
+        return compute_objective(count_stats, sl_results, jt_results, obj_weights, model_time_period=model_time_period)
 
     best_obj = _evaluate(best_params)
     logger.info("\n  Baseline objective: %.2f", best_obj)

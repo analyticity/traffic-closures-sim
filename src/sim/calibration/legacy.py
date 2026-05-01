@@ -376,6 +376,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
     max_iterations = int(calib_cfg.get("max_iterations", 10))
     conv_cfg = calib_cfg.get("convergence") or {}
     geh_target = float(conv_cfg.get("geh_lt5_target_pct", 85.0))
+    geh_mean_target = float(conv_cfg.get("geh_mean_target", 5.0))
     min_improvement = float(conv_cfg.get("min_improvement_pct", -5.0))
 
     daily_r2_target = float(daily_conv.get("r2_target", 0.80))
@@ -415,6 +416,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
     w_r2 = float(q_obj_weights.get("r2", 80.0))
     w_slope = float(q_obj_weights.get("slope_penalty", 50.0))
     w_geh = float(q_obj_weights.get("geh_lt5", 1.8))
+    w_geh_mean = float(q_obj_weights.get("geh_mean", 3.0))
     w_wmape = float(q_obj_weights.get("wmape_pct", 1.0))
     w_bias = float(q_obj_weights.get("class_bias_max_abs_pct", 0.35))
     w_rmse = float(q_obj_weights.get("pct_rmse", 0.35))
@@ -499,13 +501,14 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
 
             geh5 = float(stats.get("geh_lt5_pct", 0))
             geh10 = float(stats.get("geh_lt10_pct", 0))
+            geh_mean = float(stats.get("geh_mean") or 0.0)
             r2 = stats.get("r2")
             slope = stats.get("slope")
             pct_rmse = stats.get("pct_rmse")
             bias_pct = stats.get("bias_pct")
             daily_geh_adj = float(stats.get("daily_geh_lt_adj_pct") or 0)
 
-            logger.info(f"  R²={r2}  slope={slope}  %RMSE={pct_rmse}  bias={bias_pct}%")
+            logger.info(f"  R²={r2}  slope={slope}  %RMSE={pct_rmse}  bias={bias_pct}%  GEH_mean={geh_mean:.2f}")
             logger.info(
                 f"  GEH<5: {geh5:.1f}%  GEH<10: {geh10:.1f}%  "
                 f"daily-adj GEH<{stats.get('daily_geh_threshold', 5):.0f}: {daily_geh_adj:.1f}%"
@@ -628,6 +631,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                         + w_r2 * cur_r2
                         - w_slope * slope_dev
                         + w_geh * geh5
+                        - w_geh_mean * geh_mean
                         - w_wmape * wmape
                         - w_bias * bias_abs
                         - w_rmse * cur_pct_rmse
@@ -683,9 +687,17 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                 if converged:
                     logger.info("  CONVERGED (daily): all criteria met")
             else:
-                if geh5 >= geh_target:
-                    logger.info(f"  CONVERGED: GEH<5 = {geh5:.1f}% >= target {geh_target}%")
+                if geh5 >= geh_target and geh_mean <= geh_mean_target:
+                    logger.info(
+                        f"  CONVERGED: GEH<5 = {geh5:.1f}% >= {geh_target}% "
+                        f"and GEH_mean = {geh_mean:.2f} <= {geh_mean_target}"
+                    )
                     converged = True
+                elif geh5 >= geh_target:
+                    logger.info(
+                        f"  GEH<5 = {geh5:.1f}% >= {geh_target}% OK, "
+                        f"but GEH_mean = {geh_mean:.2f} > {geh_mean_target} — continuing"
+                    )
 
             if converged:
                 break
@@ -908,6 +920,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                 "r2": w_r2,
                 "slope_penalty": w_slope,
                 "geh_lt5": w_geh,
+                "geh_mean": w_geh_mean,
                 "wmape_pct": w_wmape,
                 "class_bias_max_abs_pct": w_bias,
                 "pct_rmse": w_rmse,

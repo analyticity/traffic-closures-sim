@@ -159,8 +159,9 @@ def _check_final_convergence(
 ) -> bool:
     """Check whether the final iteration satisfies convergence criteria.
 
-    For daily models the screenline criterion is included alongside
-    R², slope, %RMSE, and bias — matching the iteration-loop guards.
+    Daily models use R², slope, %RMSE, bias, and screenline deviation — GEH
+    is excluded because its Poisson assumption is invalid at daily volumes.
+    Hourly models require both %GEH<5 and mean GEH to meet their targets.
     """
     if not history:
         return False
@@ -180,7 +181,11 @@ def _check_final_convergence(
             and bias <= float(daily_conv.get("bias_abs_max_pct", 15.0))
             and sl_max_dev <= sl_target
         )
-    return float(final.get("geh_lt5_pct", 0)) >= geh_target
+    geh_mean_target = float(daily_conv.get("geh_mean_max", 5.0))
+    return (
+        float(final.get("geh_lt5_pct", 0)) >= geh_target
+        and float(final.get("geh_mean") or 999.0) <= geh_mean_target
+    )
 
 
 def match_csd_to_links(

@@ -157,6 +157,19 @@ class TestCheckFinalConvergence:
         }]
         assert _check_final_convergence(history, "daily", 85.0, self._daily_conv()) is True
 
+    def test_daily_ignores_geh(self):
+        """Daily convergence should not depend on GEH at all."""
+        history = [{
+            "r2": 0.90,
+            "slope": 1.0,
+            "pct_rmse": 25.0,
+            "bias_pct": 5.0,
+            "geh_mean": 99.0,
+            "geh_lt5_pct": 0.0,
+            "max_screenline_pct_dev": 10.0,
+        }]
+        assert _check_final_convergence(history, "daily", 85.0, self._daily_conv()) is True
+
     def test_daily_fail_r2(self):
         history = [{
             "r2": 0.50,
@@ -178,12 +191,16 @@ class TestCheckFinalConvergence:
         assert _check_final_convergence(history, "daily", 85.0, self._daily_conv()) is False
 
     def test_hourly_pass(self):
-        history = [{"geh_lt5_pct": 90.0}]
-        assert _check_final_convergence(history, "hourly", 85.0, {}) is True
+        history = [{"geh_lt5_pct": 90.0, "geh_mean": 3.0}]
+        assert _check_final_convergence(history, "hourly", 85.0, {"geh_mean_max": 5.0}) is True
 
-    def test_hourly_fail(self):
-        history = [{"geh_lt5_pct": 70.0}]
-        assert _check_final_convergence(history, "hourly", 85.0, {}) is False
+    def test_hourly_fail_geh_lt5(self):
+        history = [{"geh_lt5_pct": 70.0, "geh_mean": 3.0}]
+        assert _check_final_convergence(history, "hourly", 85.0, {"geh_mean_max": 5.0}) is False
+
+    def test_hourly_fail_geh_mean(self):
+        history = [{"geh_lt5_pct": 90.0, "geh_mean": 8.0}]
+        assert _check_final_convergence(history, "hourly", 85.0, {"geh_mean_max": 5.0}) is False
 
 
 # ---------------------------------------------------------------------------
@@ -250,25 +267,35 @@ class TestBearingFromGeom:
 # compute_objective
 # ---------------------------------------------------------------------------
 class TestComputeObjective:
-    def test_perfect_stats(self):
-        stats = {"geh_lt5_pct": 100, "r2": 1.0, "slope": 1.0, "pct_rmse": 0}
-        weights = {"geh": 1.0, "r2": 1.0, "slope": 1.0, "pct_rmse": 0.5, "screenline": 2.0, "jt": 1.0}
-        result = compute_objective(stats, {}, [], weights)
+    _weights = {"geh": 1.0, "geh_mean": 2.0, "r2": 1.0, "slope": 1.0, "pct_rmse": 0.5, "screenline": 2.0, "jt": 1.0}
+
+    def test_perfect_stats_hourly(self):
+        stats = {"geh_lt5_pct": 100, "geh_mean": 0, "r2": 1.0, "slope": 1.0, "pct_rmse": 0}
+        result = compute_objective(stats, {}, [], self._weights, model_time_period="hourly")
+        assert result == pytest.approx(0.0)
+
+    def test_geh_mean_penalty_hourly(self):
+        stats = {"geh_lt5_pct": 100, "geh_mean": 4.0, "r2": 1.0, "slope": 1.0, "pct_rmse": 0}
+        result = compute_objective(stats, {}, [], self._weights, model_time_period="hourly")
+        assert result == pytest.approx(4.0 * 2.0)
+
+    def test_daily_ignores_geh(self):
+        """Daily objective should be zero for perfect R²/slope/RMSE regardless of GEH."""
+        stats = {"geh_lt5_pct": 0, "geh_mean": 99.0, "r2": 1.0, "slope": 1.0, "pct_rmse": 0}
+        result = compute_objective(stats, {}, [], self._weights, model_time_period="daily")
         assert result == pytest.approx(0.0)
 
     def test_screenline_penalty(self):
-        stats = {"geh_lt5_pct": 100, "r2": 1.0, "slope": 1.0, "pct_rmse": 0}
+        stats = {"geh_lt5_pct": 100, "geh_mean": 0, "r2": 1.0, "slope": 1.0, "pct_rmse": 0}
         sl = {"SL1": {"ratio": 1.2}, "SL2": {"ratio": 0.9}}
-        weights = {"geh": 1.0, "r2": 1.0, "slope": 1.0, "pct_rmse": 0.5, "screenline": 2.0, "jt": 1.0}
-        result = compute_objective(stats, sl, [], weights)
+        result = compute_objective(stats, sl, [], self._weights, model_time_period="hourly")
         expected_sl = (0.2 + 0.1) * 2.0
         assert result == pytest.approx(expected_sl)
 
     def test_jt_failures(self):
-        stats = {"geh_lt5_pct": 100, "r2": 1.0, "slope": 1.0, "pct_rmse": 0}
+        stats = {"geh_lt5_pct": 100, "geh_mean": 0, "r2": 1.0, "slope": 1.0, "pct_rmse": 0}
         jt = [{"pass": False}, {"pass": True}]
-        weights = {"geh": 1.0, "r2": 1.0, "slope": 1.0, "pct_rmse": 0.5, "screenline": 2.0, "jt": 1.0}
-        result = compute_objective(stats, {}, jt, weights)
+        result = compute_objective(stats, {}, jt, self._weights, model_time_period="hourly")
         expected_jt = 1 / 2 * 100 * 1.0
         assert result == pytest.approx(expected_jt)
 

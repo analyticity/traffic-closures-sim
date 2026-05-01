@@ -182,6 +182,7 @@ def main() -> None:
         run_check(cfg)
     elif step == "build-network":
         build_network_from_osm(cfg)
+        print("NETWORK BUILD DONE")
     elif step == "normalize-network":
         normalize_and_export_network(cfg)
     elif step == "build-zones":

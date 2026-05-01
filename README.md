@@ -6,6 +6,86 @@ The pipeline is executed through a single runner script, where each step represe
 
 ---
 
+## Quick Start (new machine)
+
+### Prerequisites
+
+| Tool | Version | Note |
+|------|---------|------|
+| Python | >= 3.10 (tested on 3.11, 3.12) | |
+| Node.js | >= 18 LTS (recommended 20+) | Only needed for the frontend |
+| npm | bundled with Node.js | |
+| git | any recent | |
+| libspatialindex | system package | Required by `rtree` (dependency of geopandas/aequilibrae) |
+
+On Fedora / RHEL:
+
+```bash
+sudo dnf install python3 python3-pip nodejs npm libspatialindex-devel
+```
+
+On Ubuntu / Debian:
+
+```bash
+sudo apt install python3 python3-pip python3-venv nodejs npm libspatialindex-dev
+```
+
+### Backend setup
+
+```bash
+git clone <repo-url> && cd simulation
+
+# Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install the project + dev dependencies
+pip install -e ".[dev]"
+
+# For steps that need OSM downloads (build-network, build-supernetwork):
+pip install -e ".[dev,geo]"
+```
+
+Verify the install:
+
+```bash
+pytest tests/unit -v
+```
+
+### Frontend setup
+
+```bash
+cd frontend
+npm install
+npm run dev          # starts dev server at http://localhost:5173
+```
+
+The frontend expects the backend API at `http://localhost:8000` by default.
+Override with the `VITE_API_URL` environment variable if needed.
+
+### Run the backend API
+
+```bash
+# From the repo root, with the venv active:
+python run.py --config config/brno/sim.yaml serve
+```
+
+This starts the FastAPI server at `http://localhost:8000`.
+
+### Run the full pipeline for a city
+
+See **Typical Full Workflow** below for the step-by-step sequence.
+
+### Environment variables (optional)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SIM_CONFIG` | `config/brno/sim.yaml` | Config path when running uvicorn directly |
+| `VITE_API_URL` | `http://localhost:8000` | Backend URL for the frontend dev server |
+| `CORS_ALLOWED_ORIGINS` | `http://localhost:5173` | Comma-separated allowed origins for the API |
+
+---
+
 ## Overview
 
 The pipeline supports the following workflow:

@@ -9,7 +9,11 @@
 __pycache__
 
 cache/
-data/
+data/cache/
+data/brno/
+data/olomouc/
+data/most/
+data/demand/
 outputs/
 project/
 

@@ -27,6 +27,10 @@ FROM base AS pipeline
 ARG CITY=brno
 ENV PYTHONDONTWRITEBYTECODE=1
 
+# Pre-downloaded sources from build context (CI pre-fetches & caches them).
+# For local builds: mkdir -p data/sources before docker build.
+COPY data/sources/ /app/data/sources/
+
 RUN python run.py --config "config/${CITY}/sim.yaml" check \
     && python run.py --config "config/${CITY}/sim.yaml" build-network \
     && python run.py --config "config/${CITY}/sim.yaml" normalize-network \

@@ -2,7 +2,7 @@ project_path: "project/olomouc_aeq"
 
 osm:
   place_name: "Olomouc, Czechia"
-  buffer_km: 4  # wider buffer to capture motorway on/off-ramps near boundary (D35, D46)
+  buffer_km: 2  # wider buffer to capture motorway on/off-ramps near boundary (D35, D46)
 
 zoning:
   sources:

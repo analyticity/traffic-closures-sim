@@ -163,7 +163,9 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("--config", default="config/brno/sim.yaml", help="path to sim.yaml")
+    ap.add_argument("--config",
+                     default=os.environ.get("SIM_CONFIG", "config/brno/sim.yaml"),
+                     help="path to sim.yaml (default: $SIM_CONFIG or config/brno/sim.yaml)")
     ap.add_argument("--force", action="store_true",
                      help="for 'clean': also remove shared downloaded sources in data/sources/")
     ap.add_argument("step", choices=STEPS, help="pipeline step to execute")

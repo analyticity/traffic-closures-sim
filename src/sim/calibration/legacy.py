@@ -825,7 +825,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                     p_demand = float(mat_p.matrix_view.sum())
                     logger.info(f"    Demand: {p_demand:,.0f}")
 
-                    vol_df_p, _, _sl_p = execute_assignment(
+                    vol_df_p, _, _sl_p, _conv_p = execute_assignment(
                         project_p,
                         mat_p,
                         algorithm=algorithm,

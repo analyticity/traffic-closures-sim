@@ -26,13 +26,21 @@ _MAJOR_ROAD_TYPES = frozenset({"motorway", "motorway_link", "trunk", "trunk_link
 # SCC boundary repair
 # ---------------------------------------------------------------------------
 
-def repair_boundary_scc(project: Project) -> Dict[str, Any]:
+def repair_boundary_scc(
+    project: Project,
+    *,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
     """Make one-way motorway/trunk links with nodes outside the largest directed
     SCC bidirectional, so that gateway nodes can participate in directed routing.
+
+    When *dry_run* is ``True``, compute which links would be repaired and
+    return the report **without** modifying the database.
     """
     links = project.network.links.data.copy()
     _empty = {"repaired": 0, "scc_before": 0, "scc_after": 0,
-              "major_outside_before": 0, "major_outside_after": 0, "repaired_ids": []}
+              "major_outside_before": 0, "major_outside_after": 0,
+              "repaired_ids": [], "dry_run": dry_run}
     if links.empty:
         return _empty
 
@@ -64,6 +72,21 @@ def repair_boundary_scc(project: Project) -> Dict[str, Any]:
         return {**_empty, "scc_before": scc_before, "scc_after": scc_before,
                 "major_outside_before": major_outside_before,
                 "major_outside_after": major_outside_before}
+
+    if dry_run:
+        logger.info(
+            "Boundary SCC repair (DRY RUN): would make %d one-way major links "
+            "bidirectional (SCC=%d, major outside=%d)",
+            len(repair_ids), scc_before, major_outside_before,
+        )
+        return {
+            "repaired": len(repair_ids),
+            "scc_before": scc_before, "scc_after": scc_before,
+            "major_outside_before": major_outside_before,
+            "major_outside_after": major_outside_before,
+            "repaired_ids": repair_ids,
+            "dry_run": True,
+        }
 
     with project_db(project) as conn:
         for lid in repair_ids:
@@ -99,6 +122,7 @@ def repair_boundary_scc(project: Project) -> Dict[str, Any]:
         "major_outside_before": major_outside_before,
         "major_outside_after": major_outside_after,
         "repaired_ids": repair_ids,
+        "dry_run": False,
     }
 
 

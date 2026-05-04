@@ -42,6 +42,7 @@ SIM_DEFAULTS: Dict[str, Any] = {
     # ------------------------------------------------------------------
     "network": {
         "experiment_profile": "baseline",
+        "boundary_scc_repair": "auto",
         "drivable_network": {
             "enabled": True,
             "require_mode_car": True,
@@ -66,6 +67,8 @@ SIM_DEFAULTS: Dict[str, Any] = {
     #  Zoning
     # ------------------------------------------------------------------
     "zoning": {
+        "connector_warn_distance_m": 1500.0,
+        "connector_strict": False,
         "external_gateways": {
             "boundary_buffer_m": 1000.0,
             "min_gateway_separation_m": 800,
@@ -118,6 +121,7 @@ SIM_DEFAULTS: Dict[str, Any] = {
     # ------------------------------------------------------------------
     "assignment": {
         "cores": 0,
+        "blocked_centroid_flows": True,
 
         "warm_skim_pass": {
             "algorithm": "bfw",
@@ -263,8 +267,13 @@ SIM_DEFAULTS: Dict[str, Any] = {
         "distribution": {
             "enabled": True,
             "impedance": "skim",
+            "allow_euclidean_fallback": False,
+            "allow_unconverged_skims": False,
+            "segments": ["other"],
             "employment_source": "auto",
+            "require_employment": False,
             "deterrence_function": "EXPO",
+            "min_gravity_beta": 0.0001,
             "pa_trip_rate": 2.5,
             "pa_car_share": 0.50,
             "pa_occupancy": 1.3,
@@ -280,12 +289,16 @@ SIM_DEFAULTS: Dict[str, Any] = {
     # ------------------------------------------------------------------
     "calibration": {
         "algorithm": "bfw",
+        "allow_aon": False,
+        "strict_convergence": True,
         "max_iter": 150,
         "rgap_target": 0.005,
         "core_name": "wd_daily",
         "model_time_period": "daily",
+        "min_obs_per_zone": 0.5,
 
         "count_source": "csd_split",
+        "require_holdout": True,
 
         "csd_split": {
             "strategy": "alternating",
@@ -307,6 +320,7 @@ SIM_DEFAULTS: Dict[str, Any] = {
         "count_target": "motor_total",
         "aggregate_corridor": True,
         "save_skims": False,
+        "require_supply_audit": True,
         "supply_tuning": {"enabled": False},
 
         "max_iterations": 50,
@@ -377,6 +391,8 @@ SIM_DEFAULTS: Dict[str, Any] = {
             "global_max": 1.50,
         },
 
+        "screenline_dedup_strict": False,
+
         "auto_screenlines": {
             "enabled": False,
             "gateway_screenlines": True,
@@ -388,6 +404,21 @@ SIM_DEFAULTS: Dict[str, Any] = {
             "max_total_change_pct": 50.0,
             "multistage_max_deviation": 3.0,
         },
+    },
+
+    # ------------------------------------------------------------------
+    #  Sensitivity
+    # ------------------------------------------------------------------
+    "sensitivity": {
+        "enabled": False,
+        "max_iter": 30,
+        "rgap_target": 0.05,
+        "parameters": [
+            {
+                "path": "demand.sldb.external_processing.through_traffic_scale",
+                "values": [0.25, 0.50, 0.75, 1.00],
+            },
+        ],
     },
 
     # ------------------------------------------------------------------

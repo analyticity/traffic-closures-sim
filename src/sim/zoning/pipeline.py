@@ -313,7 +313,30 @@ def build_zones_and_connectors(
         )
 
         export_connector_diagnostics(project, zone_to_centroid, output_dir)
-        validate_connectors(project, zone_to_centroid, output_dir)
+
+        connector_warn_dist = float(zoning_cfg.get("connector_warn_distance_m", 1500.0))
+        connector_strict = bool(zoning_cfg.get("connector_strict", False))
+        validation_result = validate_connectors(
+            project, zone_to_centroid, output_dir,
+            warn_min_distance_m=connector_warn_dist,
+        )
+
+        warn_list = validation_result.get("warnings", [])
+        n_far = sum(1 for w in warn_list if w.get("type") == "far_connectors")
+        n_scc = sum(1 for w in warn_list if w.get("type") == "outside_scc")
+        if warn_list:
+            logger.info(
+                "Connector validation: %d zone(s) with warnings "
+                "(%d far, %d outside SCC)",
+                len({w["zone_id"] for w in warn_list}), n_far, n_scc,
+            )
+        if connector_strict and (n_far > 0 or n_scc > 0):
+            raise RuntimeError(
+                f"Connector validation failed in strict mode: "
+                f"{n_far} zone(s) with far connectors, "
+                f"{n_scc} zone(s) outside SCC. "
+                f"Fix connector geometry or set zoning.connector_strict=false."
+            )
 
         # --- Final exports ---
         centroids["centroid_node_id"] = centroids["zone_id"].map(

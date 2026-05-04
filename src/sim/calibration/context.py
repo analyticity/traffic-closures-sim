@@ -7,7 +7,7 @@ import json
 import logging
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -62,6 +62,98 @@ logger = logging.getLogger(__name__)
 
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
+
+def _check_supply_audit(output_dir: Path, *, require: bool = True) -> Optional[Dict[str, Any]]:
+    """Check that supply parameters have been audited or tuned before ODME.
+
+    Looks for ``supply_audit.json`` or ``supply_tuning_report.json``.
+    Returns the audit data if found, ``None`` otherwise.
+    Raises ``RuntimeError`` if *require* is True and no audit exists.
+    """
+    for name in ("supply_audit.json", "supply_tuning_report.json"):
+        path = output_dir / name
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+    if require:
+        raise RuntimeError(
+            "No supply audit found. Before running ODME calibration, "
+            "either run 'tune-supply' or 'audit-supply' to verify that "
+            "network speeds, capacities, and VDF parameters are reasonable. "
+            "ODME must not compensate for uncalibrated supply-side errors. "
+            "Set calibration.require_supply_audit=false to skip this check."
+        )
+    return None
+
+
+def _check_assignment_convergence(output_dir: Path) -> Optional[Dict[str, Any]]:
+    """Verify that a converged base-year UE assignment exists.
+
+    Returns the convergence metadata dict if found, ``None`` otherwise.
+    Logs a warning if the assignment did not converge.
+    """
+    conv_path = output_dir / "assignment_convergence.json"
+    if not conv_path.exists():
+        logger.warning(
+            "No assignment_convergence.json found in %s. "
+            "Cannot verify that base-year assignment converged before ODME.",
+            output_dir,
+        )
+        return None
+    try:
+        meta = json.loads(conv_path.read_text(encoding="utf-8"))
+        if not meta.get("converged", False):
+            logger.warning(
+                "Base-year assignment did NOT converge (rgap=%s). "
+                "ODME results may be unreliable.",
+                meta.get("final_rgap"),
+            )
+        return meta
+    except Exception:
+        logger.debug("Failed to read assignment_convergence.json", exc_info=True)
+        return None
+
+
+def _detect_cross_screenline_collisions(
+    sl_query: Dict[str, list],
+    *,
+    strict: bool = False,
+) -> None:
+    """Warn (or raise) when the same link_id appears in multiple screenlines.
+
+    Cross-screenline overlap means the ODME objective over-weights that
+    corridor because its volume is counted once per screenline.
+    """
+    from collections import defaultdict
+
+    link_to_screenlines: Dict[int, List[str]] = defaultdict(list)
+    for sl_name, link_tuples in sl_query.items():
+        for lid, _d in link_tuples:
+            link_to_screenlines[lid].append(sl_name)
+
+    collisions = {
+        lid: sls for lid, sls in link_to_screenlines.items() if len(sls) > 1
+    }
+    if not collisions:
+        return
+
+    lines = [
+        f"  link {lid}: screenlines {sls}" for lid, sls in sorted(collisions.items())
+    ]
+    msg = (
+        f"Cross-screenline collision: {len(collisions)} link(s) appear in "
+        f"multiple screenlines. This over-weights those corridors in ODME.\n"
+        + "\n".join(lines)
+    )
+    if strict:
+        raise RuntimeError(
+            msg + "\nSet calibration.screenline_dedup_strict=false to "
+            "downgrade to a warning."
+        )
+    logger.warning(msg)
 
 
 def _sr_val(sr: Any, key: str) -> float:
@@ -186,6 +278,20 @@ class _CalibrationContext:
         if not self.matrix_path.exists():
             raise FileNotFoundError(f"OD matrix not found: {self.matrix_path}")
 
+        # P0-3: Verify supply-side readiness before ODME
+        require_supply_audit = bool(calib_cfg.get("require_supply_audit", True))
+        self._supply_audit = _check_supply_audit(
+            self.output_dir, require=require_supply_audit,
+        )
+        if self._supply_audit:
+            logger.info("  Supply audit: verified (%s)", next(
+                n for n in ("supply_audit.json", "supply_tuning_report.json")
+                if (self.output_dir / n).exists()
+            ))
+
+        # P0-3: Verify base-year assignment converged
+        self._assignment_convergence = _check_assignment_convergence(self.output_dir)
+
         # Backup / restore seed matrix — versioned by content hash
         def _file_hash(path: Path) -> str:
             h = hashlib.sha256()
@@ -268,6 +374,10 @@ class _CalibrationContext:
                 f"  Screenlines: {len(self.screenlines)} defined, "
                 f"{len(self.sl_query)} with links"
             )
+            _detect_cross_screenline_collisions(
+                self.sl_query,
+                strict=bool(calib_cfg.get("screenline_dedup_strict", False)),
+            )
 
         # Open matrix (stays open across iterations)
         self.mat = AequilibraeMatrix()
@@ -281,6 +391,24 @@ class _CalibrationContext:
         self.seed_lower[seed <= 0] = 0.0
         self.seed_upper[seed <= 0] = 0.0
 
+        # Observation density check
+        n_zones = len(self.mat.index[:])
+        n_obs = len(self.pent) if self.pent is not None and not self.pent.empty else 0
+        obs_ratio = n_obs / max(n_zones, 1)
+        min_ratio = float(calib_cfg.get("min_obs_per_zone", 0.5))
+        logger.info(
+            "  Observation density: %d observations for %d zones "
+            "(%.2f obs/zone, threshold %.2f)",
+            n_obs, n_zones, obs_ratio, min_ratio,
+        )
+        if obs_ratio < min_ratio:
+            logger.warning(
+                "Observation density %.2f obs/zone is below threshold %.2f. "
+                "Calibration may be weakly identified. Consider adding "
+                "more count sources or corridor observations.",
+                obs_ratio, min_ratio,
+            )
+
         # Swap closures for the calibration period before opening the project
         bc_cfg = cfg.get("baseline_closures") or {}
         calib_period = bc_cfg.get("calibration_period")
@@ -293,7 +421,12 @@ class _CalibrationContext:
         # AequilibraE project + graph (reused across iterations)
         self.project = Project()
         self.project.open(str(self.project_dir))
-        self.cached_graph = build_graph(self.project, self.mat, bpr_parameters=self.cfg_bpr)
+        self.cfg_assignment = assign_cfg
+        self.cached_graph = build_graph(
+            self.project, self.mat,
+            bpr_parameters=self.cfg_bpr,
+            assignment_cfg=assign_cfg,
+        )
 
         # Gateway calibration — fallbacks match defaults.py
         gw_cal_cfg = calib_cfg.get("gateway_calibration") or {}
@@ -362,8 +495,13 @@ class _CalibrationContext:
     # -- Shared helpers for the iteration body --
 
     def run_assignment(self, *, save_skims: bool = False) -> tuple:
-        """Execute one equilibrium assignment pass."""
-        return execute_assignment(
+        """Execute one equilibrium assignment pass.
+
+        Returns ``(vol_df, skims, sl_matrices)`` — convergence metadata
+        from the 4th return value of ``execute_assignment`` is logged
+        but not propagated to callers that expect a 3-tuple.
+        """
+        vol_df, skims, sl_matrices, _conv_meta = execute_assignment(
             self.project, self.mat,
             algorithm=self.algorithm,
             max_iter=self.max_iter_assign,
@@ -378,6 +516,7 @@ class _CalibrationContext:
             graph=self.cached_graph,
             cores=self.cores,
         )
+        return vol_df, skims, sl_matrices
 
     def run_iteration_assignment(self, *, save_skims: bool = False) -> tuple:
         """Assignment + multi-class volume sum + vol_col detection.
@@ -645,8 +784,12 @@ class _CalibrationContext:
         project = Project()
         project.open(str(self.project_dir))
         try:
-            graph = build_graph(project, mat, bpr_parameters=self.cfg_bpr)
-            vol_df, _skims, _sl = execute_assignment(
+            graph = build_graph(
+                project, mat,
+                bpr_parameters=self.cfg_bpr,
+                assignment_cfg=self.cfg_assignment,
+            )
+            vol_df, _skims, _sl, _conv = execute_assignment(
                 project, mat,
                 algorithm=self.algorithm,
                 max_iter=self.max_iter_assign,

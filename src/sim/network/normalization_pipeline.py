@@ -83,9 +83,19 @@ def _repair_connectivity(
     links: pd.DataFrame,
     network_cfg: dict,
 ) -> pd.DataFrame:
-    logger.info("Repair boundary SCC")
-    repair_info = repair_boundary_scc(project)
-    if repair_info.get("repaired", 0) > 0:
+    scc_mode = str(network_cfg.get("boundary_scc_repair", "auto")).lower().strip()
+
+    if scc_mode == "disabled":
+        logger.info("Boundary SCC repair: DISABLED by config")
+        repair_info = {"repaired": 0, "repaired_ids": []}
+    elif scc_mode == "report":
+        logger.info("Boundary SCC repair: REPORT-ONLY mode")
+        repair_info = repair_boundary_scc(project, dry_run=True)
+    else:
+        logger.info("Repair boundary SCC")
+        repair_info = repair_boundary_scc(project)
+
+    if repair_info.get("repaired", 0) > 0 and not repair_info.get("dry_run", False):
         repaired_set = set(repair_info["repaired_ids"])
         mask = links["link_id"].astype(int).isin(repaired_set)
         links.loc[mask, "direction"] = 0

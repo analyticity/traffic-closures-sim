@@ -5,6 +5,7 @@ upper: OD adjustment). Only the update step differs.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -391,6 +392,50 @@ def run_odme_calibration(
             best_final, max_sl_best, sl_for_conv
         )
 
+    # P0-3: Seed-deviation analysis
+    seed_deviation_report: Dict[str, Any] = {}
+    if ctx.best_demand is not None:
+        try:
+            backup_path = ctx.matrix_path.with_suffix(".aem.orig")
+            if backup_path.exists():
+                from aequilibrae.matrix import AequilibraeMatrix as _AEM
+                seed_mat = _AEM()
+                seed_mat.load(str(backup_path))
+                seed_data = seed_mat.matrix[ctx.core_name][:, :].copy().astype(np.float64)
+                seed_mat.close()
+
+                final_data = ctx.best_demand.astype(np.float64)
+                nonzero = seed_data > 1.0
+                if nonzero.any():
+                    ratios = np.where(nonzero, final_data / seed_data, 1.0)
+                    max_ratio = float(np.max(ratios[nonzero]))
+                    min_ratio = float(np.min(ratios[nonzero]))
+                    n_suspicious = int(np.sum(
+                        (ratios > ctx.max_deviation) | (ratios < 1.0 / ctx.max_deviation)
+                    ))
+                    seed_deviation_report = {
+                        "max_cell_ratio": round(max_ratio, 3),
+                        "min_cell_ratio": round(min_ratio, 3),
+                        "max_deviation_threshold": ctx.max_deviation,
+                        "n_cells_exceeding_threshold": n_suspicious,
+                        "total_seed": round(float(seed_data.sum()), 0),
+                        "total_final": round(float(final_data.sum()), 0),
+                    }
+                    if n_suspicious > 0:
+                        logger.warning(
+                            "  ODME seed deviation: %d OD cells exceed %.1fx threshold "
+                            "(max_ratio=%.2f, min_ratio=%.2f)",
+                            n_suspicious, ctx.max_deviation, max_ratio, min_ratio,
+                        )
+        except Exception:
+            logger.debug("Seed deviation analysis failed", exc_info=True)
+
+    # Write calibration section hashes for validation holdout guard
+    calib_section_hash = ""
+    if hasattr(ctx, "pent") and not ctx.pent.empty and "objectid" in ctx.pent.columns:
+        ids_str = ",".join(str(x) for x in sorted(ctx.pent["objectid"].dropna().astype(int)))
+        calib_section_hash = hashlib.sha256(ids_str.encode()).hexdigest()[:16]
+
     report = {
         "method": method_name,
         "iterations": len(history),
@@ -426,6 +471,8 @@ def run_odme_calibration(
             "aggregate_corridor": ctx.agg_corridor,
         },
         "screenlines": sl_results,
+        "seed_deviation": seed_deviation_report,
+        "calibration_section_hash": calib_section_hash,
     }
     if method == "entropy":
         report["config"]["entropy_step_size"] = entropy_step_size

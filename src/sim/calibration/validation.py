@@ -358,6 +358,55 @@ def match_csd_to_links(
     return result
 
 
+def _classify_holdout_adequacy(n: int) -> str:
+    """Classify holdout set size: adequate (>=10), thin (5-9), insufficient (<5)."""
+    if n >= 10:
+        return "adequate"
+    if n >= 5:
+        return "thin"
+    return "insufficient"
+
+
+def _compute_daily_metrics(
+    count_stats: Dict[str, Any],
+    daily_thresholds: Dict[str, Any],
+    sl_max_error: float,
+) -> Dict[str, Any]:
+    """Evaluate daily pass/fail metrics for a set of count stats."""
+    dt = daily_thresholds
+    r2 = float(count_stats.get("r2") or 0.0)
+    slope = float(count_stats.get("slope") or 0.0)
+    prmse = float(count_stats.get("pct_rmse") or 999.0)
+    bias = abs(float(count_stats.get("bias_pct") or 999.0))
+    daily_geh_adj = float(count_stats.get("daily_geh_lt_adj_pct") or 0.0)
+
+    r2_target = float(dt.get("r2_target", 0.80))
+    slope_range = dt.get("slope_range", [0.85, 1.15])
+    prmse_max = float(dt.get("pct_rmse_max", 35.0))
+    bias_max = float(dt.get("bias_abs_max_pct", 15.0))
+    sl_max = float(dt.get("screenline_max_pct_deviation", 15.0))
+
+    r2_pass = r2 >= r2_target
+    slope_pass = slope_range[0] <= slope <= slope_range[1]
+    prmse_pass = prmse <= prmse_max
+    bias_pass = bias <= bias_max
+    sl_pass = sl_max_error <= sl_max
+
+    return {
+        "r2": round(r2, 4),
+        "r2_pass": r2_pass,
+        "slope": round(slope, 4),
+        "slope_pass": slope_pass,
+        "pct_rmse": round(prmse, 1),
+        "pct_rmse_pass": prmse_pass,
+        "bias_abs_pct": round(bias, 2),
+        "bias_pass": bias_pass,
+        "screenline_pass": sl_pass,
+        "daily_geh_lt_adj_pct": round(daily_geh_adj, 1),
+        "overall_pass": r2_pass and slope_pass and prmse_pass and bias_pass and sl_pass,
+    }
+
+
 def compute_validation_benchmarks(
     count_stats: Dict[str, Any],
     screenline_results: Dict[str, Any],
@@ -366,18 +415,22 @@ def compute_validation_benchmarks(
     model_time_period: str = "daily",
     daily_thresholds: Optional[Dict[str, Any]] = None,
     benchmarks: Optional[Dict[str, Any]] = None,
+    holdout_stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Check validation benchmarks for the model's time aggregation.
 
+    When *holdout_stats* is provided, the overall PASS/FAIL verdict is
+    based on the holdout (validation) subset, not the calibration subset.
+    The calibration subset metrics are reported as ``calibration_fit``
+    for informational purposes only.
+
     For daily models: R², slope, %RMSE, bias, screenline deviations.
     GEH is diagnostic only (FHWA target is for hourly flows).
-    Thresholds default to calibration.convergence.daily if not provided.
-    *benchmarks* overrides GEH and JT pass-rate thresholds from
-    calibration.benchmarks config.
     """
     bm = benchmarks or {}
     geh_pass_pct = float(bm.get("geh_lt5_pass_pct", 85.0))
     jt_pass_pct_thr = float(bm.get("jt_pass_pct", 85.0))
+    dt = daily_thresholds or {}
 
     geh5 = float(count_stats.get("geh_lt5_pct", 0))
     geh_pass_hourly = geh5 >= geh_pass_pct
@@ -400,47 +453,71 @@ def compute_validation_benchmarks(
         "jt_within_tolerance_pct": round(jt_pct, 1) if jt_total > 0 else None,
         "jt_benchmark_pass": jt_pass,
         "jt_routes_checked": jt_total,
-        # Hourly GEH — always reported; authoritative only for hourly models
         "geh_lt5_pct": round(geh5, 1),
         "geh_benchmark_pass_hourly": geh_pass_hourly,
     }
 
     if model_time_period == "daily":
-        dt = daily_thresholds or {}
-        r2 = float(count_stats.get("r2") or 0.0)
-        slope = float(count_stats.get("slope") or 0.0)
-        prmse = float(count_stats.get("pct_rmse") or 999.0)
-        bias = abs(float(count_stats.get("bias_pct") or 999.0))
-        daily_geh_adj = float(count_stats.get("daily_geh_lt_adj_pct") or 0.0)
+        # Calibration fit (informational)
+        calib_metrics = _compute_daily_metrics(count_stats, dt, sl_max_error)
+        result["calibration_fit"] = calib_metrics
 
-        r2_target = float(dt.get("r2_target", 0.80))
-        slope_range = dt.get("slope_range", [0.85, 1.15])
-        prmse_max = float(dt.get("pct_rmse_max", 35.0))
-        bias_max = float(dt.get("bias_abs_max_pct", 15.0))
-        sl_max = float(dt.get("screenline_max_pct_deviation", 15.0))
+        # Holdout validation (authoritative for PASS/FAIL)
+        holdout_n = holdout_stats.get("n", 0) if holdout_stats else 0
+        holdout_adequacy = _classify_holdout_adequacy(holdout_n)
+        result["holdout_adequacy"] = holdout_adequacy
 
-        r2_pass = r2 >= r2_target
-        slope_pass = slope_range[0] <= slope <= slope_range[1]
-        prmse_pass = prmse <= prmse_max
-        bias_pass = bias <= bias_max
-        sl_pass = sl_max_error <= sl_max
+        if holdout_stats and holdout_n >= 5:
+            holdout_metrics = _compute_daily_metrics(holdout_stats, dt, sl_max_error)
+            result["holdout_validation"] = holdout_metrics
 
-        daily_pass = r2_pass and slope_pass and prmse_pass and bias_pass and sl_pass
-        result.update({
-            "daily_r2": round(r2, 4),
-            "daily_r2_pass": r2_pass,
-            "daily_slope": round(slope, 4),
-            "daily_slope_pass": slope_pass,
-            "daily_pct_rmse": round(prmse, 1),
-            "daily_pct_rmse_pass": prmse_pass,
-            "daily_bias_abs_pct": round(bias, 2),
-            "daily_bias_pass": bias_pass,
-            "daily_screenline_pass": sl_pass,
-            "daily_geh_lt_adj_pct": round(daily_geh_adj, 1),
-            "daily_overall_pass": daily_pass and (jt_pass is None or jt_pass),
-            "overall_pass": daily_pass and (jt_pass is None or jt_pass),
-            "note": "GEH<5 target applies to hourly flows; daily model uses R²/slope/%RMSE/bias",
-        })
+            if holdout_adequacy == "thin":
+                logger.warning(
+                    "Holdout set has only %d observations (thin) — "
+                    "verdict is based on holdout but may not be robust",
+                    holdout_n,
+                )
+
+            daily_pass = holdout_metrics["overall_pass"]
+            result["verdict_source"] = "holdout"
+
+            result.update({
+                "daily_r2": holdout_metrics["r2"],
+                "daily_r2_pass": holdout_metrics["r2_pass"],
+                "daily_slope": holdout_metrics["slope"],
+                "daily_slope_pass": holdout_metrics["slope_pass"],
+                "daily_pct_rmse": holdout_metrics["pct_rmse"],
+                "daily_pct_rmse_pass": holdout_metrics["pct_rmse_pass"],
+                "daily_bias_abs_pct": holdout_metrics["bias_abs_pct"],
+                "daily_bias_pass": holdout_metrics["bias_pass"],
+                "daily_screenline_pass": holdout_metrics["screenline_pass"],
+                "daily_geh_lt_adj_pct": holdout_metrics["daily_geh_lt_adj_pct"],
+            })
+        else:
+            if holdout_stats and 0 < holdout_n < 5:
+                logger.warning(
+                    "Holdout set has only %d observations (insufficient) — "
+                    "falling back to calibration verdict",
+                    holdout_n,
+                )
+            daily_pass = calib_metrics["overall_pass"]
+            result["verdict_source"] = "calibration"
+            result.update({
+                "daily_r2": calib_metrics["r2"],
+                "daily_r2_pass": calib_metrics["r2_pass"],
+                "daily_slope": calib_metrics["slope"],
+                "daily_slope_pass": calib_metrics["slope_pass"],
+                "daily_pct_rmse": calib_metrics["pct_rmse"],
+                "daily_pct_rmse_pass": calib_metrics["pct_rmse_pass"],
+                "daily_bias_abs_pct": calib_metrics["bias_abs_pct"],
+                "daily_bias_pass": calib_metrics["bias_pass"],
+                "daily_screenline_pass": calib_metrics["screenline_pass"],
+                "daily_geh_lt_adj_pct": calib_metrics["daily_geh_lt_adj_pct"],
+            })
+
+        result["daily_overall_pass"] = daily_pass and (jt_pass is None or jt_pass)
+        result["overall_pass"] = daily_pass and (jt_pass is None or jt_pass)
+        result["note"] = "GEH<5 target applies to hourly flows; daily model uses R²/slope/%RMSE/bias"
     else:
         result["overall_pass"] = geh_pass_hourly and (jt_pass is None or jt_pass)
 
@@ -713,6 +790,45 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
     except Exception:
         logger.exception("Journey time validation step skipped")
 
+    # 4b) Holdout stats for benchmark verdict
+    holdout_stats: Optional[Dict[str, Any]] = None
+    if count_source == "csd_split" and csd_match_df is not None and not csd_match_df.empty:
+        csd_summary = getattr(csd_match_df, "attrs", {}).get("summary")
+        if csd_summary:
+            holdout_stats = {
+                "n": csd_summary.get("n_roads", 0),
+                "r2": csd_summary.get("r2"),
+                "slope": 1.0,
+                "pct_rmse": csd_summary.get("pct_rmse"),
+                "bias_pct": csd_summary.get("bias_pct"),
+                "geh_lt5_pct": 0.0,
+                "daily_geh_lt_adj_pct": 0.0,
+            }
+
+    # 4c) Calibration section hash guard
+    require_holdout = bool(get_nested(cfg, ["calibration", "require_holdout"], True))
+    calib_report_path = output_dir / "calibration_report.json"
+    if calib_report_path.exists() and count_source == "csd_split":
+        try:
+            calib_report = json.loads(calib_report_path.read_text(encoding="utf-8"))
+            saved_hash = calib_report.get("calibration_section_hash", "")
+            if saved_hash:
+                report["calibration_section_hash_from_calib"] = saved_hash
+                logger.info(f"  Calibration section hash: {saved_hash}")
+        except Exception:
+            pass
+
+    if require_holdout and count_source != "csd_split":
+        logger.warning(
+            "VALIDATION WARNING: require_holdout=true but count_source='%s'. "
+            "Validation verdict may reflect training data fit, not independent "
+            "holdout performance. Set calibration.require_holdout=false to suppress.",
+            count_source,
+        )
+        report["holdout_warning"] = (
+            "No holdout split active. Verdict based on calibration data."
+        )
+
     # 5) Benchmark summary
     logger.info(f"\n5) Validation benchmarks (model_time_period={model_time_period}) ...")
     daily_conv = get_nested(cfg, ["calibration", "convergence", "daily"], {})
@@ -722,6 +838,7 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
         model_time_period=model_time_period,
         daily_thresholds=daily_conv,
         benchmarks=bm_cfg,
+        holdout_stats=holdout_stats,
     )
     report["benchmarks"] = benchmarks
     qcfg = (calib_cfg.get("quality_gates") or {})
@@ -744,7 +861,11 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
         "hard_reject": bool((bias is not None) and (bias > q_bias_hard)),
         "warnings": q_warns,
     }
+
     overall = "PASS" if benchmarks["overall_pass"] else "FAIL"
+    verdict_src = benchmarks.get("verdict_source", "calibration")
+
+    # Summary table
     if model_time_period == "daily":
         dt = daily_conv or {}
         r2_tgt = float(dt.get("r2_target", 0.80))
@@ -752,17 +873,42 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
         prmse_max = float(dt.get("pct_rmse_max", 35.0))
         bias_max = float(dt.get("bias_abs_max_pct", 15.0))
         sl_max = float(dt.get("screenline_max_pct_deviation", 15.0))
-        logger.info(f"  R² >= {r2_tgt}:     {benchmarks.get('daily_r2', 0):.4f}  "
-              f"{'PASS' if benchmarks.get('daily_r2_pass') else 'FAIL'}")
-        logger.info(f"  slope [{sl_range[0]}-{sl_range[1]}]: {benchmarks.get('daily_slope', 0):.4f}  "
-              f"{'PASS' if benchmarks.get('daily_slope_pass') else 'FAIL'}")
-        logger.info(f"  %RMSE <= {prmse_max:g}%:   {benchmarks.get('daily_pct_rmse', 0):.1f}%  "
-              f"{'PASS' if benchmarks.get('daily_pct_rmse_pass') else 'FAIL'}")
-        logger.info(f"  |bias| <= {bias_max:g}%:  {benchmarks.get('daily_bias_abs_pct', 0):.2f}%  "
-              f"{'PASS' if benchmarks.get('daily_bias_pass') else 'FAIL'}")
-        logger.info(f"  SL dev <= {sl_max:g}%:  {benchmarks.get('screenline_max_error_pct', 0):.1f}%  "
-              f"{'PASS' if benchmarks.get('daily_screenline_pass') else 'FAIL'}")
-        logger.info(f"  (GEH<5: {geh:.1f}% — diagnostic only for daily model)")
+
+        calib_fit = benchmarks.get("calibration_fit", {})
+        holdout_val = benchmarks.get("holdout_validation", {})
+
+        logger.info("\nVALIDATION SUMMARY")
+        logger.info("-" * 60)
+        if holdout_val:
+            logger.info("%-20s %12s %12s %12s", "Metric", "Calibration", "Holdout", "Target")
+            logger.info("-" * 60)
+            logger.info("%-20s %11.4f  %11.4f  %s",
+                        "R²", calib_fit.get("r2", 0), holdout_val.get("r2", 0), f">= {r2_tgt}")
+            logger.info("%-20s %11.1f  %11.1f  %s",
+                        "%RMSE", calib_fit.get("pct_rmse", 0), holdout_val.get("pct_rmse", 0), f"<= {prmse_max}%")
+            logger.info("%-20s %10.1f%%  %10.1f%%  %s",
+                        "|Bias|", calib_fit.get("bias_abs_pct", 0), holdout_val.get("bias_abs_pct", 0), f"<= {bias_max}%")
+            logger.info("%-20s %11.4f  %11.4f  %s",
+                        "Slope", calib_fit.get("slope", 0), holdout_val.get("slope", 0),
+                        f"[{sl_range[0]}-{sl_range[1]}]")
+            logger.info("%-20s %11.1f%%                %s",
+                        "SL max dev", benchmarks.get("screenline_max_error_pct", 0), f"<= {sl_max}%")
+            logger.info("-" * 60)
+            logger.info("VERDICT: %s (based on %s)", overall, verdict_src)
+        else:
+            logger.info(f"  R² >= {r2_tgt}:     {benchmarks.get('daily_r2', 0):.4f}  "
+                  f"{'PASS' if benchmarks.get('daily_r2_pass') else 'FAIL'}")
+            logger.info(f"  slope [{sl_range[0]}-{sl_range[1]}]: {benchmarks.get('daily_slope', 0):.4f}  "
+                  f"{'PASS' if benchmarks.get('daily_slope_pass') else 'FAIL'}")
+            logger.info(f"  %RMSE <= {prmse_max:g}%:   {benchmarks.get('daily_pct_rmse', 0):.1f}%  "
+                  f"{'PASS' if benchmarks.get('daily_pct_rmse_pass') else 'FAIL'}")
+            logger.info(f"  |bias| <= {bias_max:g}%:  {benchmarks.get('daily_bias_abs_pct', 0):.2f}%  "
+                  f"{'PASS' if benchmarks.get('daily_bias_pass') else 'FAIL'}")
+            logger.info(f"  SL dev <= {sl_max:g}%:  {benchmarks.get('screenline_max_error_pct', 0):.1f}%  "
+                  f"{'PASS' if benchmarks.get('daily_screenline_pass') else 'FAIL'}")
+            logger.info(f"  (GEH<5: {geh:.1f}% — diagnostic only for daily model)")
+            logger.info("-" * 60)
+            logger.info("VERDICT: %s (based on %s)", overall, verdict_src)
     else:
         logger.info(f"  GEH<5 >= 85%:  {geh:.1f}%  "
               f"{'PASS' if benchmarks.get('geh_benchmark_pass_hourly') else 'FAIL'}")

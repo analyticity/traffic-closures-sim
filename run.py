@@ -13,21 +13,28 @@ Workflow:
   7) build-demand        – seed OD matrix (SLDB, gateways, synthetic segments)
   8) assign-warm-skims  – optional short assign; always saves skims.aem for distribute
   9) distribute         – gravity + IPF (see skim vs Euclidean below)
- 10) assign              – full traffic assignment (AoN / equilibrium)
- 11) calibrate           – Spiess gradient ODME (default); set calibration.method for others
- 12) calibrate-odme      – explicit alias for Spiess ODME
- 13) tune-supply         – optional outer loop on supply parameters
- 14) validate            – match diagnostics + independent validation (CSD)
- 15) learn-profile       – day-type factors from CSD
- 16) strip-closures      – remove baseline closures → clean network for scenarios
- 17) serve               – REST API (read-only results)
+ 10) assign              – full traffic assignment (user equilibrium; AoN blocked by default)
+ 11) audit-supply        – basic supply-side diagnostics (speeds, capacities, VDF); prerequisite for ODME
+ 12) calibrate           – Spiess gradient ODME (default); set calibration.method for others
+ 13) calibrate-odme      – explicit alias for Spiess ODME
+ 14) tune-supply         – optional outer loop on supply parameters
+ 15) validate            – match diagnostics + independent validation (CSD)
+ 16) learn-profile       – day-type factors from CSD
+ 17) strip-closures      – remove baseline closures → clean network for scenarios
+ 18) serve               – REST API (read-only results)
 
   Skim-driven distribute: after build-demand, run assign-warm-skims (or assign with
   calibration.save_skims=true) so distribute can use network times; then distribute, then assign.
-  If distribute runs first without skims, impedance defaults to Euclidean (demand.distribution.impedance=auto).
+  Distribution requires skims by default (demand.distribution.impedance=skim).
+
+  Prerequisite validation: each step declares required input files (project DB,
+  OD matrix, assignment results, etc.) in _STEP_PREREQUISITES.  The runner
+  checks existence before execution and warns about stale outputs via
+  _STALENESS_CHECKS.
 """
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -58,6 +65,8 @@ from sim.calibration import (
 from sim.demand.temporal import run_learn_profile
 from sim.supernetwork import run_build_supernetwork
 
+logger = logging.getLogger(__name__)
+
 STEPS = [
     "init-city",
     "clean",
@@ -71,10 +80,12 @@ STEPS = [
     "assign-warm-skims",
     "distribute",
     "assign",
+    "audit-supply",
     "calibrate",
     "calibrate-odme",  # explicit alias; calibrate also defaults to ODME
     "tune-supply",
     "validate",
+    "sensitivity",
     "learn-profile",
     "strip-closures",
     "serve",
@@ -99,6 +110,154 @@ def _require_assign_inputs(cfg: dict, step: str) -> None:
         raise FileNotFoundError(
             f"{step}: project database not found: {pdb}. Run build-network first."
         )
+
+
+# ---------------------------------------------------------------------------
+#  Step dependency DAG – declarative prerequisite & staleness checks
+# ---------------------------------------------------------------------------
+
+def _resolve_cfg_path(cfg: dict, spec: str) -> Path:
+    """Resolve a prerequisite path spec against the loaded config.
+
+    Supported specs:
+      - ``project_db``  → ``{project_path}/project_database.sqlite``
+      - ``matrix``      → ``demand.matrix_path``
+      - ``results``     → ``{demand.output_dir}/assignment_results.parquet``
+      - ``skims``       → ``{demand.output_dir}/skims.aem``
+      - ``zones``       → ``{zoning.output_dir}/zones.geojson``
+      - ``zone_map``    → ``{zoning.output_dir}/zone_centroid_mapping.json``
+    """
+    if spec == "project_db":
+        return Path(cfg["project_path"]) / "project_database.sqlite"
+    if spec == "matrix":
+        return Path(cfg["demand"]["matrix_path"])
+    demand_out = Path(
+        cfg.get("demand", {}).get("output_dir", "outputs/baseline/demand")
+    )
+    if spec == "results":
+        return demand_out / "assignment_results.parquet"
+    if spec == "skims":
+        return demand_out / "skims.aem"
+    zoning_out = Path(
+        cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones")
+    )
+    if spec == "zones":
+        return zoning_out / "zones.geojson"
+    if spec == "zone_map":
+        return zoning_out / "zone_centroid_mapping.json"
+    raise ValueError(f"Unknown prerequisite spec: {spec!r}")
+
+
+# (spec, human hint for the error message)
+_STEP_PREREQUISITES: dict[str, list[tuple[str, str]]] = {
+    "normalize-network": [
+        ("project_db", "Run build-network first"),
+    ],
+    "build-zones": [
+        ("project_db", "Run build-network first"),
+    ],
+    "assign-warm-skims": [
+        ("project_db", "Run build-network first"),
+        ("matrix", "Run build-demand first"),
+    ],
+    "distribute": [
+        ("project_db", "Run build-network first"),
+        ("matrix", "Run build-demand first"),
+    ],
+    "assign": [
+        ("project_db", "Run build-network first"),
+        ("matrix", "Run build-demand first"),
+    ],
+    "audit-supply": [
+        ("project_db", "Run build-network first"),
+    ],
+    "calibrate": [
+        ("project_db", "Run build-network first"),
+        ("matrix", "Run build-demand first"),
+    ],
+    "calibrate-odme": [
+        ("project_db", "Run build-network first"),
+        ("matrix", "Run build-demand first"),
+    ],
+    "tune-supply": [
+        ("project_db", "Run build-network first"),
+        ("matrix", "Run build-demand first"),
+    ],
+    "validate": [
+        ("matrix", "Run build-demand first"),
+        ("results", "Run assign or calibrate first"),
+    ],
+    "strip-closures": [
+        ("project_db", "Run build-network first"),
+    ],
+}
+
+# Pairs of (newer_spec, older_spec, warning_message) for staleness detection.
+# Warns when the *older* file has a newer mtime than the *newer* file,
+# suggesting a prerequisite was re-run without updating downstream outputs.
+_STALENESS_CHECKS: dict[str, list[tuple[str, str, str]]] = {
+    "distribute": [
+        (
+            "skims",
+            "project_db",
+            "skims.aem is older than project database — network may have "
+            "changed since last skim generation. Consider re-running "
+            "assign-warm-skims.",
+        ),
+    ],
+    "validate": [
+        (
+            "results",
+            "matrix",
+            "assignment_results.parquet is older than the OD matrix — "
+            "results may be stale. Consider re-running assign or calibrate.",
+        ),
+    ],
+    "calibrate": [
+        (
+            "results",
+            "project_db",
+            "assignment_results.parquet is older than project database — "
+            "consider re-running assign before calibrate.",
+        ),
+    ],
+    "calibrate-odme": [
+        (
+            "results",
+            "project_db",
+            "assignment_results.parquet is older than project database — "
+            "consider re-running assign before calibrate.",
+        ),
+    ],
+}
+
+
+def _check_step_prerequisites(cfg: dict, step: str) -> None:
+    """Validate file-existence prerequisites and warn about stale inputs."""
+    prereqs = _STEP_PREREQUISITES.get(step)
+    if prereqs:
+        missing: list[str] = []
+        for spec, hint in prereqs:
+            p = _resolve_cfg_path(cfg, spec)
+            if not p.exists():
+                missing.append(f"{p} ({hint})")
+        if missing:
+            raise FileNotFoundError(
+                f"{step}: missing required inputs:\n  "
+                + "\n  ".join(missing)
+            )
+
+    staleness = _STALENESS_CHECKS.get(step)
+    if staleness:
+        for newer_spec, older_spec, msg in staleness:
+            try:
+                newer = _resolve_cfg_path(cfg, newer_spec)
+                older = _resolve_cfg_path(cfg, older_spec)
+            except (KeyError, ValueError):
+                continue
+            if newer.exists() and older.exists():
+                if newer.stat().st_mtime < older.stat().st_mtime:
+                    logger.warning("Staleness warning for %s: %s", step, msg)
 
 
 def run_clean(config_path: str, *, force: bool = False) -> None:
@@ -174,6 +333,12 @@ def main() -> None:
     cfg = args.config
     step = args.step
 
+    # --- Preflight: unified prerequisite & staleness checks ---
+    _no_preflight = {"init-city", "clean", "check", "build-network", "fetch-data", "serve"}
+    if step not in _no_preflight:
+        _pre_cfg = load_config(cfg)
+        _check_step_prerequisites(_pre_cfg, step)
+
     if step == "init-city":
         from scripts.generate_city_config import main as gen_main
         gen_main()
@@ -197,7 +362,6 @@ def main() -> None:
         load_or_build_od_matrix(cfg, cfg=_cfg)
     elif step == "assign-warm-skims":
         _cfg = load_config(cfg)
-        _require_assign_inputs(_cfg, step)
         run_warm_skim_assignment(cfg, cfg=_cfg)
     elif step == "distribute":
         from sim.distribution import run_distribution
@@ -212,15 +376,12 @@ def main() -> None:
         run_build_supernetwork(cfg)
     elif step == "assign":
         _cfg = load_config(cfg)
-        _require_assign_inputs(_cfg, step)
         run_assignment(cfg, cfg=_cfg)
+    elif step == "audit-supply":
+        from sim.calibration.supply_audit import run_supply_audit
+        run_supply_audit(cfg)
     elif step in ("calibrate", "calibrate-odme"):
-        _c = load_config(cfg)
-        _require_abs_paths(_c, step, [
-            Path(_c["demand"]["matrix_path"]),
-            resolve_project_database_path(_c),
-        ])
-        method = (_c.get("calibration") or {}).get("method", "odme")
+        method = (_pre_cfg.get("calibration") or {}).get("method", "odme")
         if step == "calibrate-odme" or method == "odme":
             run_odme_calibration(cfg)
         elif method == "entropy_odme":
@@ -233,12 +394,11 @@ def main() -> None:
         from sim.calibration import run_supply_tuning
         run_supply_tuning(cfg)
     elif step == "validate":
-        _c = load_config(cfg)
-        _require_abs_paths(_c, step, [
-            Path(_c["demand"]["matrix_path"]),
-        ])
         run_match_diagnostics(cfg)
         run_validation_only(cfg)
+    elif step == "sensitivity":
+        from sim.sensitivity import run_sensitivity
+        run_sensitivity(cfg)
     elif step == "learn-profile":
         _c = load_config(cfg)
         _require_abs_paths(_c, step, [resolved_csd2025_validation_parquet_path(_c)])

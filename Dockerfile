@@ -41,6 +41,7 @@ RUN python run.py --config "config/${CITY}/sim.yaml" check \
     && python run.py --config "config/${CITY}/sim.yaml" assign-warm-skims \
     && python run.py --config "config/${CITY}/sim.yaml" distribute \
     && python run.py --config "config/${CITY}/sim.yaml" assign \
+    && python run.py --config "config/${CITY}/sim.yaml" audit-supply \
     && python run.py --config "config/${CITY}/sim.yaml" calibrate \
     && python run.py --config "config/${CITY}/sim.yaml" validate \
     && python run.py --config "config/${CITY}/sim.yaml" learn-profile

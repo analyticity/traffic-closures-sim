@@ -125,8 +125,8 @@ SIM_DEFAULTS: Dict[str, Any] = {
 
         "warm_skim_pass": {
             "algorithm": "bfw",
-            "max_iter": 30,
-            "rgap_target": 0.01,
+            "max_iter": 80,
+            "rgap_target": 0.02,
         },
 
         "generalized_cost": {

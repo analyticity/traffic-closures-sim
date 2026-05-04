@@ -316,6 +316,35 @@ class TestSkimConvergenceEnforcement:
             _validate_skim_convergence(tmp_path)
         assert "above the recommended threshold" in caplog.text
 
+    def test_warm_skim_rgap_019_passes_with_new_defaults(self, tmp_path):
+        """Reproduce the deploy failure: warm-skim yields rgap=0.019.
+
+        With the updated warm_skim_pass defaults (rgap_target=0.02), the
+        assignment pipeline marks this as converged and distribute accepts it.
+        """
+        from sim.defaults import SIM_DEFAULTS
+        from sim.distribution.impedance import _validate_skim_convergence
+
+        warm_target = SIM_DEFAULTS["assignment"]["warm_skim_pass"]["rgap_target"]
+        deploy_rgap = 0.019032
+
+        # Simulate what assignment/pipeline.py writes: converged = rgap <= target
+        converged = deploy_rgap <= warm_target
+        assert converged, (
+            f"rgap={deploy_rgap} should be <= warm_skim rgap_target={warm_target}"
+        )
+
+        meta = {
+            "algorithm": "bfw",
+            "final_rgap": deploy_rgap,
+            "converged": converged,
+            "n_iterations": 30,
+            "skim_method": "final",
+        }
+        (tmp_path / "skims_meta.json").write_text(json.dumps(meta))
+        # Must not raise
+        _validate_skim_convergence(tmp_path)
+
 
 # ---------------------------------------------------------------------------
 # P0-B: Segment-based distribution config

@@ -239,3 +239,4 @@ scritp.py
 # Experiment temp configs (must stay under repo root for path resolution)
 .tmp_metric_principle_configs/
 .tmp_tuning_configs/
+audit.md

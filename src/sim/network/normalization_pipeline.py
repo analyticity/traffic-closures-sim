@@ -5,6 +5,7 @@ closures, and final network export in a single call.
 """
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -54,7 +55,7 @@ def normalize_and_export_network(
 
         _log_connectivity(connectivity_info)
 
-        links = _apply_closures_if_enabled(project, links, cfg)
+        links = _apply_closures_if_enabled(project, links, cfg, outputs_dir)
 
         _export(project, links, connectivity_info, cfg, outputs_dir)
 
@@ -148,6 +149,7 @@ def _apply_closures_if_enabled(
     project: Project,
     links: pd.DataFrame,
     cfg: dict,
+    outputs_dir: Union[str, Path, None] = None,
 ) -> pd.DataFrame:
     bc_cfg = cfg.get("baseline_closures") or {}
     if not bc_cfg.get("enabled", False):
@@ -169,6 +171,18 @@ def _apply_closures_if_enabled(
 
     with project_db(project) as conn:
         _write_closure_state_to_db(conn, links)
+
+    manifest = links.attrs.get("closure_manifest")
+    if manifest and outputs_dir is not None:
+        manifest["source_path"] = str(source_path)
+        out = Path(outputs_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        manifest_path = out / "closure_manifest.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info("Closure manifest written to %s", manifest_path)
 
     return links
 

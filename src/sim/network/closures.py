@@ -260,6 +260,12 @@ def apply_baseline_closures(
             )
         else:
             logger.info("No closures matched to network links")
+        links.attrs["closure_manifest"] = {
+            "n_closures_loaded": len(closures),
+            "n_closures_matched": 0,
+            "n_links_affected": 0,
+            "affected_links": [],
+        }
         return links
 
     for col in ("speed_ab", "speed_ba", "capacity_ab", "capacity_ba",
@@ -302,6 +308,27 @@ def apply_baseline_closures(
         "Applied %d baseline closures (%d full, %d partial)",
         len(affected_link_ids), full_count, len(affected_link_ids) - full_count,
     )
+
+    manifest_links = []
+    for lid, sev in affected_link_ids.items():
+        row_mask = links["link_id"] == lid
+        if not row_mask.any():
+            continue
+        row = links.loc[row_mask].iloc[0]
+        entry: Dict[str, Any] = {"link_id": int(lid), "severity": sev}
+        if "_preclosure_capacity_ab" in links.columns:
+            entry["preclosure_cap_ab"] = round(float(row["_preclosure_capacity_ab"]), 1)
+            entry["postclosure_cap_ab"] = round(float(row["capacity_ab"]), 1)
+        manifest_links.append(entry)
+    links.attrs["closure_manifest"] = {
+        "n_closures_loaded": len(closures),
+        "n_closures_matched": len(affected_link_ids),
+        "n_links_affected": len(affected_link_ids),
+        "n_full": full_count,
+        "n_partial": len(affected_link_ids) - full_count,
+        "affected_links": manifest_links,
+    }
+
     return links
 
 

@@ -221,6 +221,27 @@ def _resolve_attr_only_screenline(
     return pair
 
 
+def _dedup_link_ids(
+    sl_name: str,
+    links: List[Tuple[int, int]],
+) -> List[Tuple[int, int]]:
+    """Remove duplicate link_id entries within a single screenline."""
+    seen: set = set()
+    out: List[Tuple[int, int]] = []
+    for lid, d in links:
+        if lid in seen:
+            continue
+        seen.add(lid)
+        out.append((lid, d))
+    n_dropped = len(links) - len(out)
+    if n_dropped:
+        logger.warning(
+            "Screenline '%s': removed %d duplicate link_id(s) (kept %d unique)",
+            sl_name, n_dropped, len(out),
+        )
+    return out
+
+
 def resolve_screenline_links(
     sl: ScreenlineDef,
     links_gdf: gpd.GeoDataFrame,
@@ -234,7 +255,7 @@ def resolve_screenline_links(
     by ``attr_filter``.
     """
     if sl.has_explicit_links and sl.links:
-        return sl.links
+        return _dedup_link_ids(sl.name, sl.links)
 
     from shapely import wkt as shapely_wkt
     from shapely.ops import transform as shapely_transform
@@ -294,6 +315,8 @@ def resolve_screenline_links(
 
     if not resolved and sl.attr_filter and geom_raw is not None:
         resolved = _resolve_attr_only_screenline(sl, links_gdf)
+
+    resolved = _dedup_link_ids(sl.name, resolved)
 
     # --- expected_links validation ------------------------------------------
     if sl.expected_links is not None and len(resolved) != sl.expected_links:

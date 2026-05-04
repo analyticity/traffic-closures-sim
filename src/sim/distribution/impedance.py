@@ -1,9 +1,10 @@
 """Impedance loading: skim matrices and Euclidean fallback."""
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -13,6 +14,62 @@ from aequilibrae.matrix import AequilibraeMatrix
 from sim.io_project import pairwise_euclidean
 
 logger = logging.getLogger(__name__)
+
+_SKIM_CONVERGENCE_WARN_THRESHOLD = 0.01
+
+
+def load_skim_metadata(output_dir: Path) -> Optional[Dict[str, Any]]:
+    """Load skim sidecar metadata written by the assignment step."""
+    meta_path = output_dir / "skims_meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.debug("Failed to read skims_meta.json", exc_info=True)
+        return None
+
+
+def _validate_skim_convergence(
+    output_dir: Path,
+    *,
+    allow_unconverged: bool = False,
+) -> None:
+    """Check that skims come from a sufficiently converged assignment.
+
+    Raises ``RuntimeError`` when skims are non-converged and
+    *allow_unconverged* is ``False`` (the default).
+    """
+    meta = load_skim_metadata(output_dir)
+    if meta is None:
+        logger.warning(
+            "No skims_meta.json found alongside skims.aem. "
+            "Cannot verify assignment convergence for distribution impedance. "
+            "Re-run assign-warm-skims or assign to generate metadata."
+        )
+        return
+    rgap = meta.get("final_rgap")
+    converged = meta.get("converged", False)
+    if not converged:
+        msg = (
+            f"Skims come from a NON-CONVERGED assignment (rgap={rgap}). "
+            "Distribution on unconverged impedance produces unreliable "
+            "trip tables. Re-run assign-warm-skims with a tighter rgap target."
+        )
+        if allow_unconverged:
+            logger.warning(msg + " (proceeding because allow_unconverged_skims=true)")
+        else:
+            raise RuntimeError(
+                msg + " Set demand.distribution.allow_unconverged_skims=true "
+                "to override (prototyping only)."
+            )
+    elif rgap is not None and rgap > _SKIM_CONVERGENCE_WARN_THRESHOLD:
+        logger.warning(
+            "Skims come from an assignment with rgap=%.6f, "
+            "above the recommended threshold (%.0e). "
+            "Consider tightening convergence for better impedance quality.",
+            rgap, _SKIM_CONVERGENCE_WARN_THRESHOLD,
+        )
 
 
 def _load_impedance(

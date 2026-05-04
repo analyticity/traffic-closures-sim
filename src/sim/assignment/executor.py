@@ -1,9 +1,11 @@
 """Low-level traffic assignment execution and result enrichment."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import warnings
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -15,6 +17,38 @@ from aequilibrae.paths import TrafficAssignment, TrafficClass
 from sim.assignment.graph import build_graph, _resolve_time_field, _resolve_vdf_params
 
 logger = logging.getLogger(__name__)
+
+_UE_ALGORITHMS = frozenset({"bfw", "cfw", "msa"})
+_AON_ALGORITHMS = frozenset({"aon", "all-or-nothing"})
+_RGAP_QUALITY_THRESHOLD = 1e-3
+
+
+def _validate_algorithm(algorithm: str, *, allow_aon: bool = False) -> str:
+    """Validate and normalize the assignment algorithm name.
+
+    Raises ``ValueError`` if the algorithm is AoN and ``allow_aon`` is False.
+    """
+    alg = algorithm.strip().lower()
+    if alg in _AON_ALGORITHMS:
+        if not allow_aon:
+            raise ValueError(
+                f"Algorithm '{algorithm}' is All-or-Nothing and is not permitted "
+                f"for production assignment. AoN ignores congestion feedback and "
+                f"produces structurally incorrect flows. Use 'bfw' (recommended), "
+                f"'cfw', or 'msa' for user-equilibrium assignment. "
+                f"Set calibration.allow_aon=true only for diagnostic use."
+            )
+        logger.warning(
+            "AoN algorithm selected with allow_aon=true. "
+            "Results are NOT suitable for calibration or forecasting."
+        )
+    elif alg not in _UE_ALGORITHMS:
+        logger.warning(
+            "Algorithm '%s' is not in the standard UE set (%s). "
+            "Proceeding, but verify AequilibraE supports it.",
+            algorithm, ", ".join(sorted(_UE_ALGORITHMS)),
+        )
+    return alg
 
 
 def execute_assignment(
@@ -34,13 +68,32 @@ def execute_assignment(
     graph=None,
     cores: int = 0,
     skim_method: str = "blended",
+    allow_aon: bool = False,
+    strict_convergence: bool = False,
+    assignment_cfg: Optional[Dict[str, object]] = None,
 ) -> Tuple[pd.DataFrame, Optional[AequilibraeMatrix], Dict[str, np.ndarray]]:
     """Run assignment on an already-open project with a loaded matrix.
 
     Returns ``(link_volume_df, skims, select_link_matrices)``.
+
+    Parameters
+    ----------
+    allow_aon : bool
+        If False (default), AoN algorithms raise ``ValueError``.
+    strict_convergence : bool
+        If True, raises ``RuntimeError`` when assignment does not converge
+        within the target relative gap.
+    assignment_cfg : dict, optional
+        Full ``assignment`` section from config; used for graph-level settings
+        like ``blocked_centroid_flows`` when no pre-built graph is supplied.
     """
+    algorithm = _validate_algorithm(algorithm, allow_aon=allow_aon)
     if graph is None:
-        graph = build_graph(project, mat, bpr_parameters=bpr_parameters)
+        graph = build_graph(
+            project, mat,
+            bpr_parameters=bpr_parameters,
+            assignment_cfg=assignment_cfg,
+        )
 
     time_field = _resolve_time_field(graph)
     gdf = graph.graph
@@ -147,21 +200,43 @@ def execute_assignment(
     assig.execute()
 
     # --- Convergence diagnostics ---
+    convergence_meta: Dict[str, Any] = {
+        "algorithm": algorithm,
+        "rgap_target": rgap_target,
+        "max_iter": max_iter,
+        "final_rgap": None,
+        "n_iterations": None,
+        "converged": False,
+    }
     try:
         report_df = assig.report()
         if report_df is not None and not report_df.empty:
             last_row = report_df.iloc[-1]
             final_rgap = float(last_row.get("rgap", last_row.get("Relative Gap", float("nan"))))
             n_iters = len(report_df)
+            convergence_meta["final_rgap"] = final_rgap
+            convergence_meta["n_iterations"] = n_iters
             if final_rgap > rgap_target:
-                warnings.warn(
+                convergence_meta["converged"] = False
+                msg = (
                     f"Assignment did NOT converge: rgap={final_rgap:.6f} > "
-                    f"target={rgap_target:.6f} after {n_iters}/{max_iter} iterations",
-                    RuntimeWarning,
-                    stacklevel=2,
+                    f"target={rgap_target:.6f} after {n_iters}/{max_iter} iterations"
                 )
+                if strict_convergence:
+                    raise RuntimeError(msg)
+                warnings.warn(msg, RuntimeWarning, stacklevel=2)
             else:
+                convergence_meta["converged"] = True
                 logger.info(f"  Assignment converged: rgap={final_rgap:.6f} in {n_iters} iterations")
+                if final_rgap > _RGAP_QUALITY_THRESHOLD:
+                    logger.warning(
+                        "  Quality note: rgap=%.6f meets target but exceeds "
+                        "recommended quality threshold (%.0e). Consider tightening "
+                        "rgap_target for production use.",
+                        final_rgap, _RGAP_QUALITY_THRESHOLD,
+                    )
+    except RuntimeError:
+        raise
     except Exception as exc:
         warnings.warn(f"Could not read assignment convergence report: {exc}", RuntimeWarning, stacklevel=2)
 
@@ -206,7 +281,7 @@ def execute_assignment(
 
     _enrich_with_peak_hour_and_los(df, graph)
 
-    return df, skims, sl_matrices
+    return df, skims, sl_matrices, convergence_meta
 
 
 def _voc_to_los(voc: float) -> str:

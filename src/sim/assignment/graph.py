@@ -14,6 +14,7 @@ def build_graph(
     mat: AequilibraeMatrix,
     *,
     bpr_parameters: Optional[Dict[str, object]] = None,
+    assignment_cfg: Optional[Dict[str, object]] = None,
 ):
     """Build and configure the car-mode graph once.
 
@@ -42,7 +43,19 @@ def build_graph(
 
     graph.set_graph(time_field)
     graph.set_skimming([time_field])
-    graph.set_blocked_centroid_flows(True)
+
+    blocked = True
+    if assignment_cfg is not None:
+        blocked = bool(assignment_cfg.get("blocked_centroid_flows", True))
+    if not blocked:
+        warnings.warn(
+            "blocked_centroid_flows is False — traffic may route through "
+            "centroids, which breaks path interpretation in real models. "
+            "Set assignment.blocked_centroid_flows: true unless you have a "
+            "specific reason (e.g. Sioux Falls toy network).",
+            stacklevel=2,
+        )
+    graph.set_blocked_centroid_flows(blocked)
 
     if bpr_parameters and bpr_parameters.get("per_link") and "link_type" in gdf.columns:
         by_lt = bpr_parameters.get("by_link_type") or {}
@@ -94,7 +107,14 @@ def _resolve_vdf_params(
     """Return the ``set_vdf_parameters`` dict for the given BPR config."""
     if bpr_parameters and bpr_parameters.get("per_link") and "link_type" in gdf_columns:
         return {"alpha": "alpha", "beta": "beta"}
-    if bpr_parameters and not bpr_parameters.get("per_link"):
+    if bpr_parameters and bpr_parameters.get("per_link") and "link_type" not in gdf_columns:
+        warnings.warn(
+            "per_link BPR requested but link_type column is missing from "
+            "the graph — falling back to scalar alpha_default/beta_default. "
+            "Check that the project network has link_type populated.",
+            stacklevel=2,
+        )
+    if bpr_parameters:
         return {
             "alpha": float(bpr_parameters.get("alpha_default", bpr_parameters.get("alpha", 0.85))),
             "beta": float(bpr_parameters.get("beta_default", bpr_parameters.get("beta", 4.0))),

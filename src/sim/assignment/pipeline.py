@@ -1,6 +1,7 @@
 """CLI entry-points: run_assignment, run_warm_skim_assignment."""
 from __future__ import annotations
 
+import json
 import logging
 import warnings
 from pathlib import Path
@@ -27,6 +28,8 @@ def _run_assignment_pass(
     log_volume_note: str = "",
     skim_method: str = "blended",
     cfg: dict | None = None,
+    allow_aon: bool = False,
+    strict_convergence: bool = False,
 ) -> None:
     """Shared body for ``assign`` and ``assign-warm-skims``."""
     if cfg is None:
@@ -77,7 +80,7 @@ def _run_assignment_pass(
     project = Project()
     project.open(str(project_dir))
     try:
-        df, skims, _sl = execute_assignment(
+        df, skims, _sl, convergence_meta = execute_assignment(
             project,
             mat,
             algorithm=algorithm,
@@ -91,6 +94,9 @@ def _run_assignment_pass(
             multi_class=multi_classes,
             cores=cores,
             skim_method=skim_method,
+            allow_aon=allow_aon,
+            strict_convergence=strict_convergence,
+            assignment_cfg=assign_cfg,
         )
     finally:
         project.close()
@@ -124,15 +130,34 @@ def _run_assignment_pass(
     df.to_parquet(str(out_path), index=False)
     logger.info(f"   Saved: {out_path}")
 
+    # Write convergence metadata for downstream guards
+    conv_path = output_dir / "assignment_convergence.json"
+    conv_path.write_text(
+        json.dumps(convergence_meta, indent=2, ensure_ascii=False), encoding="utf-8",
+    )
+    logger.info(f"   Convergence metadata: {conv_path}")
+
     if skims is not None:
         skim_path = output_dir / "skims.aem"
         try:
             skims.export(str(skim_path))
             logger.info(f"   Skims saved: {skim_path}")
+            # Write skim metadata sidecar for distribution convergence check
+            skims_meta = {
+                "algorithm": convergence_meta.get("algorithm"),
+                "final_rgap": convergence_meta.get("final_rgap"),
+                "converged": convergence_meta.get("converged"),
+                "n_iterations": convergence_meta.get("n_iterations"),
+                "skim_method": skim_method,
+            }
+            meta_path = output_dir / "skims_meta.json"
+            meta_path.write_text(
+                json.dumps(skims_meta, indent=2, ensure_ascii=False), encoding="utf-8",
+            )
         except Exception as exc:
             warnings.warn(
                 f"Skim export failed ({skim_path}): {exc}. "
-                "Trip distribution may fall back to Euclidean distance.",
+                "Trip distribution will require skims from a prior run.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -146,6 +171,8 @@ def run_assignment(config_path: str | Path = "config/brno/sim.yaml", cfg: dict |
     max_iter = int(calib_cfg.get("max_iter", 100))
     rgap = float(calib_cfg.get("rgap_target", 0.001))
     save_skims = bool(calib_cfg.get("save_skims", False))
+    allow_aon = bool(calib_cfg.get("allow_aon", False))
+    strict = bool(calib_cfg.get("strict_convergence", True))
     _run_assignment_pass(
         config_path,
         algorithm=algorithm,
@@ -154,6 +181,8 @@ def run_assignment(config_path: str | Path = "config/brno/sim.yaml", cfg: dict |
         save_skims=save_skims,
         banner="=== TRAFFIC ASSIGNMENT ===",
         cfg=cfg,
+        allow_aon=allow_aon,
+        strict_convergence=strict,
     )
 
 

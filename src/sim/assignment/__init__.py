@@ -24,6 +24,7 @@ from sim.assignment.graph import (
 # -- executor ----------------------------------------------------------------
 from sim.assignment.executor import (
     _detect_volume_col,
+    _validate_algorithm,
     _voc_to_los,
     execute_assignment,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "_resolve_vdf_params",
     # executor
     "execute_assignment",
+    "_validate_algorithm",
     "_voc_to_los",
     "_detect_volume_col",
     # pipeline

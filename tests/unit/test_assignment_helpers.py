@@ -50,10 +50,10 @@ class TestResolveVdfParams:
         assert result == {"alpha": "alpha", "beta": "beta"}
 
     def test_per_link_true_no_link_type_col(self):
-        """per_link requested but link_type missing => falls to global default."""
+        """per_link requested but link_type missing => uses configured defaults."""
         bpr = {"per_link": True, "alpha": 0.2, "beta": 5.0}
         result = _resolve_vdf_params(bpr, ["link_id"])
-        assert result == {"alpha": 0.85, "beta": 4.0}
+        assert result == {"alpha": 0.2, "beta": 5.0}
 
     def test_per_link_false_custom(self):
         bpr = {"per_link": False, "alpha": 0.2, "beta": 5.0}

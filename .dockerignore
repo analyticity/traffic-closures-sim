@@ -17,10 +17,7 @@ data/demand/
 outputs/
 project/
 
-frontend/node_modules/
-frontend/dist/
-frontend/.env
-frontend/tsconfig.tsbuildinfo
+frontend/
 
 excel_materials/
 excel_examples/

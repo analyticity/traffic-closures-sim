@@ -46,18 +46,7 @@ RUN python run.py --config "config/${CITY}/sim.yaml" check \
     && python run.py --config "config/${CITY}/sim.yaml" validate \
     && python run.py --config "config/${CITY}/sim.yaml" learn-profile
 
-# ---- Stage 3: Build frontend ----
-FROM node:20-slim AS frontend-build
-
-WORKDIR /app/frontend
-COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci
-
-COPY frontend/ ./
-ENV VITE_API_URL=""
-RUN npm run build
-
-# ---- Stage 4: Final image ----
+# ---- Stage 3: Final image ----
 FROM base AS final
 
 ARG CITY=brno
@@ -67,8 +56,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 COPY --from=pipeline /app/data/ /app/data/
 COPY --from=pipeline /app/outputs/ /app/outputs/
 COPY --from=pipeline /app/project/ /app/project/
-
-COPY --from=frontend-build /app/frontend/dist/ /app/frontend/dist/
 
 EXPOSE 8000
 CMD ["python", "run.py", "serve"]

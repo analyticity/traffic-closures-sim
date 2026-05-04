@@ -450,6 +450,14 @@ def split_csd_for_calibration(
         Sections whose ``nazev_mesta`` is non-empty (urban) are used for
         calibration; sections without a city name (rural/inter-urban)
         become the validation set.
+    corridor
+        Entire roads (by ``sil``) are assigned as units to calibration or
+        validation.  Roads are grouped by ``road_class`` and within each
+        class sorted by section count (descending) then road number, then
+        greedily assigned to whichever subset is furthest from its target
+        section count.  This guarantees that the validation set contains
+        roads the calibration has *never seen* -- a much stronger
+        independence guarantee than ``alternating``.
     """
     if not (0.0 < calib_share < 1.0):
         raise ValueError(
@@ -512,6 +520,47 @@ def split_csd_for_calibration(
                 csd, strategy="alternating",
                 calib_share=calib_share, random_seed=random_seed,
             )
+
+    elif strategy == "corridor":
+        rng = np.random.RandomState(random_seed)
+
+        road_info = (
+            csd.groupby("sil")
+            .agg(n_sections=("sil", "size"), road_class=("road_class", "first"))
+            .reset_index()
+        )
+        road_info = road_info.sample(frac=1.0, random_state=rng).reset_index(drop=True)
+
+        target_calib = round(len(csd) * calib_share)
+        calib_roads: set = set()
+        valid_roads: set = set()
+        calib_count = 0
+
+        for rc, grp in road_info.groupby("road_class"):
+            grp = grp.sort_values("n_sections", ascending=False)
+            rc_target = round(grp["n_sections"].sum() * calib_share)
+            rc_calib = 0
+            for _, row in grp.iterrows():
+                if rc_calib < rc_target:
+                    calib_roads.add(row["sil"])
+                    rc_calib += row["n_sections"]
+                    calib_count += row["n_sections"]
+                else:
+                    valid_roads.add(row["sil"])
+
+        if not valid_roads:
+            logger.warning(
+                "Corridor CSD split produced an empty validation "
+                "subset. Falling back to alternating.",
+            )
+            return split_csd_for_calibration(
+                csd, strategy="alternating",
+                calib_share=calib_share, random_seed=random_seed,
+            )
+
+        is_calib = csd["sil"].isin(calib_roads)
+        calib_df = csd[is_calib].copy()
+        valid_df = csd[~is_calib].copy()
 
     else:
         raise ValueError(f"Unknown CSD split strategy: {strategy!r}")

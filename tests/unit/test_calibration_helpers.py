@@ -435,6 +435,87 @@ class TestScreenlineFactorsConfig:
 
 
 # ---------------------------------------------------------------------------
+# _dedup_cross_screenline_links
+# ---------------------------------------------------------------------------
+class TestDedupCrossScreenlineLinks:
+    def test_no_collisions_unchanged(self):
+        from sim.calibration import _dedup_cross_screenline_links
+
+        sl_query = {
+            "SL_A": [(1, 0), (2, 0)],
+            "SL_B": [(3, 0), (4, 0)],
+        }
+        result, log = _dedup_cross_screenline_links(sl_query)
+        assert result == sl_query
+        assert log == []
+
+    def test_duplicate_kept_in_smallest_screenline(self):
+        from sim.calibration import _dedup_cross_screenline_links
+
+        sl_query = {
+            "SL_big": [(1, 0), (2, 0), (3, 0)],
+            "SL_small": [(2, 0)],
+        }
+        result, log = _dedup_cross_screenline_links(sl_query)
+        assert (2, 0) in result["SL_small"]
+        assert (2, 0) not in result["SL_big"]
+        assert len(log) == 1
+
+    def test_tie_break_alphabetical(self):
+        from sim.calibration import _dedup_cross_screenline_links
+
+        sl_query = {
+            "SL_B": [(1, 0)],
+            "SL_A": [(1, 0)],
+        }
+        result, log = _dedup_cross_screenline_links(sl_query)
+        assert (1, 0) in result["SL_A"]
+        assert (1, 0) not in result["SL_B"]
+
+    def test_multiple_collisions(self):
+        from sim.calibration import _dedup_cross_screenline_links
+
+        sl_query = {
+            "SL1": [(10, 0), (20, 0), (30, 0)],
+            "SL2": [(10, 0), (40, 0)],
+            "SL3": [(20, 0), (30, 0), (50, 0), (60, 0)],
+        }
+        result, log = _dedup_cross_screenline_links(sl_query)
+        all_lids = []
+        for links in result.values():
+            all_lids.extend(lid for lid, _ in links)
+        from collections import Counter
+        counts = Counter(all_lids)
+        assert all(c == 1 for c in counts.values()), (
+            f"Duplicate link_ids remain: {counts}"
+        )
+
+    def test_empty_screenline_after_dedup(self):
+        from sim.calibration import _dedup_cross_screenline_links
+
+        sl_query = {
+            "SL_only": [(1, 0)],
+            "SL_also": [(1, 0)],
+        }
+        result, log = _dedup_cross_screenline_links(sl_query)
+        kept_name = "SL_also"
+        empty_name = "SL_only"
+        assert (1, 0) in result[kept_name]
+        assert result[empty_name] == []
+
+    def test_preserves_direction(self):
+        from sim.calibration import _dedup_cross_screenline_links
+
+        sl_query = {
+            "SL_A": [(1, 1)],
+            "SL_B": [(1, 0), (2, 0)],
+        }
+        result, log = _dedup_cross_screenline_links(sl_query)
+        assert (1, 1) in result["SL_A"]
+        assert all(lid != 1 for lid, _ in result["SL_B"])
+
+
+# ---------------------------------------------------------------------------
 # Dynamic screenline-gateway mapping
 # ---------------------------------------------------------------------------
 class TestBuildScreenlineGatewayMap:

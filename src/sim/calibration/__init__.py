@@ -89,6 +89,7 @@ from sim.calibration.screenlines import (  # noqa: F401
     resolve_screenline_links,
     evaluate_all_screenlines,
     auto_generate_screenlines,
+    _dedup_cross_screenline_links,
 )
 
 # FSM state model (now integrated into _CalibrationContext)

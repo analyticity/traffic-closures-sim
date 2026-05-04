@@ -30,6 +30,7 @@ def _run_assignment_pass(
     cfg: dict | None = None,
     allow_aon: bool = False,
     strict_convergence: bool = False,
+    convergence_filename: str = "assignment_convergence.json",
 ) -> None:
     """Shared body for ``assign`` and ``assign-warm-skims``."""
     if cfg is None:
@@ -131,7 +132,7 @@ def _run_assignment_pass(
     logger.info(f"   Saved: {out_path}")
 
     # Write convergence metadata for downstream guards
-    conv_path = output_dir / "assignment_convergence.json"
+    conv_path = output_dir / convergence_filename
     conv_path.write_text(
         json.dumps(convergence_meta, indent=2, ensure_ascii=False), encoding="utf-8",
     )
@@ -183,6 +184,7 @@ def run_assignment(config_path: str | Path = "config/brno/sim.yaml", cfg: dict |
         cfg=cfg,
         allow_aon=allow_aon,
         strict_convergence=strict,
+        convergence_filename="pre_odme_convergence.json",
     )
 
 
@@ -218,6 +220,7 @@ def run_warm_skim_assignment(config_path: str | Path = "config/brno/sim.yaml", c
                 log_volume_note="Warm-pass results (intermediate; re-run assign after distribute if needed)",
                 skim_method="final",
                 cfg=cfg,
+                convergence_filename="warm_assignment_convergence.json",
             )
         finally:
             warnings.showwarning = old_showwarning

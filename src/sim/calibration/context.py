@@ -95,10 +95,19 @@ def _check_assignment_convergence(output_dir: Path) -> Optional[Dict[str, Any]]:
     Returns the convergence metadata dict if found, ``None`` otherwise.
     Logs a warning if the assignment did not converge.
     """
-    conv_path = output_dir / "assignment_convergence.json"
-    if not conv_path.exists():
+    candidates = [
+        "pre_odme_convergence.json",
+        "assignment_convergence.json",
+    ]
+    conv_path = None
+    for name in candidates:
+        p = output_dir / name
+        if p.exists():
+            conv_path = p
+            break
+    if conv_path is None:
         logger.warning(
-            "No assignment_convergence.json found in %s. "
+            "No assignment convergence JSON found in %s. "
             "Cannot verify that base-year assignment converged before ODME.",
             output_dir,
         )
@@ -113,7 +122,7 @@ def _check_assignment_convergence(output_dir: Path) -> Optional[Dict[str, Any]]:
             )
         return meta
     except Exception:
-        logger.debug("Failed to read assignment_convergence.json", exc_info=True)
+        logger.debug("Failed to read %s", conv_path.name, exc_info=True)
         return None
 
 
@@ -202,7 +211,7 @@ class _CalibrationContext:
     """
 
     def __init__(self, config_path: str | Path = "config/brno/sim.yaml") -> None:
-        from sim.calibration.screenlines import load_screenlines, load_screenlines_with_auto, resolve_screenline_links
+        from sim.calibration.screenlines import load_screenlines, load_screenlines_with_auto, resolve_screenline_links, _dedup_cross_screenline_links
 
         self.config_path = config_path
         cfg = load_config(config_path)
@@ -379,6 +388,36 @@ class _CalibrationContext:
                 strict=bool(calib_cfg.get("screenline_dedup_strict", False)),
             )
 
+            if bool(calib_cfg.get("screenline_cross_dedup", True)):
+                self.sl_query, dedup_log = _dedup_cross_screenline_links(
+                    self.sl_query,
+                )
+                if dedup_log:
+                    logger.info(
+                        "Cross-screenline dedup removed %d link "
+                        "assignment(s):", len(dedup_log),
+                    )
+                    for line in dedup_log:
+                        logger.info(line)
+                    sl_by_name = {sl.name: sl for sl in self.screenlines}
+                    for sl_name, link_tuples in self.sl_query.items():
+                        if sl_name in sl_by_name:
+                            sl_by_name[sl_name].links = link_tuples
+                    empty_sls = [
+                        name for name, links in self.sl_query.items()
+                        if not links
+                    ]
+                    for name in empty_sls:
+                        del self.sl_query[name]
+                        logger.warning(
+                            "Screenline '%s' has no links after "
+                            "cross-dedup, removing", name,
+                        )
+                    self.screenlines = [
+                        sl for sl in self.screenlines
+                        if sl.name not in empty_sls
+                    ]
+
         # Open matrix (stays open across iterations)
         self.mat = AequilibraeMatrix()
         self.mat.load(str(self.matrix_path))
@@ -434,6 +473,7 @@ class _CalibrationContext:
         self.gw_cal_damping = float(gw_cal_cfg.get("damping", 0.18))
         self.gw_cal_min_factor = float(gw_cal_cfg.get("min_factor", 0.70))
         self.gw_cal_max_factor = float(gw_cal_cfg.get("max_factor", 1.40))
+        self.gw_rebase_seed_bounds = bool(gw_cal_cfg.get("rebase_seed_bounds", True))
         self.gw_zone_map: Dict[str, np.ndarray] = {}
         self.gw_observed: Dict[str, float] = {}
 
@@ -722,7 +762,7 @@ class _CalibrationContext:
             for gc_line in gw_corrections:
                 logger.info(f"    {gc_line}")
         self._post_gateway_total = float(demand.sum())
-        if outer_it == 1:
+        if outer_it == 1 and self.gw_rebase_seed_bounds:
             rebased = demand.copy()
             self.seed_lower = rebased / self.max_deviation
             self.seed_upper = rebased * self.max_deviation
@@ -789,7 +829,7 @@ class _CalibrationContext:
                 bpr_parameters=self.cfg_bpr,
                 assignment_cfg=self.cfg_assignment,
             )
-            vol_df, _skims, _sl, _conv = execute_assignment(
+            vol_df, _skims, _sl, conv_meta = execute_assignment(
                 project, mat,
                 algorithm=self.algorithm,
                 max_iter=self.max_iter_assign,
@@ -806,6 +846,12 @@ class _CalibrationContext:
                 f"  Final assignment on best-state demand completed "
                 f"(iteration {self.best_iteration})"
             )
+            post_conv_path = self.output_dir / "post_odme_convergence.json"
+            post_conv_path.write_text(
+                json.dumps(conv_meta, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.info(f"  Post-ODME convergence: {post_conv_path}")
             self._transition(CalibrationState.FINALIZE_SUCCESS)
             return vol_df
         finally:

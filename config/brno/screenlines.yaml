@@ -1,80 +1,16 @@
-# Screenline / cordon definitions for gateway and corridor validation.
+# Manual screenline definitions for inner-city corridors.
 #
-# Each screenline is defined by a WKT cut-line (geometry_wkt) in WGS84 that
-# crosses the road corridor at the desired cross-section.  Links are resolved
-# dynamically at runtime by intersecting the cut-line with the network,
-# filtered by optional attribute constraints (filter).
+# Gateway screenlines (D1, D2, I/43, I/52, ...) and high-AADT CSD roads
+# (640, 42, ...) are auto-generated via calibration.auto_screenlines.
 #
-# This approach is immune to link_id changes caused by network re-imports.
+# Only corridors matched by OSM street *name* (not osm_ref_norm) need
+# manual definitions here, because auto-generation cannot create them.
 #
 # direction: 1 = a→b only, -1 = b→a only, 0 = both directions summed
 # type: "screenline" | "cordon" | "radial"
 # expected_links: optional sanity check — warns if resolved count differs
-#
-# CSD 2025 observed AADT values (cars only) are noted per screenline.
-# The evaluation reads observed counts from pentlogram-matched data;
-# for boundary links outside pentlogram coverage, observed_total will be 0
-# and the code falls back to observed_aadt_cars from this config.
 
 screenlines:
-
-  # === Major radial gateways (model boundary) ===
-
-  - name: "D1_west"
-    description: "D1 motorway western model boundary (near gateway node 249493)"
-    type: "radial"
-    observed_aadt_cars: 36985
-    observed_aadt_all: 58191
-    geometry_wkt: "LINESTRING(16.335 49.250, 16.335 49.262)"
-    filter:
-      osm_highway: "motorway"
-      osm_ref_norm: "D1"
-    expected_links: 2
-
-  - name: "D1_east"
-    description: "D1;50 shared motorway eastern model boundary (CSD 6-8810: Holubice → Rousínov)"
-    type: "radial"
-    observed_aadt_cars: 44152
-    observed_aadt_all: 58936
-    geometry_wkt: "LINESTRING(16.780 49.178, 16.780 49.186)"
-    filter:
-      osm_highway: "motorway"
-      osm_ref_norm: "D1,50"
-    expected_links: 2
-
-  - name: "D2_south"
-    description: "D2 motorway southern model boundary (CSD 6-8710: Brno,Chrlice → Blučina)"
-    type: "radial"
-    observed_aadt_cars: 26394
-    observed_aadt_all: 41320
-    geometry_wkt: "LINESTRING(16.6660 49.0610, 16.6690 49.0625)"
-    filter:
-      osm_highway: "motorway"
-      osm_ref_norm: "D2"
-    expected_links: 2
-
-  - name: "I43_north"
-    description: "I/43 primary road northern boundary (CSD 6-0359: Kuřim → hr. Brno-venkov/Blansko)"
-    type: "radial"
-    observed_aadt_cars: 20455
-    observed_aadt_all: 24265
-    geometry_wkt: "LINESTRING(16.5480 49.3480, 16.5540 49.3500)"
-    filter:
-      osm_highway: "primary"
-      osm_ref_norm: "43"
-    expected_links: 1
-
-  - name: "I52_south"
-    description: "D52 motorway southern model boundary (CSD 6-0216: hr. Brno-město → × s 152)"
-    type: "radial"
-    observed_aadt_cars: 39022
-    observed_aadt_all: 50911
-    geometry_wkt: "LINESTRING(16.5430 49.0530, 16.5470 49.0560)"
-    filter:
-      osm_ref_norm: "D52"
-    expected_links: 2
-
-  # === Inner-city corridors ===
 
   - name: "Koliste_radial"
     description: "Koliště/Příkop inner ring road cross-section (bidirectional pair)"
@@ -104,29 +40,6 @@ screenlines:
     geometry_wkt: "LINESTRING(16.6185 49.1940, 16.6215 49.1880)"
     filter:
       name: "Křenová"
-    expected_links: 2
-
-  # === Additional corridors for ODME spatial control ===
-
-  - name: "Zabovreska"
-    description: "Žabovřeská trunk corridor (pentlogram)"
-    type: "radial"
-    observed_aadt_cars: 50000
-    observed_aadt_all: 57500
-    geometry_wkt: "LINESTRING(16.5810 49.2190, 16.5850 49.2215)"
-    filter:
-      osm_ref_norm: "640"
-    expected_links: 1
-
-  - name: "Husovicky_tunel"
-    description: "Husovický tunel trunk corridor (dual carriageway, CSD road 42 mean_cars ~31k)"
-    type: "radial"
-    observed_aadt_cars: 31000
-    observed_aadt_all: 35650
-    geometry_wkt: "LINESTRING(16.6290 49.2155, 16.6330 49.2185)"
-    filter:
-      osm_highway: "trunk"
-      osm_ref_norm: "42"
     expected_links: 2
 
   - name: "Kounicova"

@@ -311,6 +311,7 @@ SIM_DEFAULTS: Dict[str, Any] = {
             "damping": 0.30,
             "min_factor": 0.50,
             "max_factor": 2.00,
+            "rebase_seed_bounds": True,
         },
 
         "match_buffer_m": 80.0,
@@ -392,6 +393,7 @@ SIM_DEFAULTS: Dict[str, Any] = {
         },
 
         "screenline_dedup_strict": False,
+        "screenline_cross_dedup": True,
 
         "auto_screenlines": {
             "enabled": False,

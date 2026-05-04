@@ -242,6 +242,56 @@ def _dedup_link_ids(
     return out
 
 
+def _dedup_cross_screenline_links(
+    sl_query: Dict[str, List[Tuple[int, int]]],
+) -> Tuple[Dict[str, List[Tuple[int, int]]], List[str]]:
+    """Remove link_ids that appear in more than one screenline.
+
+    For each duplicated link_id, the link is kept in the screenline that
+    has the **fewest** total links (tie-break: alphabetical screenline
+    name).  This preserves sparse screenlines that would otherwise lose
+    their only control point.
+
+    Returns ``(deduped_sl_query, log_lines)`` where *log_lines* is a
+    human-readable list of removals for logging.
+    """
+    from collections import defaultdict
+
+    link_to_sls: Dict[int, List[str]] = defaultdict(list)
+    for sl_name, link_tuples in sl_query.items():
+        for lid, _d in link_tuples:
+            link_to_sls[lid].append(sl_name)
+
+    collisions = {
+        lid: sls for lid, sls in link_to_sls.items() if len(sls) > 1
+    }
+    if not collisions:
+        return sl_query, []
+
+    sl_size = {name: len(links) for name, links in sl_query.items()}
+
+    keep_in: Dict[int, str] = {}
+    for lid, sls in collisions.items():
+        best = min(sls, key=lambda s: (sl_size[s], s))
+        keep_in[lid] = best
+
+    log_lines: List[str] = []
+    out: Dict[str, List[Tuple[int, int]]] = {}
+    for sl_name, link_tuples in sl_query.items():
+        filtered = []
+        for lid, d in link_tuples:
+            if lid in keep_in and keep_in[lid] != sl_name:
+                log_lines.append(
+                    f"  link {lid}: removed from '{sl_name}', "
+                    f"kept in '{keep_in[lid]}'"
+                )
+                continue
+            filtered.append((lid, d))
+        out[sl_name] = filtered
+
+    return out, log_lines
+
+
 def resolve_screenline_links(
     sl: ScreenlineDef,
     links_gdf: gpd.GeoDataFrame,

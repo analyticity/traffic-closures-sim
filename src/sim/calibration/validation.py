@@ -829,6 +829,57 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
             "No holdout split active. Verdict based on calibration data."
         )
 
+    # 4b) Period-based metrics (AM/IP/PM) from temporal profile
+    period_metrics: Dict[str, Any] = {}
+    try:
+        from sim.demand.temporal import load_profile, get_demand_period_shares
+
+        profile = load_profile(cfg)
+        period_shares = get_demand_period_shares(profile)
+
+        if vol_col and vol_col in links_gdf.columns:
+            logger.info("\n4b) Period-based synthetic validation (AM/IP/PM) ...")
+            for period in ("am", "ip", "pm"):
+                share = period_shares.get(period, 0.0)
+                if share <= 0:
+                    continue
+                period_mod = links_gdf[vol_col].fillna(0) * share
+                obs_values = links_gdf.get(obs_col)
+                if obs_values is None:
+                    continue
+                period_obs = obs_values.fillna(0) * share
+                mask = (period_obs > 0) & (period_mod >= 0)
+                if mask.sum() < 3:
+                    continue
+                p_stats = compute_stats(
+                    period_mod[mask].values,
+                    period_obs[mask].values,
+                )
+                period_metrics[period] = {
+                    "share": round(share, 4),
+                    **{k: round(v, 4) if isinstance(v, float) else v
+                       for k, v in p_stats.items()},
+                }
+                logger.info(
+                    "  %s (share=%.3f): R²=%.3f, %%RMSE=%.1f, bias=%.1f%%",
+                    period.upper(), share,
+                    p_stats.get("r2", 0), p_stats.get("pct_rmse", 0),
+                    p_stats.get("bias_pct", 0),
+                )
+            report["period_metrics"] = {
+                "note": (
+                    "Synthetic period volumes derived by applying temporal "
+                    "profile shares to daily model and observed totals. "
+                    "Not a true period-level assignment."
+                ),
+                "shares": {k: v for k, v in period_shares.items() if k != "daily"},
+                "periods": period_metrics,
+            }
+    except FileNotFoundError:
+        logger.info("  No temporal_profile.json found — skipping period metrics")
+    except Exception:
+        logger.debug("Period metrics failed", exc_info=True)
+
     # 5) Benchmark summary
     logger.info(f"\n5) Validation benchmarks (model_time_period={model_time_period}) ...")
     daily_conv = get_nested(cfg, ["calibration", "convergence", "daily"], {})

@@ -27,7 +27,6 @@ experiment_profiles:
     speed_floors:
       trunk: 70.0
       primary: 55.0
-    capacity_factors: {}
     time_penalties:
       trunk: 2.0
       trunk_link: 4.0
@@ -38,20 +37,3 @@ experiment_profiles:
       tertiary: 7.0
       tertiary_link: 6.0
       residential: 6.0
-
-  csd_speed_floors:
-    speed_caps:
-      trunk: 90.0
-      trunk_link: 70.0
-      motorway_link: 80.0
-      primary_link: 60.0
-      secondary_link: 50.0
-      tertiary_link: 40.0
-      residential: 50.0
-      service: 30.0
-    speed_floors:
-      motorway: 120.0
-      motorway_link: 60.0
-      primary: 55.0
-    capacity_factors: {}
-    time_penalties: {}

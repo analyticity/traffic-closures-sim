@@ -138,7 +138,7 @@ class TestAssignmentConvergenceCheck:
         with caplog.at_level(logging.WARNING):
             result = _check_assignment_convergence(tmp_path)
         assert result is None
-        assert "assignment_convergence.json" in caplog.text
+        assert "assignment convergence JSON" in caplog.text
 
     def test_converged_assignment(self, tmp_path):
         from sim.calibration.context import _check_assignment_convergence

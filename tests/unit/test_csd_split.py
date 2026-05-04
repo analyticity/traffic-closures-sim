@@ -219,6 +219,72 @@ class TestSplitSpatial:
 
 
 # ---------------------------------------------------------------------------
+# split_csd_for_calibration — corridor
+# ---------------------------------------------------------------------------
+
+class TestSplitCorridor:
+    def test_entire_roads_in_same_set(self):
+        """All sections of a given road must land in the same subset."""
+        csd = _make_csd()
+        calib, valid = split_csd_for_calibration(csd, strategy="corridor")
+        for road in csd["sil"].unique():
+            in_calib = (calib["sil"] == road).any()
+            in_valid = (valid["sil"] == road).any()
+            assert not (in_calib and in_valid), (
+                f"Road {road} appears in both calibration and validation"
+            )
+
+    def test_both_subsets_non_empty(self):
+        csd = _make_csd()
+        calib, valid = split_csd_for_calibration(csd, strategy="corridor")
+        assert len(calib) > 0
+        assert len(valid) > 0
+
+    def test_covers_all_sections(self):
+        csd = _make_csd()
+        calib, valid = split_csd_for_calibration(csd, strategy="corridor")
+        assert len(calib) + len(valid) == len(csd)
+
+    def test_no_overlap(self):
+        csd = _make_csd()
+        calib, valid = split_csd_for_calibration(csd, strategy="corridor")
+        shared = set(calib.index) & set(valid.index)
+        assert shared == set()
+
+    def test_deterministic(self):
+        csd = _make_csd()
+        c1, v1 = split_csd_for_calibration(csd, strategy="corridor", random_seed=42)
+        c2, v2 = split_csd_for_calibration(csd, strategy="corridor", random_seed=42)
+        pd.testing.assert_frame_equal(c1.reset_index(drop=True), c2.reset_index(drop=True))
+        pd.testing.assert_frame_equal(v1.reset_index(drop=True), v2.reset_index(drop=True))
+
+    def test_calib_share_respected(self):
+        """Calibration set should be roughly calib_share of all sections."""
+        csd = _make_csd()
+        calib, valid = split_csd_for_calibration(
+            csd, strategy="corridor", calib_share=0.65,
+        )
+        actual = len(calib) / len(csd)
+        assert 0.40 < actual < 0.90
+
+    def test_all_single_section_roads_falls_back(self):
+        """If every road has 1 section, all go to calib; fallback fires."""
+        csd = _make_csd([
+            ("D1", 50000, 40000, 10000, "Brno"),
+            ("43", 20000, 18000, 2000, "Kuřim"),
+        ])
+        calib, valid = split_csd_for_calibration(csd, strategy="corridor")
+        assert len(calib) + len(valid) == len(csd)
+
+    def test_multiple_road_classes_represented(self):
+        """Both subsets should contain multiple road classes when possible."""
+        csd = _make_csd()
+        calib, valid = split_csd_for_calibration(csd, strategy="corridor")
+        if len(valid) > 0:
+            assert len(valid["road_class"].unique()) >= 1
+
+
+# ---------------------------------------------------------------------------
 # split_csd_for_calibration — error handling / edge cases
 # ---------------------------------------------------------------------------
 

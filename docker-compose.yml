@@ -1,17 +1,14 @@
 services:
   brno:
     image: ghcr.io/adamkankovsky/simulation-brno:latest
-    ports:
-      - "8000:8000"
+    network_mode: host
 
   olomouc:
     image: ghcr.io/adamkankovsky/simulation-olomouc:latest
-    ports:
-      - "8001:8000"
+    network_mode: host
     profiles: [olomouc, all]
 
   most:
     image: ghcr.io/adamkankovsky/simulation-most:latest
-    ports:
-      - "8002:8000"
+    network_mode: host
     profiles: [most, all]

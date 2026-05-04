@@ -172,6 +172,48 @@ class TestComputeValidationBenchmarks:
         assert result["calibration_fit"]["r2_pass"] is None
         assert result["calibration_fit"]["overall_pass"] is False
 
+    def test_holdout_slope_propagated(self):
+        """Holdout slope from CSD summary must flow through to the verdict."""
+        calib_stats = self._good_stats()
+        holdout = {
+            "n": 12,
+            "r2": 0.85,
+            "slope": 0.72,
+            "pct_rmse": 30.0,
+            "bias_pct": 8.0,
+            "geh_lt5_pct": 0.0,
+            "daily_geh_lt_adj_pct": 0.0,
+        }
+        result = compute_validation_benchmarks(
+            calib_stats, {}, [],
+            model_time_period="daily",
+            holdout_stats=holdout,
+        )
+        assert result["verdict_source"] == "holdout"
+        assert result["daily_slope"] == pytest.approx(0.72, abs=0.01)
+        assert result["daily_slope_pass"] is False
+
+    def test_holdout_slope_pass(self):
+        """Holdout slope within range should pass."""
+        calib_stats = self._good_stats()
+        holdout = {
+            "n": 15,
+            "r2": 0.90,
+            "slope": 1.05,
+            "pct_rmse": 25.0,
+            "bias_pct": 5.0,
+            "geh_lt5_pct": 0.0,
+            "daily_geh_lt_adj_pct": 0.0,
+        }
+        result = compute_validation_benchmarks(
+            calib_stats, {}, [],
+            model_time_period="daily",
+            holdout_stats=holdout,
+        )
+        assert result["verdict_source"] == "holdout"
+        assert result["daily_slope"] == pytest.approx(1.05, abs=0.01)
+        assert result["daily_slope_pass"] is True
+
 
 # ---------------------------------------------------------------------------
 # _classify_csd_road (calibration version)

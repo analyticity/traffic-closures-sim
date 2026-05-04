@@ -37,7 +37,7 @@ screenlines:
     type: "radial"
     observed_aadt_cars: 22000
     observed_aadt_all: 25300
-    geometry_wkt: "LINESTRING(16.6185 49.1940, 16.6215 49.1880)"
+    geometry_wkt: "LINESTRING(16.6190 49.1920, 16.6210 49.1900)"
     filter:
       name: "Křenová"
     expected_links: 2
@@ -47,7 +47,7 @@ screenlines:
     type: "radial"
     observed_aadt_cars: 11000
     observed_aadt_all: 12650
-    geometry_wkt: "LINESTRING(16.5940 49.2080, 16.5970 49.2100)"
+    geometry_wkt: "LINESTRING(16.5930 49.2070, 16.5980 49.2110)"
     filter:
       name: "Kounicova"
     expected_links: 2

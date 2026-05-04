@@ -22,16 +22,62 @@ demand:
   segments:
     external_local:
       total_daily_trips: "auto"
+  distribution:
+    blend_alpha: 0.50
 
 calibration:
-  rgap_target: 0.005
+  rgap_target: 0.002
   count_source: "csd_split"
+  odme:
+    stages:
+      - name: "stabilize"
+        max_iterations: 12
+        global_residual_damping: 0.15
+        max_iter_change_pct: 10.0
+        gateway_calibration:
+          enabled: true
+          damping: 0.10
+      - name: "refine"
+        max_iterations: 28
+        global_residual_damping: 0.25
+        max_iter_change_pct: 15.0
+  csd_split:
+    strategy: "corridor"
   screenlines_path: "config/brno/screenlines.yaml"
   auto_screenlines:
     enabled: true
     gateway_screenlines: true
     csd_screenlines: true
     csd_min_aadt: 5000
+  journey_time_validation:
+    enabled: true
+    reference_routes:
+      # TODO: fill from_zone / to_zone with actual zone IDs from the Brno zone system
+      - name: "D1_west_to_centre"
+        from_zone: 0    # TODO: zone ID for D1 western gateway
+        to_zone: 0       # TODO: zone ID for Brno-střed
+        reference_time_min: 15
+        tolerance_pct: 20
+      - name: "D2_south_to_centre"
+        from_zone: 0    # TODO: zone ID for D2 southern gateway
+        to_zone: 0       # TODO: zone ID for Brno-střed
+        reference_time_min: 12
+        tolerance_pct: 20
+      - name: "I43_north_to_centre"
+        from_zone: 0    # TODO: zone ID for I/43 northern gateway
+        to_zone: 0       # TODO: zone ID for Brno-střed
+        reference_time_min: 18
+        tolerance_pct: 20
+      - name: "Zabovresky_to_Lisen"
+        from_zone: 0    # TODO: zone ID for Žabovřesky
+        to_zone: 0       # TODO: zone ID for Líšeň
+        reference_time_min: 20
+        tolerance_pct: 20
+      - name: "Bystrc_to_Slatina"
+        from_zone: 0    # TODO: zone ID for Bystrc
+        to_zone: 0       # TODO: zone ID for Slatina
+        reference_time_min: 25
+        tolerance_pct: 20
 
 datasets:
   enabled: true

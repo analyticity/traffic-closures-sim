@@ -306,6 +306,7 @@ def match_csd_to_links(
             csd_road_km = 0.0
         coverage = model_road_km / csd_road_km if csd_road_km > 0 else 1.0
         is_partial = coverage < 0.5
+        is_over_aggregated = coverage > 2.0
 
         matched_roads.append({
             "road": road,
@@ -320,6 +321,7 @@ def match_csd_to_links(
             "csd_road_km": round(csd_road_km, 1),
             "coverage_ratio": round(coverage, 2),
             "partial_coverage": is_partial,
+            "over_aggregated": is_over_aggregated,
         })
 
     if not matched_roads:
@@ -327,10 +329,14 @@ def match_csd_to_links(
 
     result = pd.DataFrame(matched_roads)
 
-    # Summary statistics across matched roads (exclude partial-coverage roads)
-    full_cov = ~result["partial_coverage"].astype(bool)
-    sub = result[full_cov]
-    n_partial = int((~full_cov).sum())
+    # Summary statistics: exclude partial-coverage and over-aggregated roads
+    reliable = (
+        ~result["partial_coverage"].astype(bool)
+        & ~result["over_aggregated"].astype(bool)
+    )
+    sub = result[reliable]
+    n_partial = int(result["partial_coverage"].astype(bool).sum())
+    n_over_agg = int(result["over_aggregated"].astype(bool).sum())
 
     obs = sub["csd_mean_sv"].values.astype(float)
     mod = sub["model_lw_mean"].values.astype(float)
@@ -346,10 +352,14 @@ def match_csd_to_links(
             bias = float((m_valid.sum() - o_valid.sum()) / o_valid.sum() * 100)
             pct_rmse = float(np.sqrt(((m_valid - o_valid) ** 2).mean()) / o_valid.mean() * 100)
             gehs = sub["geh"].values[mask]
+            ss_xy = float(((o_valid - o_valid.mean()) * (m_valid - m_valid.mean())).sum())
+            slope = ss_xy / ss_tot if ss_tot > 0 else 1.0
             result.attrs["summary"] = {
                 "n_roads": int(mask.sum()),
                 "n_partial_excluded": n_partial,
+                "n_over_aggregated_excluded": n_over_agg,
                 "r2": round(r2, 3),
+                "slope": round(slope, 4),
                 "bias_pct": round(bias, 1),
                 "pct_rmse": round(pct_rmse, 1),
                 "mean_geh": round(float(gehs.mean()), 1),
@@ -693,21 +703,30 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
         if not csd_match_df.empty:
             logger.info(f"  Per-road comparison: {len(csd_match_df)} roads matched")
             for _, r in csd_match_df.iterrows():
-                partial_tag = "  [PARTIAL]" if r.get("partial_coverage", False) else ""
+                cov_tag = ""
+                if r.get("partial_coverage", False):
+                    cov_tag = "  [PARTIAL]"
+                elif r.get("over_aggregated", False):
+                    cov_tag = "  [OVER-AGG]"
                 logger.info(
                     f"    {r['road']:>8s} ({r['road_class']:>10s})  "
                     f"csd_sv={r['csd_mean_sv']:>8.0f}  model={r['model_lw_mean']:>8.0f}  "
                     f"GEH={r['geh']:>5.1f}  sections={r['csd_sections']}  links={r['model_links']}"
-                    f"{partial_tag}"
+                    f"{cov_tag}"
                 )
             summary = getattr(csd_match_df, "attrs", {}).get("summary")
             if summary:
-                partial_note = ""
-                n_excl = summary.get("n_partial_excluded", 0)
-                if n_excl:
-                    partial_note = f" ({n_excl} partial-coverage road(s) excluded)"
-                logger.info(f"  Summary ({summary['n_roads']} roads{partial_note}): "
-                      f"R²={summary['r2']:.3f}  bias={summary['bias_pct']:.1f}%  "
+                excl_parts = []
+                n_partial = summary.get("n_partial_excluded", 0)
+                n_over = summary.get("n_over_aggregated_excluded", 0)
+                if n_partial:
+                    excl_parts.append(f"{n_partial} partial-coverage")
+                if n_over:
+                    excl_parts.append(f"{n_over} over-aggregated")
+                excl_note = f" ({', '.join(excl_parts)} excluded)" if excl_parts else ""
+                logger.info(f"  Summary ({summary['n_roads']} roads{excl_note}): "
+                      f"R²={summary['r2']:.3f}  slope={summary.get('slope', 'N/A')}  "
+                      f"bias={summary['bias_pct']:.1f}%  "
                       f"%RMSE={summary['pct_rmse']:.1f}  mean_GEH={summary['mean_geh']:.1f}")
                 report["csd_summary"] = summary
     except Exception:
@@ -800,7 +819,7 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
             holdout_stats = {
                 "n": csd_summary.get("n_roads", 0),
                 "r2": csd_summary.get("r2"),
-                "slope": 1.0,
+                "slope": csd_summary.get("slope", 1.0),
                 "pct_rmse": csd_summary.get("pct_rmse"),
                 "bias_pct": csd_summary.get("bias_pct"),
                 "geh_lt5_pct": 0.0,

@@ -268,9 +268,22 @@ def run_distribution(config_path: str | Path = "config/brno/sim.yaml", cfg: dict
     mat.close()
     logger.info("Updated matrix: %s", matrix_path)
 
+    skim_method = "unknown"
+    if imp_source == "skim":
+        for meta_name in ("skims_meta.json", "warm_assignment_convergence.json"):
+            meta_path = output_dir / meta_name
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    skim_method = meta.get("skim_method", "final")
+                    break
+                except Exception:
+                    pass
+
     report: Dict[str, Any] = {
         "impedance_mode": imp_mode,
         "impedance_source": imp_source,
+        "skim_method": skim_method,
         "segments_distributed": segments_to_distribute,
         "segments_preserved": [s for s in _ALL_DEMAND_SEGMENTS if s not in segments_to_distribute],
         "pa_config": {

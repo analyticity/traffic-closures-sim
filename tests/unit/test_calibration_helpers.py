@@ -516,6 +516,51 @@ class TestDedupCrossScreenlineLinks:
 
 
 # ---------------------------------------------------------------------------
+# match_counts_to_links — skip_exclusion
+# ---------------------------------------------------------------------------
+class TestSkipExclusion:
+    def test_exclusion_locked_with_skip(self):
+        """With skip_exclusion=True, no new _excluded flags should be set."""
+        import geopandas as gpd
+        from shapely.geometry import Point, LineString
+        from sim.calibration.matching import match_counts_to_links
+
+        counts = gpd.GeoDataFrame({
+            "objectid": [1, 2],
+            "observed_motor_total": [10000.0, 5000.0],
+            "observed_car": [8000.0, 4000.0],
+            "geometry": [Point(16.6, 49.2), Point(16.61, 49.21)],
+        }, crs="EPSG:4326")
+
+        links = gpd.GeoDataFrame({
+            "link_id": [100, 200],
+            "link_type": ["trunk", "secondary"],
+            "vol_ab": [0.0, 0.0],
+            "geometry": [
+                LineString([(16.5999, 49.1999), (16.6001, 49.2001)]),
+                LineString([(16.6099, 49.2099), (16.6101, 49.2101)]),
+            ],
+        }, crs="EPSG:4326")
+
+        result_with = match_counts_to_links(
+            counts, links, buffer_m=2000.0,
+            vol_col="vol_ab", match_quality_min=0.5,
+            skip_exclusion=False,
+        )
+        n_excluded_normal = int(result_with["_excluded"].sum()) if "_excluded" in result_with.columns else 0
+
+        result_skip = match_counts_to_links(
+            counts, links, buffer_m=2000.0,
+            vol_col="vol_ab", match_quality_min=0.5,
+            skip_exclusion=True,
+        )
+        n_excluded_skip = int(result_skip["_excluded"].sum()) if "_excluded" in result_skip.columns else 0
+
+        assert n_excluded_normal > 0, "Normal run should exclude zero-vol trunk posts"
+        assert n_excluded_skip == 0, "skip_exclusion=True should not set any _excluded flags"
+
+
+# ---------------------------------------------------------------------------
 # Dynamic screenline-gateway mapping
 # ---------------------------------------------------------------------------
 class TestBuildScreenlineGatewayMap:

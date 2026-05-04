@@ -589,6 +589,7 @@ class _CalibrationContext:
             aggregate_corridor=self.agg_corridor,
             vol_col=vol_col,
             match_quality_min=self.match_quality_min,
+            skip_exclusion=(iteration > 1),
         )
         if iteration == 1:
             if "_excluded" in matched.columns and "objectid" in matched.columns:

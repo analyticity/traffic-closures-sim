@@ -145,6 +145,33 @@ class TestComputeValidationBenchmarks:
         )
         assert result["daily_r2_pass"] is True
 
+    def test_null_r2_propagated(self):
+        """When r2/slope are None (n<2), benchmarks must propagate None, not 0.0."""
+        stats = self._good_stats()
+        stats["r2"] = None
+        stats["slope"] = None
+        result = compute_validation_benchmarks(
+            stats, {}, [], model_time_period="daily",
+        )
+        assert result["daily_r2"] is None
+        assert result["daily_r2_pass"] is None
+        assert result["daily_slope"] is None
+        assert result["daily_slope_pass"] is None
+        assert result["overall_pass"] is False
+
+    def test_null_r2_calibration_fallback(self):
+        """Null R² via calibration fallback (no holdout) still propagates None."""
+        stats = {"r2": None, "slope": None, "pct_rmse": 20.0,
+                 "bias_pct": 3.0, "geh_lt5_pct": 90.0,
+                 "daily_geh_lt_adj_pct": 90.0}
+        result = compute_validation_benchmarks(
+            stats, {}, [], model_time_period="daily",
+        )
+        assert result["verdict_source"] == "calibration"
+        assert result["calibration_fit"]["r2"] is None
+        assert result["calibration_fit"]["r2_pass"] is None
+        assert result["calibration_fit"]["overall_pass"] is False
+
 
 # ---------------------------------------------------------------------------
 # _classify_csd_road (calibration version)

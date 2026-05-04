@@ -374,8 +374,10 @@ def _compute_daily_metrics(
 ) -> Dict[str, Any]:
     """Evaluate daily pass/fail metrics for a set of count stats."""
     dt = daily_thresholds
-    r2 = float(count_stats.get("r2") or 0.0)
-    slope = float(count_stats.get("slope") or 0.0)
+    r2_raw = count_stats.get("r2")
+    slope_raw = count_stats.get("slope")
+    r2 = float(r2_raw) if r2_raw is not None else None
+    slope = float(slope_raw) if slope_raw is not None else None
     prmse = float(count_stats.get("pct_rmse") or 999.0)
     bias = abs(float(count_stats.get("bias_pct") or 999.0))
     daily_geh_adj = float(count_stats.get("daily_geh_lt_adj_pct") or 0.0)
@@ -386,16 +388,16 @@ def _compute_daily_metrics(
     bias_max = float(dt.get("bias_abs_max_pct", 15.0))
     sl_max = float(dt.get("screenline_max_pct_deviation", 15.0))
 
-    r2_pass = r2 >= r2_target
-    slope_pass = slope_range[0] <= slope <= slope_range[1]
+    r2_pass = (r2 >= r2_target) if r2 is not None else None
+    slope_pass = (slope_range[0] <= slope <= slope_range[1]) if slope is not None else None
     prmse_pass = prmse <= prmse_max
     bias_pass = bias <= bias_max
     sl_pass = sl_max_error <= sl_max
 
     return {
-        "r2": round(r2, 4),
+        "r2": round(r2, 4) if r2 is not None else None,
         "r2_pass": r2_pass,
-        "slope": round(slope, 4),
+        "slope": round(slope, 4) if slope is not None else None,
         "slope_pass": slope_pass,
         "pct_rmse": round(prmse, 1),
         "pct_rmse_pass": prmse_pass,
@@ -403,7 +405,7 @@ def _compute_daily_metrics(
         "bias_pass": bias_pass,
         "screenline_pass": sl_pass,
         "daily_geh_lt_adj_pct": round(daily_geh_adj, 1),
-        "overall_pass": r2_pass and slope_pass and prmse_pass and bias_pass and sl_pass,
+        "overall_pass": (r2_pass is True) and (slope_pass is True) and prmse_pass and bias_pass and sl_pass,
     }
 
 

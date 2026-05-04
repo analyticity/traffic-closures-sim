@@ -297,6 +297,7 @@ def match_counts_to_links(
     aggregate_corridor: bool = True,
     vol_col: Optional[str] = None,
     match_quality_min: float = 0.50,
+    skip_exclusion: bool = False,
 ) -> gpd.GeoDataFrame:
     """Spatial-join observed count points/lines to nearest network links.
 
@@ -474,13 +475,14 @@ def match_counts_to_links(
 
     joined["_matched"] = joined["link_id"].notna() if "link_id" in joined.columns else False
 
-    joined = _apply_exclusion_scoring(joined, vol_col, match_quality_min)
+    if not skip_exclusion:
+        joined = _apply_exclusion_scoring(joined, vol_col, match_quality_min)
 
     if aggregate_corridor:
         joined = _aggregate_corridor_volumes(joined, links_sel, buffer_m)
 
     corr_col = "_corridor_volume" if "_corridor_volume" in joined.columns else None
-    if corr_col:
+    if not skip_exclusion and corr_col:
         joined = _apply_exclusion_scoring(joined, corr_col, 0.0, phase="post_corridor")
 
     for col in ("_count_bearing", "_link_bearing"):

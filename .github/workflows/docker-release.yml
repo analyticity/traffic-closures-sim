@@ -119,3 +119,120 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.city }}
           cache-to: type=gha,mode=max,scope=${{ matrix.city }}
+
+      - name: Extract pipeline reports from image
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          IMG="${{ env.IMAGE_PREFIX }}-${{ matrix.city }}:latest"
+          OUT="reports-${{ matrix.city }}"
+          mkdir -p "$OUT"
+
+          CID=$(docker create "$IMG")
+          DEMAND="outputs/${{ matrix.city }}/baseline/demand"
+          NETWORK="outputs/${{ matrix.city }}/baseline/network"
+
+          for f in calibration_report.json validation_report.json \
+                   assignment_convergence.json od_summary.json \
+                   distribution_report.json temporal_profile.json \
+                   supply_audit.json matching_diagnostics.csv; do
+            docker cp "$CID:/app/$DEMAND/$f" "$OUT/$f" 2>/dev/null || true
+          done
+          docker cp "$CID:/app/$NETWORK/network_summary.json" "$OUT/network_summary.json" 2>/dev/null || true
+          docker rm "$CID"
+
+          echo "Extracted reports:"
+          ls -lh "$OUT"/
+
+      - name: Upload pipeline reports
+        if: steps.guard.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ matrix.city }}
+          path: reports-${{ matrix.city }}/
+          retention-days: 90
+
+      - name: Pipeline summary
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          OUT="reports-${{ matrix.city }}"
+          CITY="${{ matrix.city }}"
+
+          python3 - "$OUT" "$CITY" <<'PYEOF'
+          import json, sys, os
+          out_dir, city = sys.argv[1], sys.argv[2]
+
+          def load(name):
+              p = os.path.join(out_dir, name)
+              if not os.path.exists(p):
+                  return None
+              with open(p) as f:
+                  return json.load(f)
+
+          def fmt(v, suffix="", prec=2):
+              if v is None:
+                  return "n/a"
+              if isinstance(v, bool):
+                  return "yes" if v else "no"
+              if isinstance(v, float):
+                  return f"{v:.{prec}f}{suffix}"
+              return str(v)
+
+          calib = load("calibration_report.json")
+          valid = load("validation_report.json")
+          assign = load("assignment_convergence.json")
+
+          lines = [f"## {city.title()} — Pipeline Results\n"]
+
+          if calib:
+              final = calib.get("final") or {}
+              lines.append("### Calibration")
+              lines.append(f"| Metric | Value |")
+              lines.append(f"|--------|-------|")
+              lines.append(f"| Method | {calib.get('method', 'n/a')} |")
+              lines.append(f"| Iterations | {calib.get('iterations', 'n/a')} |")
+              lines.append(f"| Converged | {fmt(calib.get('converged'))} |")
+              lines.append(f"| R² | {fmt(final.get('r2'))} |")
+              lines.append(f"| Slope | {fmt(final.get('slope'))} |")
+              lines.append(f"| %RMSE | {fmt(final.get('pct_rmse'), '%', 1)} |")
+              lines.append(f"| Bias | {fmt(final.get('bias_pct'), '%', 1)} |")
+              lines.append(f"| GEH mean | {fmt(final.get('geh_mean'))} |")
+              lines.append(f"| GEH<5 % | {fmt(final.get('geh_lt5_pct'), '%', 1)} |")
+              sl = final.get("max_screenline_pct_dev")
+              lines.append(f"| Max screenline dev | {fmt(sl, '%', 1)} |")
+              lines.append("")
+
+          if valid:
+              bm = valid.get("benchmarks") or {}
+              qg = valid.get("quality_gates") or {}
+              icon = ":white_check_mark:" if bm.get("overall_pass") else ":x:"
+              lines.append(f"### Validation {icon}")
+              lines.append(f"| Metric | Value | Pass |")
+              lines.append(f"|--------|-------|------|")
+              lines.append(f"| R² | {fmt(bm.get('daily_r2'))} | {fmt(bm.get('daily_r2_pass'))} |")
+              lines.append(f"| Slope | {fmt(bm.get('daily_slope'))} | {fmt(bm.get('daily_slope_pass'))} |")
+              lines.append(f"| %RMSE | {fmt(bm.get('daily_pct_rmse'), '%', 1)} | {fmt(bm.get('daily_pct_rmse_pass'))} |")
+              lines.append(f"| Bias | {fmt(bm.get('daily_bias_abs_pct'), '%', 1)} | {fmt(bm.get('daily_bias_pass'))} |")
+              lines.append(f"| Screenline max error | {fmt(bm.get('screenline_max_error_pct'), '%', 1)} | {fmt(bm.get('daily_screenline_pass'))} |")
+              lines.append(f"| **Overall** | | **{fmt(bm.get('overall_pass'))}** |")
+              if qg.get("hard_reject"):
+                  lines.append(f"\n> :warning: **Hard reject** triggered")
+              if qg.get("warnings"):
+                  for w in qg["warnings"]:
+                      lines.append(f"> :warning: {w}")
+              lines.append("")
+
+          if assign:
+              lines.append("### Assignment")
+              lines.append(f"| Metric | Value |")
+              lines.append(f"|--------|-------|")
+              lines.append(f"| Algorithm | {assign.get('algorithm', 'n/a')} |")
+              lines.append(f"| Converged | {fmt(assign.get('converged'))} |")
+              lines.append(f"| Final RGAP | {fmt(assign.get('final_rgap'))} |")
+              lines.append(f"| Iterations | {assign.get('n_iterations', 'n/a')} |")
+              lines.append("")
+
+          summary = "\n".join(lines)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(summary)
+          print(summary)
+          PYEOF

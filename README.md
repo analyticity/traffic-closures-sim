@@ -131,6 +131,28 @@ If `--config` is not provided, the default configuration file is:
 config/brno/sim.yaml
 ```
 
+### Prerequisite validation
+
+Before executing a step, the runner checks that its required input files exist. If a prerequisite is missing, execution fails immediately with a clear error naming the missing file and which step to run first.
+
+Steps also perform **staleness checks**: if a downstream output (e.g. `assignment_results.parquet`) is older than a key input it depends on (e.g. the OD matrix), a warning is logged suggesting a re-run. Staleness warnings are non-fatal because file timestamps can be unreliable.
+
+| Step | Required inputs |
+|------|----------------|
+| `normalize-network` | project database |
+| `build-zones` | project database |
+| `build-demand` | zones + centroid mapping (+ supernetwork if external processing enabled) |
+| `assign-warm-skims` | project database, OD matrix |
+| `distribute` | project database, OD matrix |
+| `assign` | project database, OD matrix |
+| `audit-supply` | project database |
+| `calibrate` / `calibrate-odme` | project database, OD matrix |
+| `tune-supply` | project database, OD matrix |
+| `validate` | OD matrix, assignment results |
+| `strip-closures` | project database |
+
+Steps without infrastructure prerequisites (`init-city`, `clean`, `check`, `build-network`, `fetch-data`, `serve`) are exempt from preflight checks.
+
 ---
 
 ## Multi-City Configuration
@@ -270,8 +292,9 @@ python run.py --config $CFG build-demand
 python run.py --config $CFG assign-warm-skims
 python run.py --config $CFG distribute
 python run.py --config $CFG assign
-python run.py --config $CFG calibrate                 # Spiess ODME by default
-# python run.py --config $CFG tune-supply             # optional; disabled by default
+python run.py --config $CFG audit-supply               # prerequisite for ODME calibration
+python run.py --config $CFG calibrate                  # Spiess ODME by default
+# python run.py --config $CFG tune-supply              # optional; disabled by default
 python run.py --config $CFG validate
 python run.py --config $CFG learn-profile
 python run.py --config $CFG strip-closures            # remove closures for clean baseline
@@ -449,27 +472,51 @@ The goal is to transform the initial demand into a network-ready OD matrix consi
 
 **`demand.distribution.impedance`**
 
-* **`auto`** (default): load `skims.aem` from `demand.output_dir` if it exists; otherwise use Euclidean distance between zone centroids.
-* **`skim`**: require `skims.aem`; fail with a clear error if it is missing (run `assign-warm-skims` or `assign` with `calibration.save_skims: true` first).
+* **`skim`** (default): require `skims.aem`; fail with a clear error if it is missing. Run `assign-warm-skims` or `assign` with `calibration.save_skims: true` first. Skim convergence is verified via `skims_meta.json`.
+* **`euclidean`**: use Euclidean distance between zone centroids. Requires explicit opt-in via `demand.distribution.allow_euclidean_fallback: true`. Only suitable for prototyping — destroys spatial friction in the gravity model.
+* **`auto`** (deprecated): treated as `skim` with a deprecation warning. Will be removed in a future version.
 
 ---
 
 ### 11. `assign`
 
-Runs traffic assignment.
+Runs user-equilibrium traffic assignment.
 
-This step loads the OD matrix onto the network using a selected assignment procedure, such as:
+This step loads the OD matrix onto the network using AequilibraE's equilibrium assignment. Only UE algorithms are permitted by default:
 
-* shortest-path assignment
-* equilibrium assignment
+* **`bfw`** (biconjugate Frank-Wolfe, recommended)
+* **`cfw`** (conjugate Frank-Wolfe)
+* **`msa`** (method of successive averages)
+
+AoN (all-or-nothing) is blocked by default because it ignores congestion feedback and produces structurally incorrect flows. Set `calibration.allow_aon: true` for diagnostic use only.
+
+The assignment writes `assignment_convergence.json` with metadata (algorithm, final rgap, convergence status) consumed by downstream steps. When `calibration.strict_convergence: true` (default), the assignment raises an error if the relative gap target is not reached.
+
+**Centroid flow blocking.** By default (`assignment.blocked_centroid_flows: true`), traffic cannot route through zone centroids. This is critical for correct path interpretation in real models. Setting it to `false` triggers a warning — this is only appropriate for toy networks like Sioux Falls.
+
+**Per-link-type VDF parameters.** BPR alpha/beta parameters are differentiated by road class when `assignment.bpr.per_link: true` (default). Each link type (motorway, trunk, primary, ...) can have its own alpha/beta in `assignment.bpr.by_link_type`. If `per_link` is true but `link_type` is missing from the graph, the solver falls back to `alpha_default`/`beta_default` with a warning.
 
 The result is an estimate of flows on individual network links.
 
 ---
 
-### 12. `calibrate` / `calibrate-odme`
+### 12. `audit-supply`
+
+Runs basic supply-side diagnostics on the network and writes `supply_audit.json`.
+
+This step checks speeds, capacities, and VDF parameters per road class against expected ranges and flags anomalies. It is a **prerequisite for ODME calibration** — the calibration step will refuse to start without a supply audit or tuning report unless `calibration.require_supply_audit: false`.
+
+The principle: ODME must not compensate for uncalibrated supply-side errors. Always verify that network parameters are reasonable before running demand-side calibration.
+
+---
+
+### 13. `calibrate` / `calibrate-odme`
 
 Performs iterative bi-level OD matrix calibration against observed link counts.
+
+**Prerequisites:** Before calibration, the pipeline checks that:
+* A supply audit exists (`supply_audit.json` or `supply_tuning_report.json`). Run `audit-supply` or `tune-supply` first. Set `calibration.require_supply_audit: false` to skip.
+* A converged base-year UE assignment exists (`assignment_convergence.json`). A warning is logged if missing or non-converged.
 
 The default method is **Spiess gradient ODME** — a bi-level loop where the lower level runs AequilibraE equilibrium assignment and the upper level adjusts the OD matrix using select-link proportions from screenlines:
 
@@ -489,6 +536,8 @@ Both `calibrate` and `calibrate-odme` run ODME by default. To select a different
 | `multistage` | `run_multistage_calibration` | 4-stage pipeline: gravity re-fit, gateway pre-calib, tight-bounds ODME, screenline fine-tuning |
 | `fsm` | `run_calibration` | Legacy iterative method (1 inner step per iteration, no explicit Z objective) |
 
+**Calibration report** includes seed-deviation analysis (how much each OD cell changed vs. seed) and a calibration section hash for the validation holdout guard.
+
 **Configuration (excerpt)**
 
 * `calibration.aggregate_corridor` — when `true`, volumes on parallel divided-highway links are summed for comparison to a single count station (recommended for motorways).
@@ -500,23 +549,27 @@ Both `calibrate` and `calibrate-odme` run ODME by default. To select a different
 
 ---
 
-### 13. `tune-supply`
+### 14. `tune-supply`
 
 Runs outer-loop optimization of supply-side parameters.
 
-While `calibrate` focuses on repeated internal adjustment, this step searches for better supply-related parameters at a higher level. Enable with `calibration.supply_tuning.enabled`. The composite objective weights GEH, screenline fit, and journey-time checks (fixed weights in code).
+While `calibrate` focuses on repeated internal adjustment, this step searches for better supply-related parameters at a higher level. Enable with `calibration.supply_tuning.enabled`. The composite objective weights GEH, screenline fit, and journey-time checks (fixed weights in code). Writes `supply_tuning_report.json`, which satisfies the supply audit prerequisite for ODME.
 
 ---
 
-### 14. `validate`
+### 15. `validate`
 
 Runs independent validation using CSD 2025.
 
-Unlike calibration, this phase tests the model on separate validation data to assess generalization and robustness. It helps confirm whether the calibrated model behaves reasonably outside the calibration target.
+Unlike calibration, this phase tests the model on **holdout** validation data to assess generalization. When `calibration.count_source: csd_split` (default), CSD sections are split into calibration and validation subsets. The overall PASS/FAIL verdict is based on the holdout subset metrics, not the calibration subset. A summary table comparing calibration fit vs. holdout performance is logged.
+
+**Holdout guard:** `calibration.require_holdout: true` (default) warns if no holdout split is active, preventing false confidence from testing on training data.
+
+**Calibration hash guard:** The validation step checks that holdout sections do not overlap with calibration sections by comparing the section hash from the calibration report.
 
 ---
 
-### 15. `learn-profile`
+### 16. `learn-profile`
 
 Learns temporal day-type factors from CSD 2025.
 
@@ -526,7 +579,7 @@ It is especially useful when moving from a static baseline toward more realistic
 
 ---
 
-### 16. `strip-closures`
+### 17. `strip-closures`
 
 Restores the network to its pre-closure state after validation.
 
@@ -534,7 +587,7 @@ During `normalize-network`, baseline closures (from the Police ČR feed or manua
 
 ---
 
-### 17. `serve`
+### 18. `serve`
 
 Starts a read-only REST API server.
 

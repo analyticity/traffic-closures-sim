@@ -186,7 +186,7 @@ def _run_scenario_worker(
         project = Project()
         project.open(str(project_dir))
         try:
-            graph = build_graph(project, mat, bpr_parameters=bpr_params)
+            graph = build_graph(project, mat, bpr_parameters=bpr_params, assignment_cfg=assign_cfg)
 
             apply_scenario_to_graph(graph, job.scenario_links)
 
@@ -200,7 +200,7 @@ def _run_scenario_worker(
             gc_mult = float(gc_cfg.get("fixed_cost_multiplier", 0.0)) if gc_enabled else 0.0
             gc_vot = float(gc_cfg.get("vot", 1.0))
 
-            df, _skims, _sl = execute_assignment(
+            df, _skims, _sl, _conv = execute_assignment(
                 project,
                 mat,
                 algorithm=algorithm,

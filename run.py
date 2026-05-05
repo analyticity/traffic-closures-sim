@@ -37,12 +37,18 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 import sys
 import argparse
 
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 sys.dont_write_bytecode = True
+
+# Ensure NumPy/BLAS use all available threads unless explicitly restricted
+for _env_key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    if _env_key not in os.environ:
+        os.environ[_env_key] = str(os.cpu_count() or 4)
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
@@ -339,6 +345,8 @@ def main() -> None:
         _pre_cfg = load_config(cfg)
         _check_step_prerequisites(_pre_cfg, step)
 
+    _t0 = time.perf_counter()
+
     if step == "init-city":
         from scripts.generate_city_config import main as gen_main
         gen_main()
@@ -362,7 +370,13 @@ def main() -> None:
         load_or_build_od_matrix(cfg, cfg=_cfg)
     elif step == "assign-warm-skims":
         _cfg = load_config(cfg)
-        run_warm_skim_assignment(cfg, cfg=_cfg)
+        _skim_out = Path(_cfg.get("demand", {}).get("output_dir", "outputs/baseline/demand")) / "skims.aem"
+        if _skim_out.exists() and not os.environ.get("SIM_FORCE_SKIMS"):
+            logging.getLogger(__name__).info(
+                "Skims already exist at %s (set SIM_FORCE_SKIMS=1 to regenerate)", _skim_out
+            )
+        else:
+            run_warm_skim_assignment(cfg, cfg=_cfg)
     elif step == "distribute":
         from sim.distribution import run_distribution
         run_distribution(cfg)
@@ -381,6 +395,8 @@ def main() -> None:
         from sim.calibration.supply_audit import run_supply_audit
         run_supply_audit(cfg)
     elif step in ("calibrate", "calibrate-odme"):
+        from sim.calibration.seed_diagnostics import run_seed_diagnostics
+        run_seed_diagnostics(cfg)
         method = (_pre_cfg.get("calibration") or {}).get("method", "odme")
         if step == "calibrate-odme" or method == "odme":
             run_odme_calibration(cfg)
@@ -408,6 +424,10 @@ def main() -> None:
     elif step == "serve":
         from sim.api import start_server
         start_server(cfg)
+
+    elapsed = time.perf_counter() - _t0
+    logger = logging.getLogger(__name__)
+    logger.info("Step '%s' completed in %.1f s (%.1f min)", step, elapsed, elapsed / 60)
 
 
 if __name__ == "__main__":

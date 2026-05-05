@@ -7,7 +7,8 @@ the opposite direction.
 from __future__ import annotations
 
 import logging
-from typing import Dict
+from pathlib import Path
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -76,6 +77,68 @@ def _threshold(thresholds: dict, key: str, default: float) -> float:
 
 def _lt_mask(links: pd.DataFrame, link_type: str) -> pd.Series:
     return links["link_type"].astype(str).str.fullmatch(link_type, case=False, na=False)
+
+
+def _apply_csd_capacity_hints(
+    links: pd.DataFrame,
+    csd_path: Optional[Path],
+    peak_hour_factor: float = 0.10,
+) -> int:
+    """Refine capacity for links matchable to CSD data via road reference.
+
+    Uses observed AADT from CSD to set a minimum effective capacity:
+    capacity >= AADT * peak_hour_factor / lanes.  This prevents
+    under-capacity on roads where CSD shows high traffic.
+
+    Returns the number of links updated.
+    """
+    if csd_path is None or not csd_path.exists():
+        return 0
+
+    try:
+        csd = pd.read_parquet(csd_path)
+    except Exception:
+        logger.debug("Cannot read CSD parquet at %s", csd_path)
+        return 0
+
+    if "sil" not in csd.columns or "sv" not in csd.columns:
+        return 0
+    if "osm_ref_norm" not in links.columns:
+        return 0
+
+    csd["sil_norm"] = csd["sil"].astype(str).str.strip().str.upper().str.replace("/", "", regex=False)
+    csd["sv"] = pd.to_numeric(csd["sv"], errors="coerce").fillna(0)
+    csd_agg = csd.groupby("sil_norm")["sv"].mean().reset_index()
+    csd_agg.columns = ["road_ref", "aadt"]
+    csd_agg = csd_agg[csd_agg["aadt"] > 0]
+
+    if csd_agg.empty:
+        return 0
+
+    links["_ref_norm"] = links["osm_ref_norm"].astype(str).str.strip().str.upper().str.replace("/", "", regex=False)
+    merged = links[["_ref_norm"]].merge(csd_agg, left_on="_ref_norm", right_on="road_ref", how="left")
+    has_aadt = merged["aadt"].notna()
+
+    n_updated = 0
+    if has_aadt.any():
+        min_cap = merged.loc[has_aadt, "aadt"] * peak_hour_factor
+        for suffix, lanes_col in [("ab", "lanes_ab"), ("ba", "lanes_ba")]:
+            cap_col = f"capacity_{suffix}"
+            per_lane_min = min_cap / links.loc[has_aadt.values, lanes_col].clip(lower=1)
+            current = links.loc[has_aadt.values, cap_col]
+            upgrade_mask = has_aadt.values & (current < per_lane_min.values * links.loc[has_aadt.values, lanes_col].values)
+            if upgrade_mask.any():
+                new_cap = per_lane_min.values * links.loc[has_aadt.values, lanes_col].values
+                links.loc[upgrade_mask, cap_col] = np.maximum(
+                    links.loc[upgrade_mask, cap_col],
+                    new_cap[upgrade_mask[has_aadt.values]],
+                )
+                n_updated += int(upgrade_mask.sum())
+
+    links.drop(columns=["_ref_norm"], inplace=True, errors="ignore")
+    if n_updated > 0:
+        logger.info("CSD capacity hints: upgraded %d link-directions", n_updated)
+    return n_updated
 
 
 def _apply_speed_floors(links: pd.DataFrame, speed_floors: dict) -> None:
@@ -165,10 +228,13 @@ def normalize_network_attributes(
     project: Project,
     network_cfg: dict,
     experiment_profile: str = "baseline",
+    csd_path: Optional[Path] = None,
 ) -> pd.DataFrame:
     """Normalize/compute link attributes, preserving AB/BA directional asymmetry.
 
     Writes back per-direction values (speed_ab, speed_ba, ...) to the SQLite DB.
+    If *csd_path* is provided, CSD AADT data is used to set minimum capacities
+    on matched roads.
     """
     defaults, thresholds = _normalization_defaults(network_cfg)
     default_speeds = defaults["speed_by_link_type"]
@@ -350,6 +416,10 @@ def normalize_network_attributes(
             if remaining.any():
                 links.loc[remaining, cap_col] = generic_cpl * links.loc[remaining, lanes_col]
                 links.loc[remaining, est_col] = 1
+
+    # --- CSD capacity hints (before experiment profile so caps/factors apply on top) ---
+    if csd_path is not None:
+        _apply_csd_capacity_hints(links, csd_path)
 
     links = _apply_experiment_profile(links, profile, thresholds)
 

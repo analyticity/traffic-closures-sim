@@ -45,11 +45,21 @@ def normalize_and_export_network(
     experiment_profile = network_cfg.get("experiment_profile", "baseline")
     project_dir = Path(cfg["project_path"])
 
+    # Resolve CSD path for capacity hints
+    datasets_cfg = cfg.get("datasets") or {}
+    csd_path = None
+    if datasets_cfg.get("enabled", False):
+        csd_src = (datasets_cfg.get("sources") or {}).get("validation_csd2025_v2") or {}
+        csd_file = csd_src.get("path", "data/sources/rsd/csd2025/v2_csd2025.parquet")
+        csd_candidate = Path(csd_file)
+        if csd_candidate.exists():
+            csd_path = csd_candidate
+
     project = Project()
     project.open(str(project_dir))
 
     try:
-        links = _normalize(project, network_cfg, experiment_profile)
+        links = _normalize(project, network_cfg, experiment_profile, csd_path=csd_path)
         links = _repair_connectivity(project, links, network_cfg)
         connectivity_info = check_connectivity(project)
 
@@ -72,9 +82,12 @@ def _normalize(
     project: Project,
     network_cfg: dict,
     experiment_profile: str,
+    csd_path=None,
 ) -> pd.DataFrame:
     logger.info("Normalize attributes")
-    links = normalize_network_attributes(project, network_cfg, experiment_profile=experiment_profile)
+    links = normalize_network_attributes(
+        project, network_cfg, experiment_profile=experiment_profile, csd_path=csd_path,
+    )
     logger.info("Normalized %d links", len(links))
     return links
 

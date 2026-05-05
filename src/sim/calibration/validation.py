@@ -536,6 +536,59 @@ def compute_validation_benchmarks(
     return result
 
 
+def _save_validation_scatter(report: Dict[str, Any], output_dir: Path) -> None:
+    """Generate observed-vs-modeled scatter plot PNG if matplotlib available."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.debug("matplotlib not available, skipping scatter plot")
+        return
+
+    counts = report.get("independent_csd", {}).get("per_road_stats", [])
+    if not counts:
+        counts = report.get("primary_validation", {}).get("per_road_stats", [])
+    if not counts:
+        return
+
+    obs_vals = []
+    mod_vals = []
+    for entry in counts:
+        obs = entry.get("observed") or entry.get("obs")
+        mod = entry.get("modeled") or entry.get("mod")
+        if obs is not None and mod is not None and obs > 0:
+            obs_vals.append(float(obs))
+            mod_vals.append(float(mod))
+
+    if len(obs_vals) < 3:
+        return
+
+    obs_arr = np.array(obs_vals)
+    mod_arr = np.array(mod_vals)
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.scatter(obs_arr, mod_arr, alpha=0.6, edgecolors="k", linewidths=0.3)
+    max_val = max(obs_arr.max(), mod_arr.max()) * 1.1
+    ax.plot([0, max_val], [0, max_val], "r--", lw=1, label="y = x")
+    ax.set_xlabel("Observed (veh/day)")
+    ax.set_ylabel("Modeled (veh/day)")
+    ax.set_title("Validation: Observed vs Modeled Volumes")
+    ax.set_xlim(0, max_val)
+    ax.set_ylim(0, max_val)
+    ax.legend()
+    ax.set_aspect("equal")
+
+    r2 = report.get("independent_csd", {}).get("r2") or report.get("primary_validation", {}).get("r2")
+    if r2 is not None:
+        ax.text(0.05, 0.92, f"R² = {r2:.3f}", transform=ax.transAxes, fontsize=11)
+
+    scatter_path = output_dir / "validation_scatter.png"
+    fig.savefig(str(scatter_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Validation scatter plot: %s", scatter_path)
+
+
 def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> None:
     """Comprehensive independent validation against CSD + screenlines + journey times."""
     from sim.network.closures import swap_db_closures
@@ -546,8 +599,15 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
     calib_cfg = cfg.get("calibration") or {}
     output_dir = Path(demand_cfg.get("output_dir", "outputs/baseline/demand"))
     _ensure_dir(output_dir)
-    buffer_m = float(get_nested(cfg, ["calibration", "match_buffer_m"], 50.0))
-    mq_min = float(calib_cfg.get("match_quality_min", 0.50))
+    validation_cfg = calib_cfg.get("validation") or {}
+    buffer_m = float(validation_cfg.get(
+        "match_buffer_m",
+        get_nested(cfg, ["calibration", "match_buffer_m"], 50.0),
+    ))
+    mq_min = float(validation_cfg.get(
+        "match_quality_min",
+        calib_cfg.get("match_quality_min", 0.50),
+    ))
 
     # Swap closures to validation period (e.g. 2025)
     bc_cfg = cfg.get("baseline_closures") or {}
@@ -993,6 +1053,8 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
     report_path = output_dir / "validation_report.json"
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     logger.info(f"\nValidation report: {report_path}")
+
+    _save_validation_scatter(report, output_dir)
 
     # Strip closures and run a clean final assignment
     if bc_cfg.get("enabled", False) and valid_period:

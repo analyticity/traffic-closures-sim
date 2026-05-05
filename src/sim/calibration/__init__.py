@@ -80,6 +80,11 @@ from sim.calibration.context import (  # noqa: F401
     _odme_objective,
 )
 
+# --- Seed diagnostics ---
+from sim.calibration.seed_diagnostics import (  # noqa: F401
+    run_seed_diagnostics,
+)
+
 # --- Screenlines ---
 from sim.calibration.screenlines import (  # noqa: F401
     ScreenlineDef,

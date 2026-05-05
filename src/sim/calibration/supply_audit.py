@@ -24,11 +24,11 @@ _EXPECTED_SPEED_RANGES: Dict[str, tuple] = {
     "motorway_link": (40, 100),
     "trunk": (60, 110),
     "trunk_link": (30, 90),
-    "primary": (40, 90),
+    "primary": (50, 110),
     "primary_link": (25, 70),
-    "secondary": (30, 80),
+    "secondary": (40, 90),
     "secondary_link": (20, 60),
-    "tertiary": (20, 60),
+    "tertiary": (30, 70),
     "tertiary_link": (15, 50),
     "residential": (10, 50),
     "living_street": (5, 30),
@@ -190,6 +190,9 @@ def run_supply_audit(config_path: str | Path = "config/brno/sim.yaml") -> Dict[s
     verdict = "PASS" if all_ok else "PASS_WITH_WARNINGS"
     logger.info("  Supply audit verdict: %s", verdict)
 
+    # V/C ratio diagnostics (if assignment results exist)
+    vc_diagnostics = _compute_vc_diagnostics(output_dir, db_path, assign_cfg)
+
     report = {
         "verdict": verdict,
         "all_ok": all_ok,
@@ -197,6 +200,7 @@ def run_supply_audit(config_path: str | Path = "config/brno/sim.yaml") -> Dict[s
         "diagnostics": diagnostics,
         "estimated_coverage": estimated_coverage,
         "bpr": bpr_audit,
+        "vc_diagnostics": vc_diagnostics,
     }
 
     report_path = output_dir / "supply_audit.json"
@@ -205,6 +209,104 @@ def run_supply_audit(config_path: str | Path = "config/brno/sim.yaml") -> Dict[s
     )
     logger.info("  Supply audit report: %s", report_path)
     return report
+
+
+def _compute_vc_diagnostics(
+    output_dir: Path,
+    db_path: Path,
+    assign_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compute V/C ratio distribution from assignment results if available."""
+    results_path = output_dir / "assignment_results.parquet"
+    if not results_path.exists():
+        return {"available": False, "reason": "no_assignment_results"}
+
+    try:
+        import pandas as pd
+        vol_df = pd.read_parquet(str(results_path))
+    except Exception:
+        return {"available": False, "reason": "cannot_read_results"}
+
+    vol_col = None
+    for candidate in ("PCE_tot", "tot_flow_ab", "matrix_ab", "PCE_tot_ab", "volume_ab",
+                      "wd_daily_local_tot", "Preload_tot"):
+        if candidate in vol_df.columns:
+            vol_col = candidate
+            break
+    if vol_col is None:
+        return {"available": False, "reason": "no_volume_column"}
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cap_rows = conn.execute(
+            "SELECT link_id, link_type, capacity_ab FROM links "
+            "WHERE link_type != 'centroid_connector'"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    cap_df = pd.DataFrame(cap_rows, columns=["link_id", "link_type", "capacity_ab"])
+    cap_df["link_id"] = cap_df["link_id"].astype(int)
+    vol_df["link_id"] = vol_df["link_id"].astype(int) if "link_id" in vol_df.columns else vol_df.index
+
+    merged = vol_df.merge(cap_df, on="link_id", how="inner")
+    merged["volume"] = pd.to_numeric(merged[vol_col], errors="coerce").fillna(0)
+    merged["capacity"] = pd.to_numeric(merged["capacity_ab"], errors="coerce").fillna(1)
+
+    bpr_cfg = assign_cfg.get("bpr") or {}
+    dcf_raw = bpr_cfg.get("daily_capacity_factor", {})
+    dcf_default = float(dcf_raw) if isinstance(dcf_raw, (int, float)) else float(
+        dcf_raw.get("default", 9.0) if isinstance(dcf_raw, dict) else 9.0
+    )
+    dcf_by_lt = dcf_raw.get("by_link_type", {}) if isinstance(dcf_raw, dict) else {}
+
+    def _get_dcf(lt: str) -> float:
+        return float(dcf_by_lt.get(lt, dcf_default))
+
+    merged["daily_capacity"] = merged.apply(
+        lambda r: r["capacity"] * _get_dcf(str(r.get("link_type", ""))), axis=1,
+    )
+    merged["vc_ratio"] = merged["volume"] / merged["daily_capacity"].clip(lower=1)
+
+    total = len(merged)
+    if total == 0:
+        return {"available": False, "reason": "no_merged_links"}
+
+    vc_over_1 = int((merged["vc_ratio"] > 1.0).sum())
+    vc_over_08 = int((merged["vc_ratio"] > 0.8).sum())
+    vc_over_05 = int((merged["vc_ratio"] > 0.5).sum())
+
+    by_type = {}
+    for lt, grp in merged.groupby("link_type"):
+        by_type[str(lt)] = {
+            "n_links": len(grp),
+            "mean_vc": round(float(grp["vc_ratio"].mean()), 3),
+            "max_vc": round(float(grp["vc_ratio"].max()), 3),
+            "pct_over_1": round(float((grp["vc_ratio"] > 1.0).sum()) / max(len(grp), 1) * 100, 1),
+        }
+
+    result = {
+        "available": True,
+        "total_links": total,
+        "pct_vc_over_1": round(vc_over_1 / total * 100, 1),
+        "pct_vc_over_08": round(vc_over_08 / total * 100, 1),
+        "pct_vc_over_05": round(vc_over_05 / total * 100, 1),
+        "by_link_type": by_type,
+    }
+
+    if vc_over_1 / max(total, 1) > 0.05:
+        logger.warning(
+            "  V/C diagnostics: %.1f%% of links have V/C > 1.0 — "
+            "capacity may be under-estimated or demand over-estimated",
+            vc_over_1 / total * 100,
+        )
+    else:
+        logger.info(
+            "  V/C diagnostics: %.1f%% over capacity (OK, <5%% threshold)",
+            vc_over_1 / total * 100,
+        )
+
+    return result
 
 
 def _compute_estimated_coverage(db_path: Path) -> Dict[str, Any]:

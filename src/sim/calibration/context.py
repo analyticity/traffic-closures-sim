@@ -224,10 +224,11 @@ class _CalibrationContext:
         self.output_dir = Path(demand_cfg.get("output_dir", "outputs/baseline/demand"))
         _ensure_dir(self.output_dir)
 
-        # Assignment parameters
-        self.algorithm = str(calib_cfg.get("algorithm", "bfw"))
-        self.max_iter_assign = int(calib_cfg.get("max_iter", 150))
-        self.rgap = float(calib_cfg.get("rgap_target", 0.002))
+        # Assignment parameters — use odme-specific overrides if present
+        odme_cfg = calib_cfg.get("odme") or {}
+        self.algorithm = str(odme_cfg.get("algorithm", calib_cfg.get("algorithm", "bfw")))
+        self.max_iter_assign = int(odme_cfg.get("assign_max_iter", calib_cfg.get("max_iter", 150)))
+        self.rgap = float(odme_cfg.get("assign_rgap_target", calib_cfg.get("rgap_target", 0.005)))
         self.core_name = str(calib_cfg.get("core_name", "wd_daily"))
 
         assign_cfg = cfg.get("assignment") or {}

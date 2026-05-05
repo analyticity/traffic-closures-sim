@@ -275,6 +275,8 @@ def _build_scenario_geojson(
     aggregate_daily_volumes(gdf)
 
     # --- Delta computation ---
+    _MIN_BASELINE_VOL = 200
+
     scen_vol = gdf["wd_daily_tot"].fillna(0) if "wd_daily_tot" in gdf.columns else 0
     base_vol = gdf["baseline_vol"].fillna(0)
     gdf["delta_vol"] = scen_vol - base_vol
@@ -287,6 +289,16 @@ def _build_scenario_geojson(
     if "Congested_Time_Max" in gdf.columns and "baseline_ct" in gdf.columns:
         gdf["delta_ct"] = gdf["Congested_Time_Max"].fillna(0) - gdf["baseline_ct"].fillna(0)
 
+    max_vol = pd.concat([base_vol, scen_vol], axis=1).max(axis=1)
+    gdf["low_volume_flag"] = (max_vol < _MIN_BASELINE_VOL).astype(int)
+
+    network_mean_vol = base_vol[base_vol > 0].mean()
+    if pd.isna(network_mean_vol) or network_mean_vol == 0:
+        network_mean_vol = 1.0
+    gdf["significance"] = (
+        gdf["abs_delta_vol"] * (base_vol.clip(lower=1) / network_mean_vol)
+    )
+
     keep = [
         "link_id", "link_type", "name", "osm_ref", "speed", "capacity", "lanes", "distance",
         "wd_daily_tot", "wd_daily_ab", "wd_daily_ba",
@@ -298,6 +310,7 @@ def _build_scenario_geojson(
         "baseline_vol", "delta_vol", "delta_pct", "abs_delta_vol",
         "baseline_voc", "delta_voc",
         "baseline_ct", "delta_ct",
+        "low_volume_flag", "significance",
         "geometry",
     ]
     keep = [c for c in keep if c in gdf.columns]

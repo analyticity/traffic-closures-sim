@@ -57,6 +57,8 @@ export interface LinkProperties {
   delta_voc?: number;
   baseline_ct?: number;
   delta_ct?: number;
+  low_volume_flag?: number;
+  significance?: number;
 }
 
 export interface ZoneProperties {

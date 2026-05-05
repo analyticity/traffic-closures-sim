@@ -543,7 +543,11 @@ def scenario_delta_summary(scenario_id: str):
         if dv is None:
             continue
         adv = abs(dv)
-        if adv < 50:
+        if adv < 100:
+            continue
+        base_v = p.get("baseline_vol", 0) or 0
+        scen_v = p.get("wd_daily_tot", 0) or 0
+        if max(base_v, scen_v) < 200:
             continue
         affected.append({
             "link_id": p.get("link_id"),

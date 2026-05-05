@@ -26,8 +26,13 @@ function getDeltaColor(deltaPct: number): string {
 
 function deltaStyle(feature: GeoJSON.Feature | undefined) {
   const p = feature?.properties as LinkProperties | undefined;
-  const deltaPct = p?.delta_pct ?? 0;
+  let deltaPct = p?.delta_pct ?? 0;
   const absDelta = p?.abs_delta_vol ?? 0;
+  const baselineVol = p?.baseline_vol ?? 0;
+
+  if (baselineVol < 500 && absDelta < 200) {
+    deltaPct = Math.sign(deltaPct) * Math.min(Math.abs(deltaPct), 10);
+  }
 
   return {
     color: getDeltaColor(deltaPct),
@@ -165,8 +170,12 @@ export function DeltaLinksLayer({
     return {
       type: "FeatureCollection",
       features: data.features.filter((f) => {
-        const absDelta = (f.properties as Record<string, unknown>).abs_delta_vol as number | undefined;
-        return absDelta != null && absDelta >= 50;
+        const p = f.properties as Record<string, unknown>;
+        const absDelta = (p.abs_delta_vol as number | undefined) ?? 0;
+        const baselineVol = (p.baseline_vol as number | undefined) ?? 0;
+        const scenarioVol = (p.wd_daily_tot as number | undefined) ?? 0;
+        const maxVol = Math.max(baselineVol, scenarioVol);
+        return absDelta >= 100 && maxVol >= 200;
       }),
     };
   }, [data]);

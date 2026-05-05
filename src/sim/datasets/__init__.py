@@ -14,6 +14,7 @@ from sim.datasets.csd import (
     normalize_csd_count_columns,
 )
 from sim.datasets.population import preprocess_population_sldb2021
+from sim.datasets.employment import derive_zone_employment
 from sim.datasets.registry import merge_dataset_sources
 
 __all__ = [
@@ -24,5 +25,6 @@ __all__ = [
     "ensure_csd2025_validation_parquet",
     "normalize_csd_count_columns",
     "preprocess_population_sldb2021",
+    "derive_zone_employment",
     "merge_dataset_sources",
 ]

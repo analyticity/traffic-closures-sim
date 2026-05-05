@@ -27,6 +27,7 @@ from sim.datasets.centroids import (
     preprocess_grouped_points_zip_to_centroids,
 )
 from sim.datasets.closures_fetch import fetch_postgres_closures
+from sim.datasets.employment import derive_zone_employment
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +256,36 @@ def run_fetch_datasets(
             continue
 
         manifest["sources"][key] = info
+
+    # --- Derived products: employment from commuting destinations ---
+    emp_cfg = (ds.get("employment") or {})
+    if emp_cfg.get("enabled", True):
+        try:
+            commuting_src = all_sources.get("commuting_sldb2021") or {}
+            comm_path = Path(commuting_src.get("out_path", "data/sources/csu/sldb2021/dojizdka_obce.csv"))
+            full_cr_parquet = comm_path.parent / f"{comm_path.stem}_full_cr.parquet"
+            if full_cr_parquet.exists():
+                src_file = full_cr_parquet
+            elif comm_path.exists():
+                src_file = comm_path
+            else:
+                src_file = None
+
+            if src_file:
+                zones_path = Path(cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones")) / "zones.geojson"
+                emp_out = cache_dir / "zone_employment.parquet"
+                emp_info = derive_zone_employment(
+                    src_file,
+                    emp_out,
+                    zones_geojson=zones_path if zones_path.exists() else None,
+                    cfg=cfg,
+                )
+                manifest["sources"]["_derived_employment"] = emp_info
+                logger.info("Employment derived: %s", emp_info.get("parquet"))
+            else:
+                logger.info("Employment derivation skipped: commuting source not available yet")
+        except Exception as exc:
+            logger.warning("Employment derivation failed: %s", exc)
 
     manifest_path = cache_dir / "datasets_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")

@@ -102,7 +102,12 @@ def _euclidean_impedance(zones_gdf: gpd.GeoDataFrame, zone_ids: np.ndarray) -> n
 
 
 def _load_zone_employment(cache_dir: Path) -> Optional[Dict[int, int]]:
-    """Load zone employment counts from ``zone_employment.parquet`` if available."""
+    """Load zone employment counts from ``zone_employment.parquet`` if available.
+
+    Returns ``None`` when the file is missing, has no valid zone mapping,
+    or contains only the stale ``zone_id=0`` fallback (generated before
+    zones were built).
+    """
     path = cache_dir / "zone_employment.parquet"
     if not path.exists():
         return None
@@ -113,7 +118,19 @@ def _load_zone_employment(cache_dir: Path) -> Optional[Dict[int, int]]:
         emp_col = next((c for c in ("employment", "jobs", "employees") if c in df.columns), None)
         if emp_col is None:
             return None
-        return dict(zip(df["zone_id"].astype(int), df[emp_col].astype(int)))
+        # Reject stale fallback where all rows have zone_id=0 (generated
+        # before zones.geojson existed).
+        if (df["zone_id"] == 0).all():
+            logger.warning(
+                "zone_employment.parquet contains only zone_id=0 (stale). "
+                "Re-run fetch-data after build-zones to regenerate with "
+                "real zone IDs."
+            )
+            return None
+        result = dict(zip(df["zone_id"].astype(int), df[emp_col].astype(int)))
+        # Drop the fallback key if present alongside real zones
+        result.pop(0, None)
+        return result if result else None
     except Exception:
         logger.debug("Failed to load zone employment data", exc_info=True)
         return None

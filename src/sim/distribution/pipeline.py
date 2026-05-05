@@ -158,13 +158,16 @@ def run_distribution(config_path: str | Path = "config/brno/sim.yaml", cfg: dict
         if employment:
             logger.info("Loaded employment data for %d zones (asymmetric P/A)", len(employment))
         else:
-            require_emp = bool(dist_cfg.get("require_employment", False))
+            require_emp = bool(dist_cfg.get("require_employment", True))
             if require_emp:
                 raise RuntimeError(
-                    "No employment data found (zone_employment.parquet) but "
-                    "demand.distribution.require_employment=true. "
-                    "P/A attractions without employment are purely population-"
-                    "based and structurally incorrect."
+                    "employment_source='auto' but zone_employment.parquet is "
+                    "missing or empty (employment_zones=0). Distribution of "
+                    "'other' without employment attractions is structurally "
+                    "incorrect — trips will inflate ~3x with no spatial "
+                    "differentiation. Run fetch-data (after build-zones) to "
+                    "derive employment from SLDB commuting data, or set "
+                    "demand.distribution.require_employment=false to override."
                 )
             logger.warning(
                 "No employment data found — attractions will be symmetric "
@@ -233,23 +236,51 @@ def run_distribution(config_path: str | Path = "config/brno/sim.yaml", cfg: dict
                            max_iter=ipf_max_iter, tolerance=ipf_tol)
 
         blended = alpha * adjusted + (1.0 - alpha) * seed
+        blended_total = float(blended.sum())
+
+        # Cap expansion: prevent extreme inflation (e.g. 3.3x) when
+        # employment data is missing and attractions are symmetric.
+        seg_cfg = dist_cfg.get("segments", {}).get(seg, {}) if isinstance(dist_cfg.get("segments"), dict) else {}
+        max_mult = float(seg_cfg.get("max_total_multiplier", 0))
+        if max_mult <= 0:
+            max_mult = float(dist_cfg.get("max_total_multiplier", 0))
+        was_capped = False
+        if max_mult > 0 and seed_total > 0:
+            actual_mult = blended_total / seed_total
+            if actual_mult > max_mult:
+                cap_factor = max_mult * seed_total / blended_total
+                blended *= cap_factor
+                blended_total = float(blended.sum())
+                was_capped = True
+                logger.warning(
+                    "Segment '%s': expansion %.1fx exceeds max_total_multiplier=%.1f "
+                    "— capped to %.1fx (total=%s). Provide employment data for "
+                    "better spatial differentiation.",
+                    seg, actual_mult, max_mult, max_mult,
+                    f"{blended_total:,.0f}",
+                )
+
         logger.info(
             "Segment '%s' blended (alpha=%s): total=%s (seed=%s, ipf=%s)",
             seg, alpha,
-            f"{float(blended.sum()):,.0f}",
+            f"{blended_total:,.0f}",
             f"{seed_total:,.0f}",
             f"{float(adjusted.sum()):,.0f}",
         )
 
         mat.matrix[cn][:, :] = blended
 
-        segment_reports[seg] = {
+        seg_report: Dict[str, Any] = {
             "skipped": False,
             "gravity_params": params,
             "seed_total": round(seed_total, 0),
             "ipf_adjusted_total": round(float(adjusted.sum()), 0),
-            "blended_total": round(float(blended.sum()), 0),
+            "blended_total": round(blended_total, 0),
         }
+        if was_capped:
+            seg_report["capped"] = True
+            seg_report["max_total_multiplier"] = max_mult
+        segment_reports[seg] = seg_report
 
     # --- reconstruct wd_daily from all segments ---------------------------
     if "wd_daily" in available_cores:
@@ -274,6 +305,7 @@ def run_distribution(config_path: str | Path = "config/brno/sim.yaml", cfg: dict
     logger.info("Updated matrix: %s", matrix_path)
 
     skim_method = "unknown"
+    warm_skim_provenance: Dict[str, Any] = {}
     if imp_source == "skim":
         for meta_name in ("skims_meta.json", "warm_assignment_convergence.json"):
             meta_path = output_dir / meta_name
@@ -281,6 +313,15 @@ def run_distribution(config_path: str | Path = "config/brno/sim.yaml", cfg: dict
                 try:
                     meta = json.loads(meta_path.read_text(encoding="utf-8"))
                     skim_method = meta.get("skim_method", "final")
+                    warm_skim_provenance = {
+                        "source_file": meta_name,
+                        "algorithm": meta.get("algorithm"),
+                        "final_rgap": meta.get("final_rgap"),
+                        "rgap_target": meta.get("rgap_target"),
+                        "converged": meta.get("converged"),
+                        "n_iterations": meta.get("n_iterations"),
+                        "skim_method": skim_method,
+                    }
                     break
                 except Exception:
                     pass
@@ -289,14 +330,23 @@ def run_distribution(config_path: str | Path = "config/brno/sim.yaml", cfg: dict
         "impedance_mode": imp_mode,
         "impedance_source": imp_source,
         "skim_method": skim_method,
+        "warm_skim": warm_skim_provenance,
         "segments_distributed": segments_to_distribute,
         "segments_preserved": [s for s in _ALL_DEMAND_SEGMENTS if s not in segments_to_distribute],
         "pa_config": {
             "trip_rate": pa_trip_rate,
             "car_share": pa_car_share,
             "occupancy": pa_occupancy,
-            "employment_source": emp_source,
+            "employment_source": emp_source if not employment else "commuting_destinations",
             "employment_zones": len(employment) if employment else 0,
+            "employment_total": sum(employment.values()) if employment else 0,
+            "zones_without_employment": (
+                sum(1 for z in zone_ids if int(z) not in employment)
+                if employment else int(len(zone_ids))
+            ),
+            "employment_coverage_pct": round(
+                100.0 * sum(1 for z in zone_ids if int(z) in employment) / max(len(zone_ids), 1), 1
+            ) if employment else 0.0,
         },
         "segment_results": segment_reports,
         "ipf": {"max_iter": ipf_max_iter, "tolerance": ipf_tol},

@@ -42,6 +42,17 @@ logger = logging.getLogger(__name__)
 # Population helpers
 # ---------------------------------------------------------------------------
 
+def _employment_needs_remap(emp_path: Path) -> bool:
+    """Return True when zone_employment.parquet is stale (only zone_id=0)."""
+    try:
+        df = pd.read_parquet(emp_path)
+        if df.empty or "zone_id" not in df.columns:
+            return True
+        return bool((df["zone_id"] == 0).all())
+    except Exception:
+        return True
+
+
 def _population_needs_remap(pop_path: Path) -> bool:
     """Return True when zone_population.parquet exists but has only the no_zones fallback."""
     try:
@@ -379,6 +390,40 @@ def build_zones_and_connectors(
                 "%s not found; run fetch-data to download population CSV",
                 pop_path,
             )
+
+        # --- Employment (derived from commuting destinations) ---
+        emp_path = Path(cfg.get("datasets", {}).get("cache_dir", "data/cache")) / "zone_employment.parquet"
+        _emp_needs_regen = (
+            not emp_path.exists()
+            or _employment_needs_remap(emp_path)
+        )
+        if _emp_needs_regen:
+            reason = "missing" if not emp_path.exists() else "stale zone_id=0"
+            logger.info("zone_employment.parquet %s; regenerating ...", reason)
+            try:
+                from sim.datasets.employment import derive_zone_employment
+                from sim.datasets.paths import resolved_commuting_full_cr_parquet_path
+                comm_path = resolved_commuting_full_cr_parquet_path(cfg)
+                if comm_path.exists():
+                    emp_info = derive_zone_employment(
+                        comm_path, emp_path,
+                        zones_geojson=output_dir / "zones.geojson",
+                        cfg=cfg,
+                    )
+                    logger.info(
+                        "zone_employment.parquet regenerated: %d zones, %d matched, total=%s",
+                        emp_info.get("zones_total", 0),
+                        emp_info.get("matched", 0),
+                        format(emp_info.get("total_employment", 0), ","),
+                    )
+                else:
+                    logger.warning(
+                        "Cannot regenerate employment: commuting source %s not found. "
+                        "Run fetch-data first.",
+                        comm_path,
+                    )
+            except Exception:
+                logger.warning("Employment regeneration failed", exc_info=True)
 
         mapping_path = output_dir / "zone_centroid_mapping.json"
         mapping_path.write_text(

@@ -50,32 +50,31 @@ calibration:
     csd_screenlines: true
     csd_min_aadt: 5000
   journey_time_validation:
-    enabled: true
+    enabled: false  # Requires zone IDs from a built Brno scenario
     reference_routes:
-      # TODO: fill from_zone / to_zone with actual zone IDs from the Brno zone system
       - name: "D1_west_to_centre"
-        from_zone: 0    # TODO: zone ID for D1 western gateway
-        to_zone: 0       # TODO: zone ID for Brno-střed
+        from_zone: 0    # fill with zone ID for D1 western gateway
+        to_zone: 0       # fill with zone ID for Brno-střed
         reference_time_min: 15
         tolerance_pct: 20
       - name: "D2_south_to_centre"
-        from_zone: 0    # TODO: zone ID for D2 southern gateway
-        to_zone: 0       # TODO: zone ID for Brno-střed
+        from_zone: 0    # fill with zone ID for D2 southern gateway
+        to_zone: 0       # fill with zone ID for Brno-střed
         reference_time_min: 12
         tolerance_pct: 20
       - name: "I43_north_to_centre"
-        from_zone: 0    # TODO: zone ID for I/43 northern gateway
-        to_zone: 0       # TODO: zone ID for Brno-střed
+        from_zone: 0    # fill with zone ID for I/43 northern gateway
+        to_zone: 0       # fill with zone ID for Brno-střed
         reference_time_min: 18
         tolerance_pct: 20
       - name: "Zabovresky_to_Lisen"
-        from_zone: 0    # TODO: zone ID for Žabovřesky
-        to_zone: 0       # TODO: zone ID for Líšeň
+        from_zone: 0    # fill with zone ID for Žabovřesky
+        to_zone: 0       # fill with zone ID for Líšeň
         reference_time_min: 20
         tolerance_pct: 20
       - name: "Bystrc_to_Slatina"
-        from_zone: 0    # TODO: zone ID for Bystrc
-        to_zone: 0       # TODO: zone ID for Slatina
+        from_zone: 0    # fill with zone ID for Bystrc
+        to_zone: 0       # fill with zone ID for Slatina
         reference_time_min: 25
         tolerance_pct: 20
 

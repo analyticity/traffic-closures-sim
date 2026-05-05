@@ -9,7 +9,7 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Union
+from typing import Any, Dict, Union
 
 import pandas as pd
 from aequilibrae import Project
@@ -105,11 +105,16 @@ def _repair_connectivity(
         links.loc[mask, "lanes_ba"] = links.loc[mask, "lanes_ab"]
         links.loc[mask, "travel_time_ba"] = links.loc[mask, "travel_time_ab"]
 
-    logger.info("Repair divided highways")
-    divided_info = repair_divided_highway_dead_ends(
-        project,
-        max_snap_distance_m=float(network_cfg.get("divided_highway_snap_m", 600)),
-    )
+    divided_mode = str(network_cfg.get("repair_divided_highways", "auto")).lower().strip()
+    if divided_mode == "disabled":
+        logger.info("Divided highway repair: DISABLED by config")
+        divided_info: Dict[str, Any] = {"new_link_ids": []}
+    else:
+        logger.info("Repair divided highways")
+        divided_info = repair_divided_highway_dead_ends(
+            project,
+            max_snap_distance_m=float(network_cfg.get("divided_highway_snap_m", 600)),
+        )
     if divided_info["new_link_ids"]:
         with project_db(project) as conn_tmp:
             for new_lid in divided_info["new_link_ids"]:

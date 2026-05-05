@@ -129,6 +129,13 @@ SIM_DEFAULTS: Dict[str, Any] = {
             "rgap_target": 0.02,
         },
 
+        # Generalized cost adds a distance-based monetary penalty to travel
+        # time during assignment.  AequilibraE computes:
+        #   gc = travel_time + (fixed_cost_field * fixed_cost_multiplier) / vot
+        # With distance in meters, multiplier 0.005 means 5 cost-units/km.
+        # VOT=1.0 treats 1 cost-unit = 1 second of travel time, so this adds
+        # an effective 5 sec/km distance penalty (discourages long detours).
+        # Calibrate against local willingness-to-pay or VOT surveys if available.
         "generalized_cost": {
             "enabled": True,
             "fixed_cost_field": "distance",
@@ -271,7 +278,7 @@ SIM_DEFAULTS: Dict[str, Any] = {
             "allow_unconverged_skims": False,
             "segments": ["other"],
             "employment_source": "auto",
-            "require_employment": False,
+            "require_employment": True,
             "deterrence_function": "EXPO",
             "min_gravity_beta": 0.0001,
             "pa_trip_rate": 2.5,

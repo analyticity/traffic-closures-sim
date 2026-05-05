@@ -174,10 +174,11 @@ def _estimate_total_daily_trips_from_csd(
         return None
 
     unique_roads = set(gateway_refs.values())
-    total = 0.0
-    matched_gateways = 0
 
-    for gw_name, road_code in gateway_refs.items():
+    # Aggregate AADT by unique road code to avoid counting the same
+    # corridor multiple times when several gateways share one road_ref.
+    road_aadts: Dict[str, float] = {}
+    for road_code in unique_roads:
         csd_match = csd[csd["sil"] == road_code]
         if csd_match.empty:
             csd_match = csd[csd["sil"].str.replace("M", "", regex=False) == road_code.replace("M", "")]
@@ -185,20 +186,21 @@ def _estimate_total_daily_trips_from_csd(
             continue
         mean_aadt = float(csd_match["sv"].mean())
         if mean_aadt > 0:
-            total += mean_aadt
-            matched_gateways += 1
+            road_aadts[road_code] = mean_aadt
 
-    if matched_gateways == 0:
+    if not road_aadts:
         return None
 
-    coverage = matched_gateways / max(len(gateway_refs), 1)
-    if coverage < 1.0 and matched_gateways > 0:
+    total = sum(road_aadts.values())
+    matched_roads = len(road_aadts)
+    coverage = matched_roads / max(len(unique_roads), 1)
+    if coverage < 1.0 and matched_roads > 0:
         total = total / coverage
 
     logger.info(
         "Auto-estimated total_daily_trips=%.0f from CSD "
-        "(%d/%d gateways matched, %d unique roads)",
-        total, matched_gateways, len(gateway_refs), len(unique_roads),
+        "(%d/%d unique roads matched, %d gateways)",
+        total, matched_roads, len(unique_roads), len(gateway_refs),
     )
     return total
 

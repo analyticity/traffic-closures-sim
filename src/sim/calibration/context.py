@@ -272,6 +272,7 @@ class _CalibrationContext:
         # ODME / elasticity
         self.odme_cfg = calib_cfg.get("odme") or {}
         self.max_deviation = float(self.odme_cfg.get("max_deviation", 4.0))
+        self.epsilon_support = float(self.odme_cfg.get("epsilon_support", 0.0))
 
         # Screenline factor bounds (shared by ODME and FSM Spiess updates)
         sl_factors = calib_cfg.get("screenline_factors") or {}
@@ -428,7 +429,10 @@ class _CalibrationContext:
         self.seed_lower = seed / self.max_deviation
         self.seed_upper = seed * self.max_deviation
         self.seed_lower[seed <= 0] = 0.0
-        self.seed_upper[seed <= 0] = 0.0
+        if self.epsilon_support > 0:
+            self.seed_upper[seed <= 0] = self.epsilon_support
+        else:
+            self.seed_upper[seed <= 0] = 0.0
 
         # Observation density check
         n_zones = len(self.mat.index[:])
@@ -768,7 +772,10 @@ class _CalibrationContext:
             self.seed_lower = rebased / self.max_deviation
             self.seed_upper = rebased * self.max_deviation
             self.seed_lower[rebased <= 0] = 0.0
-            self.seed_upper[rebased <= 0] = 0.0
+            if self.epsilon_support > 0:
+                self.seed_upper[rebased <= 0] = self.epsilon_support
+            else:
+                self.seed_upper[rebased <= 0] = 0.0
             logger.info("  Seed bounds rebased after first gateway calibration")
 
     def apply_demand_cap_and_save(self, demand: np.ndarray, total_demand: float, *, max_change_pct: float) -> None:

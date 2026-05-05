@@ -517,8 +517,17 @@ def evaluate_all_screenlines(
     links_gdf: Optional[gpd.GeoDataFrame] = None,
 ) -> Dict[str, ScreenlineResult]:
     """Evaluate all screenlines and return {name: result}."""
-    results: Dict[str, ScreenlineResult] = {}
+    seen_names: set = set()
+    unique_screenlines: List[ScreenlineDef] = []
     for sl in screenlines:
+        if sl.name in seen_names:
+            logger.warning("Duplicate screenline name '%s' — skipping duplicate", sl.name)
+            continue
+        seen_names.add(sl.name)
+        unique_screenlines.append(sl)
+
+    results: Dict[str, ScreenlineResult] = {}
+    for sl in unique_screenlines:
         r = evaluate_screenline(sl, vol_df, matched_counts, vol_col, obs_col, links_gdf)
         results[sl.name] = r
     return results

@@ -255,7 +255,14 @@ def execute_assignment(
     if save_skims and primary_tc is not None:
         try:
             if skim_method == "final":
-                skims = primary_tc._aon_results.skims
+                if hasattr(primary_tc, "_aon_results") and primary_tc._aon_results is not None:
+                    skims = primary_tc._aon_results.skims
+                else:
+                    logger.warning(
+                        "_aon_results unavailable (AequilibraE API change?), "
+                        "falling back to results.skims"
+                    )
+                    skims = primary_tc.results.skims
             else:
                 skims = primary_tc.results.skims
         except Exception as exc:

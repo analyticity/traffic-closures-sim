@@ -77,6 +77,14 @@ def _run_assignment_pass(
     mc_cfg = assign_cfg.get("multi_class") or {}
     multi_classes = _resolve_multi_class(mc_cfg)
 
+    if gc_enabled and gc_mult > 0:
+        penalty_per_km = gc_mult * 1000.0 / max(gc_vot, 1e-9)
+        logger.info(
+            "  Generalized cost: field=%s, multiplier=%.4f, vot=%.2f "
+            "=> effective %.1f sec/km distance penalty",
+            gc_field, gc_mult, gc_vot, penalty_per_km,
+        )
+
     logger.info(f"\n3) Running {algorithm.upper()} ...")
     project = Project()
     project.open(str(project_dir))

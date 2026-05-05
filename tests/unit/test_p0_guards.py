@@ -272,9 +272,9 @@ class TestP0Defaults:
         from sim.defaults import SIM_DEFAULTS
         assert SIM_DEFAULTS["demand"]["distribution"]["min_gravity_beta"] == 0.0001
 
-    def test_require_employment_default_false(self):
+    def test_require_employment_default_true(self):
         from sim.defaults import SIM_DEFAULTS
-        assert SIM_DEFAULTS["demand"]["distribution"]["require_employment"] is False
+        assert SIM_DEFAULTS["demand"]["distribution"]["require_employment"] is True
 
     def test_screenline_dedup_strict_default_false(self):
         from sim.defaults import SIM_DEFAULTS

@@ -199,7 +199,10 @@ def run_odme_calibration(
                     ctx.seed_lower = seed / new_max_dev
                     ctx.seed_upper = seed * new_max_dev
                     ctx.seed_lower[seed <= 0] = 0.0
-                    ctx.seed_upper[seed <= 0] = 0.0
+                    if ctx.epsilon_support > 0:
+                        ctx.seed_upper[seed <= 0] = ctx.epsilon_support
+                    else:
+                        ctx.seed_upper[seed <= 0] = 0.0
 
                 ctx.gw_rebase_seed_bounds = bool(
                     _stage_param("rebase_seed_bounds", ctx.gw_rebase_seed_bounds)

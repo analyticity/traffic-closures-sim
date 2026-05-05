@@ -20,6 +20,10 @@ from sim.network.normalization import ensure_link_types_registered
 logger = logging.getLogger(__name__)
 
 _MAJOR_ROAD_TYPES = frozenset({"motorway", "motorway_link", "trunk", "trunk_link"})
+# Only ramp/link types are eligible for SCC bidirectionalization — mainline
+# carriageways (motorway, trunk) must never be reversed as that creates
+# physically impossible routes.
+_SCC_REPAIR_ELIGIBLE = frozenset({"motorway_link", "trunk_link"})
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +61,7 @@ def repair_boundary_scc(
     repair_ids = []
     for _, lk in links.iterrows():
         lt = str(lk.get("link_type", ""))
-        if lt not in _MAJOR_ROAD_TYPES:
+        if lt not in _SCC_REPAIR_ELIGIBLE:
             continue
         d = int(lk.get("direction", 0) or 0)
         if d == 0:
@@ -233,9 +237,12 @@ def repair_divided_highway_dead_ends(
         if dead_lt.get(n1) and dead_lt.get(n2) and dead_lt[n1] != dead_lt[n2]:
             lt_use = dead_lt[n1]
 
-        spd = 130.0 if lt_use in ("motorway", "motorway_link") else 90.0
-        cap_lane = 2200.0 if lt_use in ("motorway", "motorway_link") else 1800.0
-        lanes = 3 if lt_use in ("motorway", "motorway_link") else 2
+        # Penalty values: crossover links represent U-turns or service roads,
+        # not mainline carriageways. Low speed + capacity discourages assignment
+        # from routing through them unless no alternative exists.
+        spd = 20.0
+        cap_lane = 200.0
+        lanes = 1
         tt = (dist / 1000.0) / max(spd, 1.0) * 3600.0 if dist > 0 else 0.01
 
         links_api = project.network.links

@@ -117,7 +117,7 @@ def run_supply_audit(config_path: str | Path = "config/brno/sim.yaml") -> Dict[s
             warnings_list.append(w)
             all_ok = False
         if not cap_ok:
-            w = f"{lt}: avg capacity {avg_cap:.0f} veh/day outside expected [{cap_range[0]}-{cap_range[1]}]"
+            w = f"{lt}: avg capacity {avg_cap:.0f} veh/h/dir outside expected [{cap_range[0]}-{cap_range[1]}]"
             warnings_list.append(w)
             all_ok = False
 
@@ -128,9 +128,9 @@ def run_supply_audit(config_path: str | Path = "config/brno/sim.yaml") -> Dict[s
             "min_speed_kmh": round(min_spd, 1),
             "max_speed_kmh": round(max_spd, 1),
             "speed_ok": speed_ok,
-            "avg_capacity_vpd": round(avg_cap, 0),
-            "min_capacity_vpd": round(min_cap, 0),
-            "max_capacity_vpd": round(max_cap, 0),
+            "avg_capacity_vph": round(avg_cap, 0),
+            "min_capacity_vph": round(min_cap, 0),
+            "max_capacity_vph": round(max_cap, 0),
             "capacity_ok": cap_ok,
             "avg_lanes": round(avg_lanes, 1),
         }
@@ -160,15 +160,16 @@ def run_supply_audit(config_path: str | Path = "config/brno/sim.yaml") -> Dict[s
     }
 
     # Estimated vs empirical coverage
+    _IMPUTATION_WARN_THRESHOLD = 70  # percent
     estimated_coverage = _compute_estimated_coverage(db_path)
-    if estimated_coverage["pct_speed_estimated"] > 90:
+    if estimated_coverage["pct_speed_estimated"] > _IMPUTATION_WARN_THRESHOLD:
         w = (
             f"Speed: {estimated_coverage['pct_speed_estimated']:.0f}% of links use "
             f"default/imputed values — supply is not empirically calibrated"
         )
         warnings_list.append(w)
         all_ok = False
-    if estimated_coverage["pct_capacity_estimated"] > 90:
+    if estimated_coverage["pct_capacity_estimated"] > _IMPUTATION_WARN_THRESHOLD:
         w = (
             f"Capacity: {estimated_coverage['pct_capacity_estimated']:.0f}% of links use "
             f"default/imputed values — supply is not empirically calibrated"

@@ -223,8 +223,13 @@ def run_distribution(config_path: str | Path = "config/brno/sim.yaml", cfg: dict
             }
             continue
 
+        # Build gravity deterrence matrix and use it as IPF base so that
+        # impedance (travel time/cost) actively shapes spatial distribution.
+        gravity_matrix = np.exp(-beta_val * impedance)
+        np.fill_diagonal(gravity_matrix, 0)
+
         logger.info("Running IPF for '%s' (max_iter=%d)", seg, ipf_max_iter)
-        adjusted = run_ipf(seed, target_rows, target_cols,
+        adjusted = run_ipf(gravity_matrix, target_rows, target_cols,
                            max_iter=ipf_max_iter, tolerance=ipf_tol)
 
         blended = alpha * adjusted + (1.0 - alpha) * seed

@@ -109,7 +109,7 @@ datasets:
         destination:
           keep_all: true
     calibration_brno_pentlogram_2024:
-      enabled: true
+      enabled: false
     validation_csd2025_v2:
       usage:
         area_filter: { enabled: true, region_hint: "Jihomoravský kraj" }

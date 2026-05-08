@@ -551,6 +551,13 @@ NETWORK_NORM_DEFAULTS: Dict[str, Any] = {
             "generic_capacity_per_lane": 900,
             "min_travel_time_s": 0.01,
         },
+        "practical_speed": {
+            "enabled": True,
+            "base_factor": 0.85,
+            "intersection_penalty_per_km": 0.02,
+            "min_intersection_degree": 3,
+            "min_speed_kmh": 5.0,
+        },
         "defaults": {
             "speed_by_link_type": {
                 "motorway": 130.0,

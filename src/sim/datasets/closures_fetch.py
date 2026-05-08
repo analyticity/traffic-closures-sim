@@ -98,7 +98,16 @@ def fetch_postgres_closures(
             first_seen,
             last_seen,
             ST_Y(location_point_geog::geometry) AS lat,
-            ST_X(location_point_geog::geometry) AS lon
+            ST_X(location_point_geog::geometry) AS lon,
+            ST_AsText(location_line_geog::geometry) AS line_wkt,
+            direction      AS closure_direction,
+            km_from,
+            km_to,
+            road_type_code,
+            quality_score,
+            urgency,
+            probability,
+            segment_id
         FROM {table}
         WHERE location_point_geog IS NOT NULL
         ORDER BY id
@@ -145,6 +154,13 @@ def fetch_postgres_closures(
         df = df[df["status"].fillna("").astype(str).str.strip().str.lower().isin(allowed)].copy()
         logger.info("PostgreSQL closures: status filter (%s): %d -> %d", ", ".join(sorted(allowed)), before_status, len(df))
 
+    min_quality = source_cfg.get("min_quality_score")
+    if min_quality is not None and "quality_score" in df.columns:
+        threshold = int(min_quality)
+        before_q = len(df)
+        df = df[df["quality_score"].fillna(0).astype(int) >= threshold].copy()
+        logger.info("PostgreSQL closures: quality_score >= %d: %d -> %d", threshold, before_q, len(df))
+
     min_observed_days = source_cfg.get("min_observed_days")
     if min_observed_days is not None and "first_seen" in df.columns and "last_seen" in df.columns:
         min_days = float(min_observed_days)
@@ -166,6 +182,21 @@ def fetch_postgres_closures(
     )
 
     df["road_ref"] = df["road_number"].fillna("").astype(str).str.strip()
+
+    for col in ("closure_direction", "road_type_code", "urgency", "probability"):
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str).str.strip()
+
+    if "quality_score" in df.columns:
+        df["quality_score"] = pd.to_numeric(df["quality_score"], errors="coerce").fillna(0).astype(int)
+
+    if "km_from" in df.columns:
+        df["km_from"] = pd.to_numeric(df["km_from"], errors="coerce")
+    if "km_to" in df.columns:
+        df["km_to"] = pd.to_numeric(df["km_to"], errors="coerce")
+
+    if "segment_id" in df.columns:
+        df["segment_id"] = pd.to_numeric(df["segment_id"], errors="coerce").fillna(-1).astype(int)
 
     for ts_col, fallback_col, out_col in [
         ("valid_from", "first_seen", "start"),
@@ -189,7 +220,19 @@ def fetch_postgres_closures(
     else:
         df["description_cs"] = df["description_cs"].fillna("")
 
+    from shapely import wkt
     from shapely.geometry import Point
+
+    if "line_wkt" in df.columns:
+        df["line_geom"] = df["line_wkt"].apply(
+            lambda w: wkt.loads(w) if pd.notna(w) and str(w).strip() else None
+        )
+        df.drop(columns=["line_wkt"], inplace=True)
+    else:
+        df["line_geom"] = None
+
+    n_with_line = int(df["line_geom"].notna().sum())
+    logger.info("PostgreSQL closures: %d/%d have line geometry", n_with_line, len(df))
 
     geometry = [Point(lon, lat) for lon, lat in zip(df["lon"], df["lat"])]
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
@@ -201,6 +244,12 @@ def fetch_postgres_closures(
         "PostgreSQL closures: %d events in model area (%d full, %d lane_reduction, %d speed_limit)",
         len(gdf), full_count, partial_count, speed_count,
     )
+
+    if "line_geom" in gdf.columns:
+        gdf["line_wkt"] = gdf["line_geom"].apply(
+            lambda g: g.wkt if g is not None else ""
+        )
+        gdf.drop(columns=["line_geom"], inplace=True)
 
     gdf = coerce_object_columns_for_parquet(gdf)
     gdf.to_parquet(cache_path, index=False)

@@ -54,6 +54,15 @@ def apply_scenario_to_graph(graph, scenario_links: List[Dict[str, Any]]) -> None
 
     time_col = "free_flow_time" if "free_flow_time" in gdf.columns else "travel_time"
 
+    if not scenario_links:
+        return
+
+    has_dir = "direction" in gdf.columns
+
+    link_id_to_rows: dict = {}
+    for i, lid in enumerate(gdf["link_id"].values):
+        link_id_to_rows.setdefault(int(lid), []).append(i)
+
     for sl in scenario_links:
         link_id = int(sl["link_id"])
         direction = sl.get("direction", "both")
@@ -61,22 +70,26 @@ def apply_scenario_to_graph(graph, scenario_links: List[Dict[str, Any]]) -> None
         lanes_orig = max(int(sl.get("lanes", 1)), 1)
         lanes_remaining = max(int(sl.get("lanes_remaining", 1)), 1)
 
-        mask = gdf["link_id"] == link_id
+        row_indices = link_id_to_rows.get(link_id)
+        if not row_indices:
+            continue
 
-        if direction == "ab":
-            mask = mask & (gdf["direction"] == 1)
-        elif direction == "ba":
-            mask = mask & (gdf["direction"] == -1)
+        if has_dir and direction in ("ab", "ba"):
+            dir_val = 1 if direction == "ab" else -1
+            row_indices = [i for i in row_indices if gdf["direction"].iat[i] == dir_val]
 
-        if not mask.any():
+        if not row_indices:
             continue
 
         if closure_type == "full":
-            gdf.loc[mask, "capacity"] = CLOSURE_CAPACITY
-            gdf.loc[mask, time_col] = CLOSURE_TRAVEL_TIME
+            for i in row_indices:
+                gdf.iat[i, gdf.columns.get_loc("capacity")] = CLOSURE_CAPACITY
+                gdf.iat[i, gdf.columns.get_loc(time_col)] = CLOSURE_TRAVEL_TIME
         else:
             ratio = lanes_remaining / lanes_orig
-            gdf.loc[mask, "capacity"] = gdf.loc[mask, "capacity"] * ratio
+            cap_col_idx = gdf.columns.get_loc("capacity")
+            for i in row_indices:
+                gdf.iat[i, cap_col_idx] = gdf.iat[i, cap_col_idx] * ratio
 
 
 # --- Job management ---

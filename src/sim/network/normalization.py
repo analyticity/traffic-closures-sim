@@ -141,6 +141,55 @@ def _apply_csd_capacity_hints(
     return n_updated
 
 
+def _apply_practical_speed_reduction(
+    links: pd.DataFrame,
+    project: Project,
+    pffs_cfg: dict,
+) -> None:
+    """HCM-inspired practical free-flow speed reduction.
+
+    ``practical_speed = posted_speed * base_factor - penalty * ipkm``
+
+    where *ipkm* is the intersection density (nodes with degree >= threshold
+    per kilometre of link length).  This captures the speed loss caused by
+    signalisation, priority intersections, access points and general urban
+    friction without any city-specific tuning.
+    """
+    if not pffs_cfg.get("enabled", False):
+        return
+
+    base_factor = float(pffs_cfg.get("base_factor", 0.85))
+    penalty = float(pffs_cfg.get("intersection_penalty_per_km", 0.02))
+    min_degree = int(pffs_cfg.get("min_intersection_degree", 3))
+    min_speed = float(pffs_cfg.get("min_speed_kmh", 5.0))
+
+    node_counts = (
+        links["a_node"].value_counts().add(
+            links["b_node"].value_counts(), fill_value=0
+        )
+    )
+    high_degree_nodes = frozenset(node_counts[node_counts >= min_degree].index)
+
+    a_is_int = links["a_node"].isin(high_degree_nodes).astype(int)
+    b_is_int = links["b_node"].isin(high_degree_nodes).astype(int)
+    n_intersections = a_is_int + b_is_int
+
+    dist_km = (links["distance"] / 1000.0).clip(lower=0.01)
+    ipkm = n_intersections / dist_km
+
+    for col in ("speed_ab", "speed_ba"):
+        links[col] = (links[col] * base_factor - penalty * ipkm).clip(lower=min_speed)
+
+    logger.info(
+        "Practical speed reduction (base=%.2f, penalty=%.3f/km): "
+        "median ipkm=%.1f, mean speed change %.1f km/h",
+        base_factor,
+        penalty,
+        float(ipkm.median()),
+        float((links["speed_ab"] * (1 - base_factor)).mean()),
+    )
+
+
 def _apply_speed_floors(links: pd.DataFrame, speed_floors: dict) -> None:
     for lt, floor_val in speed_floors.items():
         m = _lt_mask(links, lt)
@@ -387,6 +436,12 @@ def normalize_network_attributes(
     links["lanes_ab"] = links["lanes_ab"].clip(lower=1)
     links["lanes_ba"] = links["lanes_ba"].clip(lower=1)
 
+    # --- Practical free-flow speed reduction (HCM-inspired) ---
+    pffs_defaults = _NORM_DEFS.get("practical_speed") or {}
+    pffs_profile = profile.get("practical_speed") or {}
+    pffs_cfg = {**pffs_defaults, **pffs_profile}
+    _apply_practical_speed_reduction(links, project, pffs_cfg)
+
     # --- Capacity (AB/BA) ---
     if "capacity_ab" in links.columns:
         links["capacity_ab"] = pd.to_numeric(links["capacity_ab"], errors="coerce")
@@ -454,16 +509,9 @@ def normalize_network_attributes(
         logger.warning("Project database not found at %s, DB update skipped", db_path)
         return links
 
-    updates = []
-    for _, row in links.iterrows():
-        updates.append((
-            str(row["link_type"]),
-            float(row["speed_ab"]), float(row["speed_ba"]),
-            int(row["lanes_ab"]), int(row["lanes_ba"]),
-            float(row["capacity_ab"]), float(row["capacity_ba"]),
-            float(row["travel_time_ab"]), float(row["travel_time_ba"]),
-            int(row["link_id"]),
-        ))
+    _needed = ["link_type", "speed_ab", "speed_ba", "lanes_ab", "lanes_ba",
+               "capacity_ab", "capacity_ba", "travel_time_ab", "travel_time_ba", "link_id"]
+    updates = list(links[_needed].itertuples(index=False, name=None))
 
     with project_db(project) as conn:
         conn.executemany(

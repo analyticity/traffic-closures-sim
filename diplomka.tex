@@ -1,0 +1,335 @@
+\chapter{Výsledky a vyhodnocení}
+\label{ch:vysledky}
+
+% Kapitola navazuje na implementaci (kap.~7) a vyhodnocuje navržený simulační model
+% z~hlediska zadání: „Otestujte navrhnuté simulace. Vyhodnoťte výsledky simulací
+% z~hlediska jejich dopadu na dopravu."
+%
+% Struktura kapitoly:
+%   1. Ověření baseline modelu proti nezávislým datům (CSD, Waze).
+%   2. Scénářové experimenty s reálnými uzavírkami z~databáze.
+%   3. Křížová validace pomocí tabulek traffic_jams, accidents, event_links.
+%   4. Citlivostní analýza parametrů modelu.
+%   5. Diskuse zjištění a praktických implikací.
+%   6. Omezení studie.
+
+
+% ============================================================================
+\section{Validace výchozího (baseline) stavu}
+\label{sec:baseline}
+% ============================================================================
+
+% Cíl sekce: prokázat, že model bez uzavírek dostatečně věrně reprodukuje
+% reálný dopravní stav -- je to nutný předpoklad pro důvěryhodnost scénářů.
+
+\subsection{Shoda modelových intenzit s~celostátním sčítáním dopravy (CSD)}
+% - Porovnat modelované objemy (link flows z~BFW přiřazení) s~pozorovanými
+%   hodnotami AADT na kalibračních a zejména VALIDAČNÍCH profilech CSD 2020.
+% - Kalibrační profily (65 \%) sloužily při ODME -- zde jen stručně rekapitulovat
+%   dosažené metriky (R², \%RMSE, GEH, MAPE, bias, slope).
+% - Hlavní důraz na NEZÁVISLOU validační sadu (35 \% profilů):
+%   - scatter plot obs vs. mod s~regresní přímkou a 45° linií,
+%   - distribuce GEH: kolik profilů splňuje GEH < 5 (standard: ≥ 85 \%),
+%   - histogram reziduí (mod − obs) -- ověřit symetrii (žádný systematický bias).
+% - Screenline analýza: součty toků přes definované řezy městem (mosty přes
+%   Svratku, vnější/vnitřní okruh, radiály) -- porovnat s~pozorovanými součty.
+
+\subsection{Validace rychlostí na síti pomocí Waze free-flow dat}
+\label{subsec:freeflow}
+% NOVÝ, ZAJÍMAVÝ PŘÍSTUP -- využití tabulky traffic_jams z~PostgreSQL.
+%
+% Myšlenka: Sloupec speed_normal_kmh v~záznamu o~zácpě udává rychlost
+% za normálních podmínek na daném segmentu (volně plynoucí provoz).
+% Agregací přes road_segments (→ osm_id → link_id) získáme nezávislý
+% odhad volné rychlosti pro tisíce hran sítě.
+%
+% Postup:
+%   1. Z~jams_segment_stats.parquet vzít median_speed_normal_kmh per segment.
+%   2. Přes road_segments.osm_id namapovat na link_id v~AequilibraE síti.
+%   3. Porovnat s~modelovou speed_ab / speed_ba (free-flow rychlost z~OSM + normalizace).
+%
+% Vizualizace:
+%   - Scatter plot: Waze free-flow vs. model free-flow; R² a RMSE.
+%   - Mapa odchylek: kde model přeceňuje / podceňuje rychlost.
+%   - Rozlišit podle funkční třídy komunikace (motorway, primary, residential…).
+%
+% Význam: Na rozdíl od CSD (objemy) jde o validaci RYCHLOSTNÍ složky modelu --
+% ta vstupuje do BPR funkce a přímo ovlivňuje cestovní časy a přesměrování.
+
+\subsection{Prostorové vzorce kongesce: model vs.\ reálné zácpy}
+\label{subsec:congestion-patterns}
+% Porovnat modelové V/C poměry s~reálnou frekvencí zácp z~traffic_jams.
+%
+% Postup:
+%   1. Pro každý road_segment spočítat počet zaznamenaných zácp (jam_count)
+%      a průměrný delay_seconds -- z~jams_segment_stats.parquet.
+%   2. Namapovat na link_id přes osm_id.
+%   3. Porovnat s~modelovým V/C (volume / capacity z~baseline assignment).
+%
+% Očekávání: Hrany s~V/C > 0.8 by měly korelovat s~místy, kde jsou zácpy
+% nejčastější. Pokud model predikuje nízké V/C tam, kde Waze reportuje
+% časté zácpy, naznačuje to chybu v~kapacitě nebo poptávce.
+%
+% Vizualizace:
+%   - Heatmapa překryvem: V/C z~modelu vs. hustota zácp z~Waze.
+%   - Korelační graf segment-level: V/C vs. jam_count (Spearman ρ).
+%   - Rozlišení špička / mimo-špičku pomocí časových agregací
+%     z~traffic_jams (hodina dne, den v~týdnu).
+
+
+% ============================================================================
+\section{Experimenty se scénáři dopravních uzavírek}
+\label{sec:scenare}
+% ============================================================================
+
+% Cíl: Otestovat model na reálných uzavírkách z~databáze restrictions a~vyhodnotit
+% dopad na dopravní síť pomocí rozdílové analýzy (delta analysis) vůči baseline.
+
+\subsection{Výběr testovacích uzavírek}
+% - Z~restrictions vybrat 3--5 reprezentativních uzavírek s~různými charakteristikami:
+%   a) Plná uzavírka páteřní komunikace (severity = full_closure, silnice I. třídy).
+%   b) Částečná uzavírka s~redukcí pruhů (severity = lane_reduction).
+%   c) Uzavírka v~centru města (vysoká hustota alternativ).
+%   d) Uzavírka na periferní radiále (omezená redundance sítě).
+%   e) Uzavírka mostu / přechodu přes vodní tok (topologicky kritický článek).
+% - Pro každou uvést: link_id, road_number, city, restriction_type, severity,
+%   valid_from/to, zda má liniovou geometrii a směrovost.
+
+\subsection{Výsledky scénářového přiřazení}
+% Pro každý vybraný scénář prezentovat:
+%
+% a) Síťové KPI:
+%   - Celkový VHT (Vehicle Hours Traveled) a jeho změna ΔVHT vs. baseline.
+%   - Celkový VKT (Vehicle Kilometers Traveled) a ΔVKT.
+%   - Průměrný cestovní čas a jeho nárůst.
+%   - Počet hran s~V/C > 1.0 (přetížení).
+%
+% b) Koridorová analýza:
+%   - Mapy Δflow a Δtravel_time na dotčeném koridoru a jeho okolí.
+%   - Identifikace objízdných tras, na které se doprava přesunula.
+%   - Kvantifikace nárůstu zatížení na objízdných trasách (% nárůst).
+%
+% c) Kaskádové efekty:
+%   - Kde se projevují sekundární kongesce (hrany vzdálené od uzavírky
+%     s~nárůstem V/C > 0.2)?
+%   - Jak daleko do sítě zasahuje dopad uzavírky (metricky: vzdálenost
+%     nejbližší hrany se signifikantním Δflow od místa uzavírky)?
+
+\subsection{Porovnání typů uzavírek}
+% Napříč vybranými scénáři porovnat:
+%   - Žebříček dle ΔVHT: která uzavírka má největší celosíťový dopad?
+%   - Poměr lokálního vs. celosíťového dopadu.
+%   - Nelineární efekty: při kombinaci dvou uzavírek současně (je-li
+%     v~datech případ) -- je dopad superpozicí, nebo výrazně horší?
+% - Tabulka: scénář | typ | ΔVHT | ΔTT | max ΔV/C | počet přetížených hran.
+
+\subsection{Vliv liniové geometrie a~směrovosti na výsledky}
+\label{subsec:line-vs-point}
+% NOVÝ EXPERIMENT -- porovnání dvou režimů matchingu uzavírek:
+%
+% a) Bodový matching (starý přístup):
+%   - Uzavírka přiřazena k~nejbližší hraně dle bodu (lat, lon).
+%   - Riziko: u~dlouhých uzavírek zasáhne jen jednu hranu.
+%
+% b) Liniový matching (nový přístup):
+%   - Uzavírka s~line_wkt bufferována a průnik s~hranami sítě.
+%   - Zasáhne všechny hrany, které geometricky protíná.
+%
+% c) Směrový vs. obousměrný režim:
+%   - closure_direction = aligned/opposite → aplikace jen na ab/ba.
+%   - vs. výchozí both → obousměrná redukce.
+%
+% Metriky pro porovnání:
+%   - Počet zasažených link_id (bodový vs. liniový).
+%   - Rozdíl v~ΔVHT a ΔTT pro tentýž scénář.
+%   - Případové studie: uzavírka dlouhé rekonstrukce na silnici I. třídy,
+%     kde bodový matching zasáhne 1 hranu, ale liniový 15+ hran.
+%   - Vizualizace: mapa zasažených hran při obou přístupech.
+
+
+% ============================================================================
+\section{Křížová validace modelu vůči nezávislým datovým zdrojům}
+\label{sec:krizova-validace}
+% ============================================================================
+
+% Cíl: Ověřit predikce modelu pomocí dat, která nebyla použita při kalibraci.
+% Využít bohaté datové zdroje z~PostgreSQL (traffic_jams, accidents,
+% event_links, alerts) jako nezávislé referenční body.
+
+\subsection{Validace dopadů uzavírek pomocí kauzálních vazeb (event\_links)}
+\label{subsec:event-links-validace}
+% KLÍČOVÝ A ORIGINÁLNÍ VALIDAČNÍ PŘÍSTUP.
+%
+% Tabulka event_links mapuje: restriction_id → traffic_jam_id + delay_seconds.
+% Pro vybrané uzavírky tedy ZNÁME:
+%   - Kolik zácp reálně způsobily (jams_caused).
+%   - Na kterých segmentech se zácpy objevily (→ link_id přes road_segments).
+%   - Celkové reálné zpoždění (total_delay_s z~restriction_impact.parquet).
+%
+% Validační postup:
+%   1. Vybrat uzavírky z~experimentů (sec. 8.2), pro které existují event_links.
+%   2. Spustit scénář v~modelu → získat ΔV/C a Δtravel_time na všech hranách.
+%   3. Porovnat:
+%      a) PROSTOROVĚ: Na kterých hranách model predikuje kongesci (ΔV/C > práh)?
+%         Shodují se s~hranami, kde Waze zaznamenal zácpy?
+%         → Precision / Recall analýza: kolik reálných zácp model „odchytil".
+%      b) KVANTITATIVNĚ: Celkový modelový nárůst VHT vs. reálné total_delay_s.
+%         → Scatter plot přes více uzavírek; regrese a R².
+%      c) TOPOLOGICKY: Leží modelové kongesce na stejných alternativních
+%         trasách jako reálné zácpy, nebo model predikuje přesměrování jinam?
+%
+% Očekávání a interpretace:
+%   - Statický model zachytí hlavní přelivy (primární objízdné trasy), ale
+%     nemusí zachytit kaskádové zácpy (ty vyžadují dynamický model).
+%   - I~částečná shoda (>50 \% recall) je pro statický model dobrý výsledek
+%     a potvrzuje praktickou použitelnost.
+
+\subsection{Korelace přetížení modelu s~nehodovými blackspoty}
+\label{subsec:accident-correlation}
+% Myšlenka: Úseky s~vysokým poměrem V/C v~modelu indikují vyšší míru
+% kongesce a tedy potenciálně vyšší nehodovost (rear-end kolize, nehody
+% při řazení, stresové chování řidičů).
+%
+% Postup:
+%   1. Z~accidents agregovat počet nehod per road_segment (→ osm_id → link_id).
+%   2. Modelové V/C z~baseline přiřazení per link.
+%   3. Spearman rank korelace: V/C vs. accident_count per link.
+%   4. Logistická regrese: P(nehoda na linku) ~ V/C + road_type + speed_limit.
+%
+% Rozšíření:
+%   - Rozlišit nehody za mokra (weather_condition = rain/wet) vs. suché podmínky.
+%   - Porovnat s~alerts typu HAZARD -- zda alerty kopírují modelové přetížení.
+%
+% Vizualizace:
+%   - Mapa: překryv heatmapy nehod s~V/C > 0.9 z~modelu.
+%   - Box plot: distribuce accident_count pro kvartily V/C.
+%
+% Význam: Nejde o primární účel dopravního modelu, ale tato korelace dodává
+% důvěryhodnost -- pokud model správně identifikuje přetížené úseky, měl by
+% se to promítnout i do nezávislých dat o nehodovosti.
+
+\subsection{Porovnání modelových a~reálných kongescí v~časových profilech}
+\label{subsec:temporal-profiles}
+% Statický model AequilibraE počítá denní průměr. Porovnání s~časovými profily
+% z~traffic_jams umožňuje posoudit, zda model odpovídá „špičkovému" chování.
+%
+% Postup:
+%   1. Z~traffic_jams agregovat: pro každý segment průměrný počet zácp
+%      a~delay per hodina dne (6--9, 9--15, 15--18, 18--22).
+%   2. Model produkuje denní V/C. Porovnat, zda modelový V/C koreluje
+%      se špičkovou (7--9, 15--17) frekvencí zácp.
+%
+% Hypotéza: Pokud model dobře zachycuje prostorové rozložení poptávky,
+% pak by V/C > 0.8 mělo korelovat se segmenty, kde jsou zácpy nejčastější
+% ve špičkových hodinách.
+%
+% Doplňkový experiment: Pokud bude implementován learn-profile (krok 18 pipeline),
+% porovnat výstup časového profilu modelu s~hodinovou distribucí zácp z~Waze.
+
+
+% ============================================================================
+\section{Citlivostní analýza}
+\label{sec:citlivost}
+% ============================================================================
+
+% Cíl: Ověřit robustnost zjištění při změnách klíčových vstupních parametrů.
+
+\subsection{Citlivost na úroveň poptávky}
+% - Spustit baseline a vybrané scénáře s~O-D maticí škálovanou na 90\,\%
+%   a 110\,\% původní poptávky.
+% - Sledovat: Jak se mění ΔVHT, ΔTT a prostorový vzorec přesměrování?
+% - Očekávání: Při vyšší poptávce budou dopady uzavírek nelineárně horší
+%   (síť je blíže kapacitnímu limitu → menší rezerva pro přesun dopravy).
+% - Vizualizace: graf ΔVHT vs. úroveň poptávky pro vybrané scénáře.
+
+\subsection{Citlivost na parametry severity uzavírky}
+% - Pro stejnou uzavírku variovat capacity_factor (0.0, 0.1, 0.3, 0.5)
+%   a~speed_factor (0.3, 0.5, 0.7, 1.0).
+% - Sledovat nelineární práh: od jakého snížení kapacity dopad skokově roste?
+% - Porovnat plnou uzavírku (full) vs. redukci na 1 pruh (lanes) vs.
+%   pouze snížení rychlosti (speed penalty).
+
+\subsection{Citlivost na quality\_score filtraci uzavírek}
+% - Spustit scénář se všemi uzavírkami (min_quality_score = 0) vs.
+%   jen s~kvalitními (min_quality_score ≥ 70).
+% - Zjistit: Kolik nekvalitních uzavírek zbytečně zatěžuje model?
+%   Mění se výrazně KPI při filtraci?
+
+\subsection{Vliv konvergenčních parametrů přiřazení}
+% - Variovat RGAP toleranci (1e-3, 1e-4, 1e-5) a maximální iterace BFW.
+% - Sledovat stabilitu výsledných Δ-metrik: pokud se ΔVHT liší o~méně
+%   než 1\,\% při zpřísnění konvergence, model je dostatečně konvergovaný.
+
+
+% ============================================================================
+\section{Diskuse zjištění}
+\label{sec:diskuse}
+% ============================================================================
+
+\subsection{Kritické články sítě a~odolnost}
+% - Na základě experimentů identifikovat hrany, jejichž uzavírka způsobuje
+%   největší ΔVHT -- tyto představují kritické články sítě (bottlenecks).
+% - Diskutovat redundanci: oblasti s~více alternativami (centrum, mřížková
+%   zástavba) vs. oblasti s~jedinou přístupovou cestou (mosty, periferní radiály).
+% - Souvislost s~konceptem network resilience z~literatury (Sheffi, Cascetta).
+
+\subsection{Přesnost statického modelu pro hodnocení uzavírek}
+% - Na základě křížové validace (sec.~\ref{sec:krizova-validace}) diskutovat:
+%   - Kde statický model funguje dobře (hlavní přelivy, denní průměry)?
+%   - Kde selhává (dynamické kaskády, špičková kongesce, krátkodobé incidenty)?
+% - Porovnat s~teoretickými limity statického přiřazení z~kapitoly 2.
+% - Navrhnout, kdy je nutné přejít na DTA (dynamické přiřazení).
+
+\subsection{Přínos rozšířených dat pro kvalitu simulace}
+% - Kvantifikovat přínos liniové geometrie vs. bodového matchingu
+%   (z~experimentu \ref{subsec:line-vs-point}): o~kolik se zlepšily KPI?
+% - Přínos směrovosti: Diskutovat případy, kde ignorování směru vedlo
+%   k~nadhodnocení dopadu (uzavírka jednoho směru zbytečně penalizuje oba).
+% - Přínos Waze free-flow rychlostí (sec.~\ref{subsec:freeflow}) pro kalibraci:
+%   umožňují zpřesnit speed_ab/ba na tisících hran, kde OSM data chybí.
+
+\subsection{Praktické implikace pro dopravní plánování}
+% - Jak mohou výsledky sloužit dopravním inženýrům při plánování uzavírek:
+%   - Identifikace nejhorších scénářů ještě před zahájením stavby.
+%   - Odhad objízdných tras a jejich potřebné kapacity.
+%   - Informační strategie pro řidiče (které alternativy doporučit).
+% - Možnost integrace s~řízením SSZ (světelná signalizace) na objízdných trasách.
+% - Vazba na práci Ondruškové: jak vizualizace dopadů v~mapě pomáhá
+%   při komunikaci s~veřejností a stakeholdery.
+
+
+% ============================================================================
+\section{Omezení studie}
+\label{sec:omezeni}
+% ============================================================================
+
+\subsection{Omezení modelu}
+% - Statický přístup: nepodchycuje dynamiku v~čase (ranní náběh, rozptyl
+%   po otevření). Vhodný pro strategické hodnocení, ne pro operativní řízení.
+% - Chybějící módní volba: model pracuje pouze s~individuální automobilovou
+%   dopravou. Přesun cestujících na MHD/kolo není modelován.
+% - Zjednodušení křižovatek: AequilibraE nemodluje detaily křižovatek
+%   (signální plány, kapacity odbočení) -- lokální kongesce v~uzlech
+%   může být podhodnocena.
+% - Homogenní řidiči: v~rámci každé třídy (local/through) identické chování;
+%   heterogenní VOT a informovanost nejsou zohledněny.
+
+\subsection{Omezení dat}
+% - Waze data (traffic_jams, alerts): pokrytí závisí na penetraci aplikace.
+%   Venkovské oblasti a méně frekventované komunikace mohou být podreprezentovány.
+% - Sloupec quality_score v~restrictions: 12\,\% záznamů má NULL.
+%   Data NDIC/DATEX~II mohou obsahovat duplicity nebo zastaralé záznamy.
+% - Accidents: pouze PČR hlášené nehody, nezachycují drobné kolize bez policie.
+% - CSD profily: cca 400 profilů pro Brno -- pokrytí sítě není rovnoměrné,
+%   menší komunikace mohou být pod-reprezentovány.
+% - O-D matice: odvozena ze SLDB 2021 dojížďkových dat -- odráží denní
+%   dojížďku, ne veškerou mobilitu (nákupy, volný čas, nákladní doprava
+%   je řešena pouze odhadem).
+
+\subsection{Přenositelnost a zobecnitelnost}
+% - Metodika (pipeline, scénářové porovnání, validační přístupy) je obecná
+%   a přenositelná na jiná města (viz init-city mechanismus, kap.~7).
+% - Konkrétní kalibrační výsledky a zjištění o~kritických článcích platí
+%   specificky pro Brno a nelze je přímo zobecnit.
+% - Doporučení pro aplikaci na jiné město: minimální požadavky na data
+%   (OSM síť, sčítací profily, O-D seed), ideálně doplnit o~Waze data.

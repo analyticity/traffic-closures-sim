@@ -59,46 +59,46 @@ def apply_supply_params(project_dir: Path, params: SupplyParams) -> int:
     conn = sqlite3.connect(db)
     updated = 0
     try:
-        links = conn.execute(
+        import pandas as _pd
+
+        df = _pd.read_sql(
             "SELECT link_id, link_type, _base_speed_ab, _base_speed_ba, "
-            "_base_capacity_ab, _base_capacity_ba FROM links"
-        ).fetchall()
+            "_base_capacity_ab, _base_capacity_ba, distance FROM links",
+            conn,
+        )
 
-        for lid, lt, bsab, bsba, bcab, bcba in links:
-            lt_str = str(lt or "").lower()
-            sf = params.speed_factors.get(lt_str, 1.0)
-            cf = params.capacity_factors.get(lt_str, 1.0)
+        _ROAD_CLASSES = ("motorway", "trunk", "primary", "secondary", "tertiary", "residential")
 
-            for road_class, factor_s, factor_c in [
-                ("motorway", sf, cf), ("trunk", sf, cf), ("primary", sf, cf),
-                ("secondary", sf, cf), ("tertiary", sf, cf), ("residential", sf, cf),
-            ]:
-                if road_class in lt_str:
-                    sf = params.speed_factors.get(road_class, sf)
-                    cf = params.capacity_factors.get(road_class, cf)
-                    break
+        lt_lower = df["link_type"].fillna("").astype(str).str.lower()
 
-            new_sab = (bsab or 50) * sf
-            new_sba = (bsba or 50) * sf
-            new_cab = (bcab or 900) * cf
-            new_cba = (bcba or 900) * cf
+        sf_arr = lt_lower.map(lambda v: params.speed_factors.get(v, 1.0)).astype(float)
+        cf_arr = lt_lower.map(lambda v: params.capacity_factors.get(v, 1.0)).astype(float)
 
-            tt_ab = 0
-            tt_ba = 0
-            dist = conn.execute(
-                "SELECT distance FROM links WHERE link_id=?", (lid,)
-            ).fetchone()
-            if dist and dist[0] and new_sab > 0:
-                tt_ab = dist[0] * 3.6 / new_sab
-            if dist and dist[0] and new_sba > 0:
-                tt_ba = dist[0] * 3.6 / new_sba
+        for rc in _ROAD_CLASSES:
+            mask = lt_lower.str.contains(rc, regex=False)
+            sf_arr = sf_arr.where(~mask, lt_lower.map(lambda v, _rc=rc: params.speed_factors.get(_rc, params.speed_factors.get(v, 1.0))).astype(float))
+            cf_arr = cf_arr.where(~mask, lt_lower.map(lambda v, _rc=rc: params.capacity_factors.get(_rc, params.capacity_factors.get(v, 1.0))).astype(float))
 
-            conn.execute(
-                "UPDATE links SET speed_ab=?, speed_ba=?, capacity_ab=?, capacity_ba=?, "
-                "travel_time_ab=?, travel_time_ba=? WHERE link_id=?",
-                (new_sab, new_sba, new_cab, new_cba, tt_ab, tt_ba, lid),
-            )
-            updated += 1
+        new_sab = df["_base_speed_ab"].fillna(50).astype(float) * sf_arr
+        new_sba = df["_base_speed_ba"].fillna(50).astype(float) * sf_arr
+        new_cab = df["_base_capacity_ab"].fillna(900).astype(float) * cf_arr
+        new_cba = df["_base_capacity_ba"].fillna(900).astype(float) * cf_arr
+
+        dist = df["distance"].fillna(0).astype(float)
+        tt_ab = _pd.Series(0.0, index=df.index)
+        tt_ba = _pd.Series(0.0, index=df.index)
+        valid_ab = (dist > 0) & (new_sab > 0)
+        valid_ba = (dist > 0) & (new_sba > 0)
+        tt_ab[valid_ab] = dist[valid_ab] * 3.6 / new_sab[valid_ab]
+        tt_ba[valid_ba] = dist[valid_ba] * 3.6 / new_sba[valid_ba]
+
+        updates = list(zip(new_sab, new_sba, new_cab, new_cba, tt_ab, tt_ba, df["link_id"]))
+        conn.executemany(
+            "UPDATE links SET speed_ab=?, speed_ba=?, capacity_ab=?, capacity_ba=?, "
+            "travel_time_ab=?, travel_time_ba=? WHERE link_id=?",
+            updates,
+        )
+        updated = len(updates)
 
         conn.commit()
     finally:

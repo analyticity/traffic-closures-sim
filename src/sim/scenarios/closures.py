@@ -28,7 +28,10 @@ def _match_closures_to_links(
     require_road_ref_match: bool = False,
     metric_epsg: int = 5514,
 ) -> Dict[int, List[Dict[str, Any]]]:
-    """Spatially match closure points to the nearest network links.
+    """Spatially match closures to network links.
+
+    Uses line geometry (``line_geom``) when available for accurate
+    multi-link matching; falls back to point matching otherwise.
 
     Returns ``{link_id: [closure_dict, ...]}``.  When multiple closures
     hit the same link the most severe one wins during scenario generation,
@@ -37,11 +40,12 @@ def _match_closures_to_links(
     if not closures:
         return {}
 
-    closure_pts = gpd.GeoDataFrame(
-        closures,
-        geometry=[Point(float(c.get("lon", 0)), float(c.get("lat", 0))) for c in closures],
-        crs="EPSG:4326",
-    ).to_crs(epsg=metric_epsg)
+    import pyproj
+    from shapely.ops import transform
+
+    transformer = pyproj.Transformer.from_crs(
+        "EPSG:4326", f"EPSG:{metric_epsg}", always_xy=True,
+    )
 
     gdf = link_gdf.copy()
     if gdf.crs is None:
@@ -54,18 +58,20 @@ def _match_closures_to_links(
     link_closures: Dict[int, List[Dict[str, Any]]] = {}
     sindex = gdf.sindex
 
-    for idx, cpt in closure_pts.iterrows():
-        geom = cpt.geometry
-        if geom is None or geom.is_empty:
-            continue
-
-        closure_dict = closures[int(idx)]
+    for closure_dict in closures:
         closure_ref = str(closure_dict.get("road_ref", "") or "").strip()
+        line_geom = closure_dict.get("line_geom")
 
-        candidates = sindex.query(geom.buffer(max_distance_m), predicate="intersects")
-        if len(candidates) == 0:
-            nn = sindex.nearest(geom, max_distance=max_distance_m)
-            candidates = nn[1] if nn.ndim == 2 and nn.shape[0] == 2 else nn.ravel()
+        if line_geom is not None and not line_geom.is_empty:
+            proj_geom = transform(transformer.transform, line_geom)
+            candidates = sindex.query(proj_geom.buffer(max_distance_m), predicate="intersects")
+        else:
+            pt = Point(float(closure_dict.get("lon", 0)), float(closure_dict.get("lat", 0)))
+            proj_geom = transform(transformer.transform, pt)
+            candidates = sindex.query(proj_geom.buffer(max_distance_m), predicate="intersects")
+            if len(candidates) == 0:
+                nn = sindex.nearest(proj_geom, max_distance=max_distance_m)
+                candidates = nn[1] if nn.ndim == 2 and nn.shape[0] == 2 else nn.ravel()
 
         for cidx in candidates:
             row = gdf.iloc[int(cidx)]
@@ -215,9 +221,17 @@ def closures_for_date(
                 lanes_remaining = max(lanes - 1, 1)
 
         first = cl_list[0]
+        raw_dir = str(first.get("closure_direction", "") or "").strip().lower()
+        if raw_dir == "aligned":
+            link_direction = "ab"
+        elif raw_dir == "opposite":
+            link_direction = "ba"
+        else:
+            link_direction = "both"
+
         results.append({
             "link_id": lid,
-            "direction": "both",
+            "direction": link_direction,
             "closure_type": closure_type,
             "lanes": lanes,
             "lanes_remaining": lanes_remaining,

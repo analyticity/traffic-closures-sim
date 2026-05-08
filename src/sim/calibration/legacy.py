@@ -22,6 +22,7 @@ from sim.calibration.context import (
     _ensure_dir,
     _sr_val,
 )
+from sim.calibration.state import CalibrationState
 from sim.calibration.matching import match_counts_to_links, match_quality_report
 from sim.calibration.metrics import (
     compute_stats,
@@ -785,6 +786,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
             else:
                 logger.warning("  Cannot scale — no valid matched volumes")
 
+            ctx._transition(CalibrationState.PERSIST_CHECKPOINT)
             mat.save()
 
     finally:

@@ -61,6 +61,25 @@ _CZ_DEFAULT_SOURCES: Dict[str, Dict[str, Any]] = {
         "min_observed_days": 2,
         "usage": {"calibration_target": "baseline_closures"},
     },
+    "traffic_jams_pg": {
+        "enabled": True,
+        "provider": "postgres_jams",
+        "table": "traffic_jams",
+        "segments_table": "road_segments",
+        "usage": {"speed_calibration": "free_flow_speeds", "validation": "jam_statistics"},
+    },
+    "road_segments_pg": {
+        "enabled": True,
+        "provider": "postgres_segments",
+        "table": "road_segments",
+        "usage": {"segment_matching": "osm_id_lookup"},
+    },
+    "event_links_pg": {
+        "enabled": True,
+        "provider": "postgres_event_links",
+        "table": "event_links",
+        "usage": {"impact_analysis": "restriction_jam_impact"},
+    },
     "cz_roads_major_pbf": {
         "enabled": True,
         "provider": "http_file",

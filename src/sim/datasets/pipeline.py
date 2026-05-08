@@ -27,6 +27,9 @@ from sim.datasets.centroids import (
     preprocess_grouped_points_zip_to_centroids,
 )
 from sim.datasets.closures_fetch import fetch_postgres_closures
+from sim.datasets.jams_fetch import fetch_postgres_jams
+from sim.datasets.segments_fetch import fetch_postgres_segments
+from sim.datasets.event_links_fetch import fetch_postgres_event_links
 from sim.datasets.employment import derive_zone_employment
 
 logger = logging.getLogger(__name__)
@@ -247,6 +250,12 @@ def run_fetch_datasets(
                 info = _handle_atom_file(scfg, cache_dir=cache_dir, timeout_s=timeout_s, retries=retries, headers=headers, force=force)
             elif provider == "postgres_closures":
                 info = fetch_postgres_closures(cfg, scfg, force=force)
+            elif provider == "postgres_jams":
+                info = fetch_postgres_jams(cfg, scfg, force=force)
+            elif provider == "postgres_segments":
+                info = fetch_postgres_segments(cfg, scfg, force=force)
+            elif provider == "postgres_event_links":
+                info = fetch_postgres_event_links(cfg, scfg, force=force)
             else:
                 raise ValueError(f"Unknown provider '{provider}' for source '{key}'")
         except Exception as exc:

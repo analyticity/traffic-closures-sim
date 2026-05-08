@@ -110,8 +110,10 @@ def export_map_png(
         return
 
     out_dpi = int(dpi) if dpi is not None else NETWORK_MAP_EXPORT_DPI
-    fig_w, fig_h = NETWORK_MAP_EXPORT_FIGSIZE
-    title_pt = max(14.0, min(24.0, float(fig_w) * 1.05))
+    _base_w, _base_h = NETWORK_MAP_EXPORT_FIGSIZE
+    fig_w = max(_base_w, 20.0)
+    fig_h = max(_base_h, 15.0)
+    title_pt = max(18.0, min(28.0, float(fig_w) * 1.1))
 
     if zones.empty:
         logger.warning("no zones, skipping map export")
@@ -160,11 +162,11 @@ def export_map_png(
     maxx0 = max(float(sx2), float(zx2))
     maxy0 = max(float(sy2), float(zy2))
 
-    margin_ratio = 0.02
+    margin_ratio = 0.01
     w = maxx0 - minx0
     h = maxy0 - miny0
-    margin_x = max(w * margin_ratio, 50.0)
-    margin_y = max(h * margin_ratio, 50.0)
+    margin_x = max(w * margin_ratio, 30.0)
+    margin_y = max(h * margin_ratio, 30.0)
 
     minx = minx0 - margin_x
     maxx = maxx0 + margin_x
@@ -283,11 +285,11 @@ def export_map_png(
         external_centroids.plot(
             ax=ax,
             color=_EXIT_PURPLE,
-            edgecolors=_NET_FG,
-            linewidths=1.25,
-            markersize=56,
+            edgecolors="white",
+            linewidths=1.6,
+            markersize=90,
             marker="X",
-            zorder=15,
+            zorder=25,
         )
 
     _gw_corridor_color = "#C0392B"
@@ -355,7 +357,7 @@ def export_map_png(
         fontsize=title_pt,
         fontweight="bold",
         color=NETWORK_MAP_PALETTE["title"],
-        pad=20,
+        pad=12,
     )
 
     legend_handles: List[Any] = [
@@ -442,10 +444,12 @@ def export_map_png(
     ax.legend(
         handles=legend_handles,
         loc="upper left",
-        bbox_to_anchor=(1.14, 1.02),
-        borderaxespad=0.75,
+        bbox_to_anchor=(1.01, 1.0),
+        borderaxespad=0.3,
         framealpha=0.96,
-        fontsize=max(9.5, title_pt * 0.52),
+        fontsize=max(13.0, title_pt * 0.58),
+        handlelength=2.0,
+        labelspacing=0.6,
     )
 
     ax.set_axis_off()
@@ -457,7 +461,7 @@ def export_map_png(
         dpi=out_dpi,
         bbox_inches="tight",
         facecolor=NETWORK_MAP_PALETTE["figure"],
-        pad_inches=0.55,
+        pad_inches=0.15,
     )
     plt.close(fig)
     logger.info("map: %s", png_path)

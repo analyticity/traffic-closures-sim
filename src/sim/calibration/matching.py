@@ -61,6 +61,10 @@ def _aggregate_corridor_volumes(
 
     has_sindex = hasattr(links, "sindex")
 
+    lid_to_idx: dict = {}
+    for _i, _lid_val in enumerate(link_lid):
+        lid_to_idx.setdefault(int(_lid_val), _i)
+
     for idx, row in joined.iterrows():
         if pd.isna(row.get("link_id")):
             continue
@@ -68,11 +72,9 @@ def _aggregate_corridor_volumes(
         count_pt = row.geometry
         matched_lt = str(row.get("link_type", ""))
 
-        matched_idx_in_links = np.where(link_lid == matched_lid)[0]
-        if len(matched_idx_in_links) == 0:
+        mi = lid_to_idx.get(matched_lid)
+        if mi is None:
             continue
-
-        mi = matched_idx_in_links[0]
         matched_direction = int(link_dir[mi])
 
         if matched_direction == 0:

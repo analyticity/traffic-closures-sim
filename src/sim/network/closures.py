@@ -3,6 +3,14 @@
 Closures reduce capacity and speed of matched network links.
 Pre-closure values are stored in ``_preclosure_*`` DB columns for
 later restoration by :func:`strip_closures`.
+
+Line-geometry matching (when ``line_wkt`` is present) walks the full
+extent of a closure and matches all intersecting links -- far more
+accurate than point-only matching for long restrictions.
+
+Direction-aware application uses the ``closure_direction`` field
+(``aligned`` / ``opposite``) to only penalise the affected travel
+direction on bidirectional links.
 """
 from __future__ import annotations
 
@@ -10,7 +18,7 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import geopandas as gpd
 import pandas as pd
@@ -97,28 +105,35 @@ def _write_closure_state_to_db(
 ) -> None:
     """Persist closure-modified attributes and pre-closure backup to the DB."""
     _ensure_preclosure_columns(conn)
-    cur = conn.cursor()
-    for _, row in links_gdf.iterrows():
-        cap_ab = _safe_float(row["capacity_ab"])
-        cap_ba = _safe_float(row["capacity_ba"])
-        spd_ab = _safe_float(row["speed_ab"], 5.0)
-        spd_ba = _safe_float(row["speed_ba"], 5.0)
-        tt_ab = _safe_float(row["travel_time_ab"], 0.01)
-        tt_ba = _safe_float(row["travel_time_ba"], 0.01)
-        pc_cap_ab = _safe_float(row.get("_preclosure_capacity_ab", cap_ab), cap_ab)
-        pc_cap_ba = _safe_float(row.get("_preclosure_capacity_ba", cap_ba), cap_ba)
-        pc_spd_ab = _safe_float(row.get("_preclosure_speed_ab", spd_ab), spd_ab)
-        pc_spd_ba = _safe_float(row.get("_preclosure_speed_ba", spd_ba), spd_ba)
-        cur.execute(
-            "UPDATE links SET capacity_ab=?, capacity_ba=?, speed_ab=?, speed_ba=?, "
-            "travel_time_ab=?, travel_time_ba=?, "
-            "_preclosure_capacity_ab=?, _preclosure_capacity_ba=?, "
-            "_preclosure_speed_ab=?, _preclosure_speed_ba=? "
-            "WHERE link_id=?",
-            (cap_ab, cap_ba, spd_ab, spd_ba, tt_ab, tt_ba,
-             pc_cap_ab, pc_cap_ba, pc_spd_ab, pc_spd_ba,
-             int(row["link_id"])),
-        )
+
+    def _col_safe(series: pd.Series, fallback: float) -> pd.Series:
+        return pd.to_numeric(series, errors="coerce").fillna(fallback)
+
+    df = links_gdf.copy()
+    df["_cap_ab"] = _col_safe(df["capacity_ab"], 50.0)
+    df["_cap_ba"] = _col_safe(df["capacity_ba"], 50.0)
+    df["_spd_ab"] = _col_safe(df["speed_ab"], 5.0)
+    df["_spd_ba"] = _col_safe(df["speed_ba"], 5.0)
+    df["_tt_ab"] = _col_safe(df["travel_time_ab"], 0.01)
+    df["_tt_ba"] = _col_safe(df["travel_time_ba"], 0.01)
+    df["_pc_cap_ab"] = _col_safe(df.get("_preclosure_capacity_ab", df["_cap_ab"]), 50.0)
+    df["_pc_cap_ba"] = _col_safe(df.get("_preclosure_capacity_ba", df["_cap_ba"]), 50.0)
+    df["_pc_spd_ab"] = _col_safe(df.get("_preclosure_speed_ab", df["_spd_ab"]), 5.0)
+    df["_pc_spd_ba"] = _col_safe(df.get("_preclosure_speed_ba", df["_spd_ba"]), 5.0)
+
+    rows = df[["_cap_ab", "_cap_ba", "_spd_ab", "_spd_ba",
+               "_tt_ab", "_tt_ba",
+               "_pc_cap_ab", "_pc_cap_ba", "_pc_spd_ab", "_pc_spd_ba",
+               "link_id"]].values.tolist()
+
+    conn.cursor().executemany(
+        "UPDATE links SET capacity_ab=?, capacity_ba=?, speed_ab=?, speed_ba=?, "
+        "travel_time_ab=?, travel_time_ba=?, "
+        "_preclosure_capacity_ab=?, _preclosure_capacity_ba=?, "
+        "_preclosure_speed_ab=?, _preclosure_speed_ba=? "
+        "WHERE link_id=?",
+        rows,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +177,18 @@ def load_closures(
         logger.info("Closures file is empty")
         return []
 
+    from shapely import wkt as _wkt
+
+    for c in closures:
+        lw = c.get("line_wkt")
+        if lw and str(lw).strip():
+            try:
+                c["line_geom"] = _wkt.loads(str(lw))
+            except Exception:
+                c["line_geom"] = None
+        else:
+            c["line_geom"] = None
+
     total = len(closures)
     if measurement_period:
         p_start = measurement_period.get("start", "1900-01-01")
@@ -180,6 +207,74 @@ def load_closures(
     return closures
 
 
+def _match_closure_to_links(
+    closure: Dict[str, Any],
+    link_gdf: gpd.GeoDataFrame,
+    sindex: Any,
+    *,
+    max_dist_m: float,
+    require_ref: bool,
+    link_ref_col: Optional[str],
+    metric_epsg: int,
+) -> List[int]:
+    """Return link_ids matched by a single closure (line or point)."""
+    from shapely.geometry import Point
+
+    sev = str(closure.get("severity", "lane_reduction"))
+    closure_ref = str(closure.get("road_ref", "") or "").strip()
+
+    line_geom = closure.get("line_geom")
+    if line_geom is not None and not line_geom.is_empty:
+        from shapely.ops import transform
+        import pyproj
+
+        transformer = pyproj.Transformer.from_crs(
+            "EPSG:4326", f"EPSG:{metric_epsg}", always_xy=True,
+        )
+        proj_line = transform(transformer.transform, line_geom)
+        candidates = sindex.query(proj_line.buffer(max_dist_m), predicate="intersects")
+    else:
+        pt = Point(float(closure.get("lon", 0)), float(closure.get("lat", 0)))
+        from shapely.ops import transform
+        import pyproj
+
+        transformer = pyproj.Transformer.from_crs(
+            "EPSG:4326", f"EPSG:{metric_epsg}", always_xy=True,
+        )
+        proj_pt = transform(transformer.transform, pt)
+        candidates = sindex.query(proj_pt.buffer(max_dist_m), predicate="intersects")
+        if len(candidates) == 0:
+            nn = sindex.nearest(proj_pt, max_distance=max_dist_m)
+            candidates = nn[1] if nn.ndim == 2 and nn.shape[0] == 2 else nn.ravel()
+
+    matched: List[int] = []
+    for cidx in candidates:
+        row = link_gdf.iloc[int(cidx)]
+        lid = int(row["link_id"])
+        if closure_ref and link_ref_col:
+            link_ref = str(row.get(link_ref_col, "") or "").strip()
+            if require_ref and closure_ref and link_ref and closure_ref != link_ref:
+                continue
+        matched.append(lid)
+    return matched
+
+
+# Direction string from the DB -> which side(s) to penalise.
+_DIR_AB = "ab"
+_DIR_BA = "ba"
+_DIR_BOTH = "both"
+
+
+def _resolve_closure_direction(closure: Dict[str, Any]) -> str:
+    """Map ``closure_direction`` to ``ab`` / ``ba`` / ``both``."""
+    raw = str(closure.get("closure_direction", "") or "").strip().lower()
+    if raw == "aligned":
+        return _DIR_AB
+    if raw == "opposite":
+        return _DIR_BA
+    return _DIR_BOTH
+
+
 def apply_baseline_closures(
     links: pd.DataFrame,
     closures: List[Dict[str, Any]],
@@ -187,11 +282,13 @@ def apply_baseline_closures(
 ) -> pd.DataFrame:
     """Match closures to network links and reduce capacity/speed.
 
+    Uses line geometry when available for accurate multi-link matching.
+    Respects ``closure_direction`` (aligned/opposite) to only penalise
+    the affected travel direction.
+
     Stores pre-closure values in ``_preclosure_*`` columns for later
     restoration by :func:`strip_closures`.
     """
-    from shapely.geometry import Point
-
     bc_cfg = cfg.get("baseline_closures") or {}
     match_cfg = bc_cfg.get("matching") or {}
     severity_map = bc_cfg.get("severity_map") or {}
@@ -212,51 +309,49 @@ def apply_baseline_closures(
             if nan_mask.any():
                 links.loc[nan_mask, col] = links.loc[nan_mask, src]
 
-    closure_pts = gpd.GeoDataFrame(
-        closures,
-        geometry=[Point(float(c.get("lon", 0)), float(c.get("lat", 0))) for c in closures],
-        crs="EPSG:4326",
-    ).to_crs(epsg=metric_epsg)
-
     link_gdf = _prepare_link_gdf(links, metric_epsg)
     link_ref_col = "osm_ref_norm" if (link_gdf is not None and "osm_ref_norm" in link_gdf.columns) else None
 
-    affected_link_ids: Dict[int, str] = {}
+    # Maps link_id -> (severity, direction)
+    affected_link_ids: Dict[int, Tuple[str, str]] = {}
+    n_line_matched = 0
 
     if link_gdf is not None and not link_gdf.geometry.isna().all():
         sindex = link_gdf.sindex
-        for _, cpt in closure_pts.iterrows():
-            geom = cpt.geometry
-            if geom is None or geom.is_empty:
-                continue
-            sev = str(cpt.get("severity", "lane_reduction"))
-            closure_ref = str(cpt.get("road_ref", "") or "").strip()
+        for closure in closures:
+            sev = str(closure.get("severity", "lane_reduction"))
+            direction = _resolve_closure_direction(closure)
+            has_line = closure.get("line_geom") is not None
 
-            candidates = sindex.query(geom.buffer(max_dist_m), predicate="intersects")
-            if len(candidates) == 0:
-                nn = sindex.nearest(geom, max_distance=max_dist_m)
-                candidates = nn[1] if nn.ndim == 2 and nn.shape[0] == 2 else nn.ravel()
+            matched_lids = _match_closure_to_links(
+                closure, link_gdf, sindex,
+                max_dist_m=max_dist_m,
+                require_ref=require_ref,
+                link_ref_col=link_ref_col,
+                metric_epsg=metric_epsg,
+            )
 
-            for cidx in candidates:
-                row = link_gdf.iloc[int(cidx)]
-                lid = int(row["link_id"])
-                if closure_ref and link_ref_col:
-                    link_ref = str(row.get(link_ref_col, "") or "").strip()
-                    if require_ref and closure_ref and link_ref and closure_ref != link_ref:
-                        continue
-                if lid not in affected_link_ids or sev == "full":
-                    affected_link_ids[lid] = sev
+            if has_line and matched_lids:
+                n_line_matched += 1
+
+            for lid in matched_lids:
+                existing = affected_link_ids.get(lid)
+                if existing is None or sev == "full":
+                    affected_link_ids[lid] = (sev, direction)
     else:
         logger.warning("No link geometries available for spatial closure matching")
 
+    logger.info(
+        "Closure matching: %d closures matched via line geometry",
+        n_line_matched,
+    )
+
     if not affected_link_ids:
-        if link_gdf is not None and len(closure_pts) > 0:
+        if link_gdf is not None and len(closures) > 0:
             lb = link_gdf.total_bounds
-            cb = closure_pts.total_bounds
             logger.debug(
-                "No closures matched (link bounds [%.0f,%.0f,%.0f,%.0f], "
-                "closure bounds [%.0f,%.0f,%.0f,%.0f], buffer %sm)",
-                lb[0], lb[1], lb[2], lb[3], cb[0], cb[1], cb[2], cb[3], max_dist_m,
+                "No closures matched (link bounds [%.0f,%.0f,%.0f,%.0f], buffer %sm)",
+                lb[0], lb[1], lb[2], lb[3], max_dist_m,
             )
         else:
             logger.info("No closures matched to network links")
@@ -274,22 +369,47 @@ def apply_baseline_closures(
         if col in links.columns:
             links[col] = links[col].astype(float)
 
-    for lid, sev in affected_link_ids.items():
-        sev_cfg = severity_map.get(sev, severity_map.get("lane_reduction", {}))
-        cap_factor = float(sev_cfg.get("capacity_factor", 0.5))
-        spd_factor = float(sev_cfg.get("speed_factor", 0.7))
-        mask = links["link_id"] == lid
-        if not mask.any():
-            continue
-        links.loc[mask, "capacity_ab"] = links.loc[mask, "_preclosure_capacity_ab"] * cap_factor
-        links.loc[mask, "capacity_ba"] = links.loc[mask, "_preclosure_capacity_ba"] * cap_factor
-        links.loc[mask, "speed_ab"] = links.loc[mask, "_preclosure_speed_ab"] * spd_factor
-        links.loc[mask, "speed_ba"] = links.loc[mask, "_preclosure_speed_ba"] * spd_factor
+    # Vectorised closure application (avoids O(n_affected * n_links) per-row scan)
+    closure_df = pd.DataFrame(
+        [
+            (lid, sev, direction)
+            for lid, (sev, direction) in affected_link_ids.items()
+        ],
+        columns=["link_id", "severity", "direction"],
+    )
+    closure_df["cap_factor"] = closure_df["severity"].map(
+        lambda s: float(severity_map.get(s, severity_map.get("lane_reduction", {})).get("capacity_factor", 0.5))
+    )
+    closure_df["spd_factor"] = closure_df["severity"].map(
+        lambda s: float(severity_map.get(s, severity_map.get("lane_reduction", {})).get("speed_factor", 0.7))
+    )
 
-        for tt_col, spd_col in [("travel_time_ab", "speed_ab"), ("travel_time_ba", "speed_ba")]:
-            sub = mask & (links[spd_col] > 0)
-            if sub.any():
-                links.loc[sub, tt_col] = links.loc[sub, "distance"] * 3.6 / links.loc[sub, spd_col]
+    idx = links.set_index("link_id", drop=False)
+    common_ids = closure_df["link_id"][closure_df["link_id"].isin(idx.index)]
+    closure_df = closure_df[closure_df["link_id"].isin(common_ids)].set_index("link_id")
+
+    affected_idx = idx.index.isin(closure_df.index)
+    af = idx.loc[affected_idx].copy()
+    cf = closure_df.reindex(af.index)
+
+    apply_ab = cf["direction"].isin((_DIR_AB, _DIR_BOTH))
+    apply_ba = cf["direction"].isin((_DIR_BA, _DIR_BOTH))
+
+    if apply_ab.any():
+        af.loc[apply_ab, "capacity_ab"] = af.loc[apply_ab, "_preclosure_capacity_ab"] * cf.loc[apply_ab, "cap_factor"]
+        af.loc[apply_ab, "speed_ab"] = af.loc[apply_ab, "_preclosure_speed_ab"] * cf.loc[apply_ab, "spd_factor"]
+    if apply_ba.any():
+        af.loc[apply_ba, "capacity_ba"] = af.loc[apply_ba, "_preclosure_capacity_ba"] * cf.loc[apply_ba, "cap_factor"]
+        af.loc[apply_ba, "speed_ba"] = af.loc[apply_ba, "_preclosure_speed_ba"] * cf.loc[apply_ba, "spd_factor"]
+
+    for tt_col, spd_col in [("travel_time_ab", "speed_ab"), ("travel_time_ba", "speed_ba")]:
+        valid = af[spd_col] > 0
+        if valid.any():
+            af.loc[valid, tt_col] = af.loc[valid, "distance"] * 3.6 / af.loc[valid, spd_col]
+
+    links.set_index("link_id", inplace=True, drop=False)
+    links.update(af[["capacity_ab", "capacity_ba", "speed_ab", "speed_ba", "travel_time_ab", "travel_time_ba"]])
+    links.reset_index(drop=True, inplace=True)
 
     min_cap, min_spd = 50.0, 5.0
     for col in ("capacity_ab", "capacity_ba"):
@@ -303,20 +423,31 @@ def apply_baseline_closures(
             links[col] = links[col].fillna(min_spd)
             logger.warning("Filled %d NaN values in %s with %s", n_nan, col, min_spd)
 
-    full_count = sum(1 for s in affected_link_ids.values() if s == "full")
+    full_count = sum(1 for s, _ in affected_link_ids.values() if s == "full")
+    dir_ab = sum(1 for _, d in affected_link_ids.values() if d == _DIR_AB)
+    dir_ba = sum(1 for _, d in affected_link_ids.values() if d == _DIR_BA)
+    dir_both = sum(1 for _, d in affected_link_ids.values() if d == _DIR_BOTH)
     logger.info(
-        "Applied %d baseline closures (%d full, %d partial)",
+        "Applied %d baseline closures (%d full, %d partial; direction: %d ab, %d ba, %d both)",
         len(affected_link_ids), full_count, len(affected_link_ids) - full_count,
+        dir_ab, dir_ba, dir_both,
     )
 
     manifest_links = []
-    for lid, sev in affected_link_ids.items():
-        row_mask = links["link_id"] == lid
-        if not row_mask.any():
+    links_idx = links.set_index("link_id", drop=False)
+    has_preclosure = "_preclosure_capacity_ab" in links.columns
+    for lid, (sev, direction) in affected_link_ids.items():
+        if lid not in links_idx.index:
             continue
-        row = links.loc[row_mask].iloc[0]
-        entry: Dict[str, Any] = {"link_id": int(lid), "severity": sev}
-        if "_preclosure_capacity_ab" in links.columns:
+        entry: Dict[str, Any] = {
+            "link_id": int(lid),
+            "severity": sev,
+            "direction": direction,
+        }
+        if has_preclosure:
+            row = links_idx.loc[lid]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
             entry["preclosure_cap_ab"] = round(float(row["_preclosure_capacity_ab"]), 1)
             entry["postclosure_cap_ab"] = round(float(row["capacity_ab"]), 1)
         manifest_links.append(entry)
@@ -326,6 +457,7 @@ def apply_baseline_closures(
         "n_links_affected": len(affected_link_ids),
         "n_full": full_count,
         "n_partial": len(affected_link_ids) - full_count,
+        "n_line_geometry_matched": n_line_matched,
         "affected_links": manifest_links,
     }
 

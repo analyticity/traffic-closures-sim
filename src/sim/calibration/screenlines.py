@@ -403,9 +403,21 @@ def _get_link_volume(
     link_id: int,
     direction: int,
     vol_col: str,
+    _vol_idx: Optional[pd.DataFrame] = None,
 ) -> float:
-    """Get modeled volume for a link, respecting direction."""
-    rows = vol_df[vol_df["link_id"] == link_id]
+    """Get modeled volume for a link, respecting direction.
+
+    Pass *_vol_idx* (vol_df indexed by link_id) to avoid repeated O(N) scans.
+    """
+    idx = _vol_idx if _vol_idx is not None else vol_df
+    if _vol_idx is None:
+        rows = vol_df[vol_df["link_id"] == link_id]
+    else:
+        try:
+            rows = idx.loc[[link_id]]
+        except KeyError:
+            return 0.0
+
     if rows.empty:
         return 0.0
 
@@ -428,9 +440,20 @@ def _get_link_observed(
     matched: gpd.GeoDataFrame,
     link_id: int,
     obs_col: str,
+    _obs_idx: Optional[pd.DataFrame] = None,
 ) -> float:
-    """Get observed count for a link from the matched counts DataFrame."""
-    rows = matched[matched["link_id"] == link_id] if "link_id" in matched.columns else pd.DataFrame()
+    """Get observed count for a link from the matched counts DataFrame.
+
+    Pass *_obs_idx* (matched indexed by link_id) to avoid repeated O(N) scans.
+    """
+    if _obs_idx is not None:
+        try:
+            rows = _obs_idx.loc[[link_id]]
+        except KeyError:
+            return 0.0
+    else:
+        rows = matched[matched["link_id"] == link_id] if "link_id" in matched.columns else pd.DataFrame()
+
     if rows.empty:
         return 0.0
     if obs_col not in rows.columns:
@@ -455,9 +478,16 @@ def evaluate_screenline(
     obs_total = 0.0
     per_link: List[Dict[str, Any]] = []
 
+    vol_idx = vol_df.set_index("link_id", drop=False) if "link_id" in vol_df.columns else vol_df
+    obs_idx = (
+        matched_counts.set_index("link_id", drop=False)
+        if "link_id" in matched_counts.columns
+        else matched_counts
+    )
+
     for link_id, direction in resolved:
-        mv = _get_link_volume(vol_df, link_id, direction, vol_col)
-        ov = _get_link_observed(matched_counts, link_id, obs_col)
+        mv = _get_link_volume(vol_df, link_id, direction, vol_col, _vol_idx=vol_idx)
+        ov = _get_link_observed(matched_counts, link_id, obs_col, _obs_idx=obs_idx)
         mod_total += mv
         obs_total += ov
         per_link.append({
@@ -625,6 +655,12 @@ def auto_generate_screenlines(
                         pass
                     break
 
+            node_to_link_rows: dict = {}
+            if links_gdf is not None:
+                for i, (a, b) in enumerate(zip(links_gdf["a_node"].values, links_gdf["b_node"].values)):
+                    node_to_link_rows.setdefault(int(a), []).append(i)
+                    node_to_link_rows.setdefault(int(b), []).append(i)
+
             for _, row in gw_df.iterrows():
                 gw_name = str(row.get("gateway_name", ""))
                 if not gw_name:
@@ -650,10 +686,8 @@ def auto_generate_screenlines(
 
                     if tnodes:
                         for nid in tnodes:
-                            adj = links_gdf[
-                                (links_gdf["a_node"] == nid)
-                                | (links_gdf["b_node"] == nid)
-                            ]
+                            adj_idxs = node_to_link_rows.get(nid, [])
+                            adj = links_gdf.iloc[adj_idxs]
                             if ref:
                                 ref_lower = ref.lower()
                                 adj = adj[adj["osm_ref_norm"].apply(

@@ -27,13 +27,3 @@ experiment_profiles:
     speed_floors:
       trunk: 70.0
       primary: 55.0
-    time_penalties:
-      trunk: 2.0
-      trunk_link: 4.0
-      primary: 3.0
-      primary_link: 5.0
-      secondary: 5.0
-      secondary_link: 5.0
-      tertiary: 7.0
-      tertiary_link: 6.0
-      residential: 6.0

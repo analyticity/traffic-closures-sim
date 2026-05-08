@@ -30,8 +30,10 @@ def plot_overview(edges_metric: gpd.GeoDataFrame, model_area: gpd.GeoDataFrame, 
     from matplotlib.lines import Line2D
 
     ensure_dir(out_png.parent)
-    fig_w, fig_h = NETWORK_MAP_EXPORT_FIGSIZE
-    title_pt = max(14.0, min(24.0, float(fig_w) * 1.05))
+    _base_w, _base_h = NETWORK_MAP_EXPORT_FIGSIZE
+    fig_w = max(_base_w, 20.0)
+    fig_h = max(_base_h, 15.0)
+    title_pt = max(18.0, min(28.0, float(fig_w) * 1.1))
 
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor=NETWORK_MAP_PALETTE["figure"])
     ax.set_facecolor(NETWORK_MAP_PALETTE["figure"])
@@ -54,7 +56,7 @@ def plot_overview(edges_metric: gpd.GeoDataFrame, model_area: gpd.GeoDataFrame, 
         color=NETWORK_MAP_PALETTE["title"],
         fontsize=title_pt,
         fontweight="bold",
-        pad=18,
+        pad=12,
     )
     legend_handles = [
         Line2D(
@@ -90,13 +92,29 @@ def plot_overview(edges_metric: gpd.GeoDataFrame, model_area: gpd.GeoDataFrame, 
             label="Connector units",
         ),
     ]
-    ax.legend(handles=legend_handles, loc="upper right", framealpha=0.95)
+    legend_fs = max(13.0, title_pt * 0.58)
+    ax.legend(
+        handles=legend_handles,
+        loc="upper right",
+        framealpha=0.96,
+        fontsize=legend_fs,
+        handlelength=2.0,
+        labelspacing=0.6,
+    )
     ax.set_axis_off()
+
+    sx, sy, sx2, sy2 = edges_metric.total_bounds
+    pad_x = (sx2 - sx) * 0.01
+    pad_y = (sy2 - sy) * 0.01
+    ax.set_xlim(sx - pad_x, sx2 + pad_x)
+    ax.set_ylim(sy - pad_y, sy2 + pad_y)
+    ax.set_aspect("equal", adjustable="box")
+
     fig.savefig(
         out_png,
         dpi=NETWORK_MAP_EXPORT_DPI,
         bbox_inches="tight",
         facecolor=NETWORK_MAP_PALETTE["figure"],
-        pad_inches=0.05,
+        pad_inches=0.15,
     )
     plt.close(fig)

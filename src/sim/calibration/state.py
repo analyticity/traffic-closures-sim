@@ -33,11 +33,12 @@ TRANSITIONS: Dict[CalibrationState, Set[CalibrationState]] = {
     CalibrationState.MATCH: {CalibrationState.EVALUATE, CalibrationState.DEGRADED_INPUT},
     CalibrationState.EVALUATE: {
         CalibrationState.UPDATE_DEMAND,
+        CalibrationState.PERSIST_CHECKPOINT,
         CalibrationState.FINALIZE_BEST,
         CalibrationState.STALLED,
     },
     CalibrationState.UPDATE_DEMAND: {CalibrationState.PERSIST_CHECKPOINT, CalibrationState.FAILED},
-    CalibrationState.PERSIST_CHECKPOINT: {CalibrationState.ASSIGN},
+    CalibrationState.PERSIST_CHECKPOINT: {CalibrationState.ASSIGN, CalibrationState.FINALIZE_BEST},
     CalibrationState.FINALIZE_BEST: {CalibrationState.FINALIZE_SUCCESS, CalibrationState.FAILED},
     CalibrationState.STALLED: {CalibrationState.FINALIZE_BEST},
     CalibrationState.DEGRADED_INPUT: {CalibrationState.EVALUATE},

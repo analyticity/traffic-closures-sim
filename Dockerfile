@@ -18,6 +18,7 @@ COPY run.py ./
 COPY config/ config/
 COPY scripts/ scripts/
 COPY scenarios/ scenarios/
+COPY experiments/ experiments/
 
 RUN pip install --no-cache-dir -e ".[geo]"
 
@@ -45,6 +46,8 @@ RUN python run.py --config "config/${CITY}/sim.yaml" check \
     && python run.py --config "config/${CITY}/sim.yaml" calibrate \
     && python run.py --config "config/${CITY}/sim.yaml" validate \
     && python run.py --config "config/${CITY}/sim.yaml" learn-profile
+
+RUN python experiments/run_all.py --config "config/${CITY}/sim.yaml"
 
 # ---- Stage 3: Final image ----
 FROM base AS final

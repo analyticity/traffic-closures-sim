@@ -130,6 +130,7 @@ jobs:
           CID=$(docker create "$IMG")
           DEMAND="outputs/${{ matrix.city }}/baseline/demand"
           NETWORK="outputs/${{ matrix.city }}/baseline/network"
+          EXPERIMENTS="outputs/experiments/${{ matrix.city }}"
 
           for f in calibration_report.json validation_report.json \
                    assignment_convergence.json od_summary.json \
@@ -138,10 +139,15 @@ jobs:
             docker cp "$CID:/app/$DEMAND/$f" "$OUT/$f" 2>/dev/null || true
           done
           docker cp "$CID:/app/$NETWORK/network_summary.json" "$OUT/network_summary.json" 2>/dev/null || true
+
+          mkdir -p "experiments-${{ matrix.city }}"
+          docker cp "$CID:/app/$EXPERIMENTS/." "experiments-${{ matrix.city }}/" 2>/dev/null || true
           docker rm "$CID"
 
           echo "Extracted reports:"
           ls -lh "$OUT"/
+          echo "Extracted experiments:"
+          find "experiments-${{ matrix.city }}" -type f | head -50 || true
 
       - name: Upload pipeline reports
         if: steps.guard.outputs.skip == 'false'
@@ -151,18 +157,27 @@ jobs:
           path: reports-${{ matrix.city }}/
           retention-days: 90
 
+      - name: Upload experiment results
+        if: steps.guard.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: experiments-${{ matrix.city }}
+          path: experiments-${{ matrix.city }}/
+          retention-days: 90
+
       - name: Pipeline summary
         if: steps.guard.outputs.skip == 'false'
         run: |
           OUT="reports-${{ matrix.city }}"
+          EXP="experiments-${{ matrix.city }}"
           CITY="${{ matrix.city }}"
 
-          python3 - "$OUT" "$CITY" <<'PYEOF'
+          python3 - "$OUT" "$CITY" "$EXP" <<'PYEOF'
           import json, sys, os
-          out_dir, city = sys.argv[1], sys.argv[2]
+          out_dir, city, exp_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 
-          def load(name):
-              p = os.path.join(out_dir, name)
+          def load(name, base=None):
+              p = os.path.join(base or out_dir, name)
               if not os.path.exists(p):
                   return None
               with open(p) as f:
@@ -229,6 +244,25 @@ jobs:
               lines.append(f"| Converged | {fmt(assign.get('converged'))} |")
               lines.append(f"| Final RGAP | {fmt(assign.get('final_rgap'))} |")
               lines.append(f"| Iterations | {assign.get('n_iterations', 'n/a')} |")
+              lines.append("")
+
+          exp_report = load("experiment_report.json", base=exp_dir)
+          if exp_report:
+              counts = exp_report.get("counts", {})
+              elapsed = exp_report.get("total_elapsed_s", 0)
+              lines.append("### Experiments")
+              lines.append(f"| Experiment | Status | Time |")
+              lines.append(f"|------------|--------|------|")
+              for e in exp_report.get("experiments", []):
+                  name = e["experiment"].replace("_", " ")
+                  st = e["status"]
+                  icon = {"ok": ":white_check_mark:", "skipped": ":fast_forward:", "error": ":x:"}.get(st, st)
+                  t = f'{e.get("elapsed_s", 0):.1f}s'
+                  reason = f' ({e["reason"][:60]})' if "reason" in e else ""
+                  lines.append(f"| {name} | {icon} {st}{reason} | {t} |")
+              lines.append(f"\n**Totals:** {counts.get('ok', 0)} ok, "
+                           f"{counts.get('skipped', 0)} skipped, "
+                           f"{counts.get('error', 0)} error ({elapsed:.0f}s)")
               lines.append("")
 
           summary = "\n".join(lines)

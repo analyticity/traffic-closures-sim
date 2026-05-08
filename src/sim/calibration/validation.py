@@ -796,7 +796,7 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
     logger.info("\n3) Screenline validation ...")
     sl_results: Dict[str, Any] = {}
     try:
-        from sim.calibration.screenlines import load_screenlines_with_auto, evaluate_all_screenlines
+        from sim.calibration.screenlines import load_screenlines_with_auto, evaluate_all_screenlines, _dedup_cross_screenline_links
         csd_for_auto = None
         csd_full_for_gw = None
         try:
@@ -811,6 +811,9 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
             cfg, csd_df=csd_for_auto, csd_df_full=csd_full_for_gw,
         )
         if screenlines:
+            screenlines, _dedup_log = _dedup_cross_screenline_links(screenlines)
+            if _dedup_log:
+                logger.info(f"  Cross-screenline dedup: {len(_dedup_log)} links reassigned")
             sl_res = evaluate_all_screenlines(
                 screenlines, vol_df,
                     matched if "matched" in locals() else gpd.GeoDataFrame(),

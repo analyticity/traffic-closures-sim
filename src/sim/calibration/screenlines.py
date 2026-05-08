@@ -518,6 +518,17 @@ def evaluate_screenline(
             obs_total = config_aadt
             obs_source = "csd_config_override"
 
+    if obs_source != "pentlogram" and per_link:
+        orig_obs = sum(pl["observed"] for pl in per_link)
+        if orig_obs > 0:
+            scale = obs_total / orig_obs
+            for pl in per_link:
+                pl["observed"] = round(pl["observed"] * scale, 0)
+        else:
+            share = obs_total / len(per_link)
+            for pl in per_link:
+                pl["observed"] = round(share, 0)
+
     ratio = mod_total / max(obs_total, 1.0)
     geh_arr = compute_geh(
         np.array([mod_total], dtype=float),
@@ -559,6 +570,10 @@ def evaluate_all_screenlines(
     results: Dict[str, ScreenlineResult] = {}
     for sl in unique_screenlines:
         r = evaluate_screenline(sl, vol_df, matched_counts, vol_col, obs_col, links_gdf)
+        if r.modeled_total == 0 and r.observed_total and r.observed_total > 0 and sl.name.startswith("auto_gw_"):
+            logger.warning("Skipping zero-flow auto screenline '%s' (obs=%,.0f) — likely disconnected link",
+                           sl.name, r.observed_total)
+            continue
         results[sl.name] = r
     return results
 

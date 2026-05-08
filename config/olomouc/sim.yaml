@@ -4,6 +4,9 @@ osm:
   place_name: "Olomouc, Czechia"
   buffer_km: 2  # wider buffer to capture motorway on/off-ramps near boundary (D35, D46)
 
+network:
+  normalization_config: "config/olomouc/network_normalization.yaml"
+
 zoning:
   sources:
     - type: osm
@@ -11,7 +14,7 @@ zoning:
       admin_level: "9"
   external_gateways:
     enabled: true
-    whitelist: ["D35", "D46", "I/55", "I/46", "I/35"]
+    whitelist: ["D1", "D35", "D46", "I/55", "I/46", "I/35"]
 
 demand:
   segments:

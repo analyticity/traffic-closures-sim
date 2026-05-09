@@ -23,7 +23,9 @@ experiment_profiles:
       secondary_link: 40.0
       tertiary: 40.0
       tertiary_link: 35.0
-      residential: 40.0
+      residential: 30.0
+      service: 35.0
     speed_floors:
       trunk: 70.0
       primary: 55.0
+      service: 25.0

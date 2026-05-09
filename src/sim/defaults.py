@@ -361,16 +361,16 @@ SIM_DEFAULTS: Dict[str, Any] = {
         },
 
         "odme": {
-            "max_outer_iterations": 40,
+            "max_outer_iterations": 30,
             "gradient_descent_iterations": 8,
-            "max_deviation": 6.0,
+            "max_deviation": 4.0,
             "weight_function": "inverse_sqrt",
             "convergence_tol": 0.001,
-            "global_residual_damping": 0.25,
-            "max_iter_change_pct": 15.0,
-            "stall_patience": 8,
+            "global_residual_damping": 0.20,
+            "max_iter_change_pct": 10.0,
+            "stall_patience": 6,
             "class_residual_enabled": True,
-            "class_residual_damping": 0.08,
+            "class_residual_damping": 0.06,
             "class_residual_min_counts": 3,
         },
 
@@ -574,7 +574,7 @@ NETWORK_NORM_DEFAULTS: Dict[str, Any] = {
                 "unclassified": 40.0,
                 "road": 40.0,
                 "residential": 50.0,
-                "service": 20.0,
+                "service": 30.0,
                 "living_street": 20.0,
             },
             "lanes_by_link_type": {

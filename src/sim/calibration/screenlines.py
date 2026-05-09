@@ -570,10 +570,19 @@ def evaluate_all_screenlines(
     results: Dict[str, ScreenlineResult] = {}
     for sl in unique_screenlines:
         r = evaluate_screenline(sl, vol_df, matched_counts, vol_col, obs_col, links_gdf)
-        if r.modeled_total == 0 and r.observed_total and r.observed_total > 0 and sl.name.startswith("auto_gw_"):
-            logger.warning("Skipping zero-flow auto screenline '%s' (obs=%,.0f) — likely disconnected link",
-                           sl.name, r.observed_total)
-            continue
+        if r.observed_total and r.observed_total > 0:
+            if r.modeled_total == 0:
+                logger.warning(
+                    "Screenline '%s': modeled=0 vs observed=%,.0f — "
+                    "resolved links may be disconnected or missing demand",
+                    sl.name, r.observed_total,
+                )
+            elif r.ratio < 0.1:
+                logger.warning(
+                    "Screenline '%s': ratio=%.3f (modeled=%,.0f vs observed=%,.0f) — "
+                    "severe under-assignment, check gateway demand",
+                    sl.name, r.ratio, r.modeled_total, r.observed_total,
+                )
         results[sl.name] = r
     return results
 

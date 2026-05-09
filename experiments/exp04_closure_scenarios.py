@@ -25,6 +25,7 @@ from _common import (
     load_baseline_links,
     load_closures,
     load_network_links,
+    match_links_near_point,
     run_scenario_assignment,
     save_csv,
     save_figure,
@@ -105,30 +106,14 @@ def _closure_to_scenario_links(
     cfg: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     """Convert a single closure record into scenario_links format."""
-    from sim.scenarios.closures import closures_for_date
-
-    # Try to use the existing matching infrastructure
     sev = str(closure.get("pg_severity", closure.get("severity", "")))
     is_full = "full" in sev.lower() or "closure" in sev.lower()
 
-    # Simple spatial matching fallback: nearest links by lat/lon
     lat, lon = closure.get("lat"), closure.get("lon")
     if pd.isna(lat) or pd.isna(lon):
         return []
 
-    # Use a small buffer to find nearby links
-    import geopandas as _gpd
-    from shapely.geometry import Point
-
-    pt = Point(float(lon), float(lat))
-    if links.crs and links.crs.to_epsg() != 4326:
-        pt_gdf = _gpd.GeoDataFrame(geometry=[pt], crs="EPSG:4326").to_crs(links.crs)
-        pt = pt_gdf.geometry.iloc[0]
-
-    dists = links.geometry.distance(pt)
-    nearby = links[dists < 200].copy()
-    if nearby.empty:
-        nearby = links.loc[[dists.idxmin()]]
+    nearby = match_links_near_point(float(lat), float(lon), links, max_dist_m=200)
 
     direction = "both"
     raw_dir = str(closure.get("closure_direction", "")).strip().lower()

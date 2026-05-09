@@ -28,19 +28,23 @@ demand:
 calibration:
   rgap_target: 0.002
   count_source: "csd_split"
+  method: "entropy_odme"
   odme:
+    max_deviation: 3.0
+    stall_patience: 5
     stages:
       - name: "stabilize"
-        max_iterations: 15
-        global_residual_damping: 0.20
-        max_iter_change_pct: 10.0
+        max_iterations: 12
+        global_residual_damping: 0.15
+        max_iter_change_pct: 8.0
         gateway_calibration:
           enabled: true
-          damping: 0.15
+          damping: 0.20
       - name: "refine"
-        max_iterations: 25
-        global_residual_damping: 0.25
-        max_iter_change_pct: 15.0
+        max_iterations: 10
+        global_residual_damping: 0.12
+        max_iter_change_pct: 5.0
+        class_residual_damping: 0.05
   validation:
     match_buffer_m: 120.0
     match_quality_min: 0.25

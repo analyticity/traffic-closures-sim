@@ -164,6 +164,53 @@ def load_closures(cfg: Dict[str, Any]) -> pd.DataFrame:
     return pd.read_parquet(p)
 
 
+# Default metric CRS for Czech Republic (S-JTSK / Křovák East-North)
+_METRIC_CRS = "EPSG:5514"
+
+
+def ensure_metric_links(links: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Return *links* in a metric CRS suitable for distance calculations.
+
+    If the GeoDataFrame is already in a projected (metric) CRS, returns it
+    unchanged.  Otherwise reprojects to EPSG:5514 (S-JTSK).
+    """
+    if links.crs is None or links.crs.is_geographic:
+        return links.to_crs(_METRIC_CRS)
+    return links
+
+
+def match_links_near_point(
+    lat: float,
+    lon: float,
+    links: gpd.GeoDataFrame,
+    max_dist_m: float = 200,
+    *,
+    max_links: int = 50,
+) -> gpd.GeoDataFrame:
+    """Find network links within *max_dist_m* meters of a WGS84 point.
+
+    Returns a subset GeoDataFrame (in the original links CRS).
+    Falls back to the single nearest link if none found within the buffer.
+    Caps results at *max_links* to prevent accidental full-network selection.
+    """
+    from shapely.geometry import Point
+
+    metric_links = ensure_metric_links(links)
+    pt = gpd.GeoDataFrame(
+        geometry=[Point(lon, lat)], crs="EPSG:4326"
+    ).to_crs(metric_links.crs).geometry.iloc[0]
+
+    dists = metric_links.geometry.distance(pt)
+    nearby_mask = dists < max_dist_m
+
+    if not nearby_mask.any():
+        nearest_idx = dists.idxmin()
+        return links.loc[[nearest_idx]]
+
+    nearby_idx = dists[nearby_mask].nsmallest(max_links).index
+    return links.loc[nearby_idx]
+
+
 # ---------------------------------------------------------------------------
 # KPI computation
 # ---------------------------------------------------------------------------

@@ -18,14 +18,15 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from shapely import wkt
-from shapely.geometry import Point
 
 from _common import (
     compute_scenario_kpis,
+    ensure_metric_links,
     init_experiment,
     load_assignment_results,
     load_baseline_links,
     load_closures,
+    match_links_near_point,
     run_scenario_assignment,
     save_csv,
     save_figure,
@@ -39,30 +40,26 @@ BUFFER_M = 50
 
 
 def _match_point(lat: float, lon: float, links: gpd.GeoDataFrame, max_dist: float = 200) -> List[int]:
-    """Match by nearest link to a point."""
-    pt = Point(lon, lat)
-    if links.crs and links.crs.to_epsg() != 4326:
-        pt_gdf = gpd.GeoDataFrame(geometry=[pt], crs="EPSG:4326").to_crs(links.crs)
-        pt = pt_gdf.geometry.iloc[0]
-    dists = links.geometry.distance(pt)
-    nearby = links[dists < max_dist]
-    if nearby.empty:
-        return [int(links.loc[dists.idxmin(), "link_id"])]
+    """Match by nearest link to a point (distance in meters)."""
+    nearby = match_links_near_point(lat, lon, links, max_dist_m=max_dist)
     return nearby["link_id"].astype(int).tolist()
 
 
 def _match_line(line_wkt_str: str, links: gpd.GeoDataFrame) -> List[int]:
-    """Match by buffering the line geometry and intersecting with links."""
+    """Match by buffering the line geometry (BUFFER_M meters) and intersecting."""
     try:
         geom = wkt.loads(line_wkt_str)
     except Exception:
         return []
-    line_gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326")
-    if links.crs and links.crs.to_epsg() != 4326:
-        line_gdf = line_gdf.to_crs(links.crs)
+    metric_links = ensure_metric_links(links)
+    line_gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326").to_crs(metric_links.crs)
     buffered = line_gdf.geometry.iloc[0].buffer(BUFFER_M)
-    mask = links.geometry.intersects(buffered)
-    return links.loc[mask, "link_id"].astype(int).tolist()
+    mask = metric_links.geometry.intersects(buffered)
+    matched = links.loc[mask, "link_id"].astype(int).tolist()
+    if len(matched) > 200:
+        logger.warning("Line buffer matched %d links — capping at 200", len(matched))
+        matched = matched[:200]
+    return matched
 
 
 def _build_scenario_links(

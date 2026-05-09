@@ -20,6 +20,7 @@ from _common import (
     load_assignment_results,
     load_baseline_links,
     load_closures,
+    match_links_near_point,
     run_scenario_assignment,
     save_csv,
     save_figure,
@@ -37,9 +38,6 @@ def _closures_to_scenario_links(
     links: pd.DataFrame,
 ) -> List[Dict[str, Any]]:
     """Convert a set of closures into scenario_links for a single day."""
-    import geopandas as _gpd
-    from shapely.geometry import Point
-
     result: List[Dict[str, Any]] = []
     seen_link_ids: set = set()
 
@@ -48,15 +46,7 @@ def _closures_to_scenario_links(
         if pd.isna(lat) or pd.isna(lon):
             continue
 
-        pt = Point(float(lon), float(lat))
-        if links.crs and links.crs.to_epsg() != 4326:
-            pt_gdf = _gpd.GeoDataFrame(geometry=[pt], crs="EPSG:4326").to_crs(links.crs)
-            pt = pt_gdf.geometry.iloc[0]
-
-        dists = links.geometry.distance(pt)
-        nearby = links[dists < 150]
-        if nearby.empty:
-            nearby = links.loc[[dists.idxmin()]]
+        nearby = match_links_near_point(float(lat), float(lon), links, max_dist_m=150)
 
         sev = str(cl.get("pg_severity", cl.get("severity", "")))
         is_full = "full" in sev.lower() or "closure" in sev.lower()

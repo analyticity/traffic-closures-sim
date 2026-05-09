@@ -117,7 +117,10 @@ def main() -> None:
     link_to_seg = {v: k for k, v in seg_map.items()}
 
     # Focus on closures that have real jam data
-    closures_with_impact = ri[ri.get("jam_count", pd.Series(dtype=int)).fillna(0) > 0].copy()
+    if "jam_count" in ri.columns:
+        closures_with_impact = ri[ri["jam_count"].fillna(0) > 0].copy()
+    else:
+        closures_with_impact = pd.DataFrame()
     if closures_with_impact.empty:
         closures_with_impact = ri.head(10)
 

@@ -26,6 +26,7 @@ from _common import (
     load_assignment_results,
     load_baseline_links,
     load_closures,
+    match_links_near_point,
     save_csv,
     save_figure,
     save_json,
@@ -120,10 +121,9 @@ def _pick_test_closure(
 ) -> List[Dict[str, Any]]:
     """Pick one representative closure and convert to scenario_links."""
     if "quality_score" in closures.columns:
-        closures = closures.sort_values(
-            pd.to_numeric(closures["quality_score"], errors="coerce").fillna(0),
-            ascending=False,
-        )
+        closures = closures.assign(
+            _qs=pd.to_numeric(closures["quality_score"], errors="coerce").fillna(0)
+        ).sort_values("_qs", ascending=False).drop(columns=["_qs"])
 
     sev_col = "pg_severity" if "pg_severity" in closures.columns else "severity"
     full = closures[closures[sev_col].str.contains("full|closure", case=False, na=False)]
@@ -133,17 +133,7 @@ def _pick_test_closure(
     if pd.isna(lat) or pd.isna(lon):
         return []
 
-    import geopandas as _gpd
-    from shapely.geometry import Point
-    pt = Point(float(lon), float(lat))
-    if links.crs and links.crs.to_epsg() != 4326:
-        pt_gdf = _gpd.GeoDataFrame(geometry=[pt], crs="EPSG:4326").to_crs(links.crs)
-        pt = pt_gdf.geometry.iloc[0]
-
-    dists = links.geometry.distance(pt)
-    nearby = links[dists < 200]
-    if nearby.empty:
-        nearby = links.loc[[dists.idxmin()]]
+    nearby = match_links_near_point(float(lat), float(lon), links, max_dist_m=200)
 
     result = []
     for _, link in nearby.iterrows():

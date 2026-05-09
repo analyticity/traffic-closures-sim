@@ -452,16 +452,32 @@ def compute_validation_benchmarks(
     jt_pct = jt_pass_count / max(jt_total, 1) * 100
     jt_pass = jt_pct >= jt_pass_pct_thr if jt_total > 0 else None
 
-    sl_max_error = 0.0
-    for sr in screenline_results.values():
+    _AUTO_SL_PREFIXES = ("auto_gw_", "auto_csd_")
+    sl_max_error_all = 0.0
+    sl_max_error_manual = 0.0
+    sl_max_error_auto = 0.0
+    n_manual_sl = 0
+    for sl_name, sr in screenline_results.items():
         ratio = sr.get("ratio")
         obs = sr.get("observed_total", 0)
-        if ratio is not None and obs and obs > 0:
-            sl_max_error = max(sl_max_error, abs(ratio - 1.0) * 100)
+        if ratio is None or not obs or obs <= 0:
+            continue
+        err = abs(ratio - 1.0) * 100
+        sl_max_error_all = max(sl_max_error_all, err)
+        is_auto = sl_name.startswith(_AUTO_SL_PREFIXES)
+        if is_auto:
+            sl_max_error_auto = max(sl_max_error_auto, err)
+        else:
+            sl_max_error_manual = max(sl_max_error_manual, err)
+            n_manual_sl += 1
+
+    sl_max_error = sl_max_error_manual if n_manual_sl > 0 else 0.0
 
     result: Dict[str, Any] = {
         "model_time_period": model_time_period,
-        "screenline_max_error_pct": round(sl_max_error, 1),
+        "screenline_max_error_pct": round(sl_max_error_all, 1),
+        "screenline_max_error_manual_pct": round(sl_max_error_manual, 1) if n_manual_sl > 0 else None,
+        "screenline_max_error_auto_pct": round(sl_max_error_auto, 1),
         "jt_within_tolerance_pct": round(jt_pct, 1) if jt_total > 0 else None,
         "jt_benchmark_pass": jt_pass,
         "jt_routes_checked": jt_total,

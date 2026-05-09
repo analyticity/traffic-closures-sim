@@ -646,6 +646,25 @@ def select_gateway_target_nodes(
             len(gateway_meta),
         )
 
+    n_before_target_dedup = len(gateway_meta)
+    gateway_targets, gateway_meta = _merge_gateways_by_shared_targets(
+        gateway_targets=gateway_targets,
+        gateway_meta=gateway_meta,
+        node_geom=node_geom,
+        node_weight=node_weight,
+        model_area=model_area,
+        nodes_per_gateway=int(nodes_per_gateway),
+        scc_nodes=scc_nids,
+    )
+    n_target_merged = n_before_target_dedup - len(gateway_meta)
+    if n_target_merged > 0:
+        logger.info(
+            "target-node dedup: merged %d gateway(s) sharing target nodes (%d -> %d)",
+            n_target_merged,
+            n_before_target_dedup,
+            len(gateway_meta),
+        )
+
     debug_corridors_gdf = (
         gpd.GeoDataFrame(pd.concat(debug_corridor_parts, ignore_index=True), crs=links_gdf.crs)
         if debug_corridor_parts
@@ -777,6 +796,120 @@ def _merge_gateway_candidates_on_boundary(
                     new_meta["gateway_name"],
                     _grp_key,
                 )
+
+    return merged_targets, merged_meta
+
+
+# ---------------------------------------------------------------------------
+# Gateway merging (target-node overlap)
+# ---------------------------------------------------------------------------
+
+def _merge_gateways_by_shared_targets(
+    gateway_targets: Dict[str, List[int]],
+    gateway_meta: Dict[str, Dict[str, Any]],
+    node_geom: Dict[int, Point],
+    node_weight: Dict[int, float],
+    model_area: Any,
+    *,
+    nodes_per_gateway: int,
+    scc_nodes: Optional[set] = None,
+) -> Tuple[Dict[str, List[int]], Dict[str, Dict[str, Any]]]:
+    """Merge gateways whose target nodes overlap to prevent demand inflation.
+
+    Multiple boundary clusters for the same road (e.g. 379_NE, 379_NE_2,
+    379_NE_3) can be far apart on the boundary ring but still route through
+    the same physical link.  Each gets its own OD demand share, inflating
+    the total.  This pass uses union-find to group overlapping gateways
+    and keeps a single representative.
+    """
+    if len(gateway_meta) <= 1:
+        return gateway_targets, gateway_meta
+
+    from collections import defaultdict
+
+    node_to_gws: Dict[int, List[str]] = defaultdict(list)
+    for gw_name, nodes in gateway_targets.items():
+        for nid in nodes:
+            node_to_gws[nid].append(gw_name)
+
+    parent: Dict[str, str] = {n: n for n in gateway_targets}
+
+    def _find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(x: str, y: str) -> None:
+        rx, ry = _find(x), _find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    for _nid, gw_names in node_to_gws.items():
+        for i in range(1, len(gw_names)):
+            _union(gw_names[0], gw_names[i])
+
+    groups: Dict[str, List[str]] = defaultdict(list)
+    for name in gateway_targets:
+        groups[_find(name)].append(name)
+
+    merged_targets: Dict[str, List[int]] = {}
+    merged_meta: Dict[str, Dict[str, Any]] = {}
+
+    boundary = model_area.boundary
+
+    for _root, group_names in groups.items():
+        if len(group_names) == 1:
+            name = group_names[0]
+            merged_targets[name] = gateway_targets[name]
+            merged_meta[name] = gateway_meta[name]
+            continue
+
+        group_metas = [gateway_meta[n] for n in group_names]
+        rep = sorted(
+            group_metas,
+            key=lambda m: (
+                int(m.get("whitelist_priority", 9999)),
+                float(m.get("dist_boundary_m", 1e9)),
+                -float(ROAD_CLASS_WEIGHT.get(str(m.get("link_type", "")), 0.0)),
+            ),
+        )[0]
+
+        union_nodes: List[int] = []
+        for name in group_names:
+            for nid in gateway_targets[name]:
+                if nid not in union_nodes and nid in node_geom:
+                    union_nodes.append(nid)
+
+        chosen = pick_nodes_near_boundary(
+            union_nodes,
+            node_geom,
+            boundary,
+            node_weight,
+            max_nodes=int(nodes_per_gateway),
+            min_node_sep_m=25.0,
+            scc_nodes=scc_nodes,
+        )
+
+        if not chosen:
+            chosen = gateway_targets[rep["gateway_name"]]
+
+        rep_name = rep["gateway_name"]
+        new_meta = dict(rep)
+        new_meta["target_node_ids"] = chosen
+        new_meta["anchor_node_id"] = int(chosen[0])
+        if chosen[0] in node_geom:
+            new_meta["anchor_x"] = float(node_geom[chosen[0]].x)
+            new_meta["anchor_y"] = float(node_geom[chosen[0]].y)
+        new_meta["merged_from"] = "|".join(group_names)
+
+        merged_targets[rep_name] = chosen
+        merged_meta[rep_name] = new_meta
+
+        logger.info(
+            "target-dedup: merged gateways %s -> %s (shared target nodes)",
+            group_names, rep_name,
+        )
 
     return merged_targets, merged_meta
 

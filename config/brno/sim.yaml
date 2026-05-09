@@ -107,3 +107,6 @@ datasets:
 
 baseline_closures:
   enabled: true
+  matching:
+    max_distance_m: 50
+    require_road_ref_match: true

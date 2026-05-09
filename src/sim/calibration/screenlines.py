@@ -376,22 +376,50 @@ def resolve_screenline_links(
             sl.name, len(resolved), sl.expected_links, sl.attr_filter or "none",
         )
 
-    # --- log results --------------------------------------------------------
-    link_names = []
+    # --- log results with link_type audit ------------------------------------
+    _NON_ROUTABLE_TYPES = frozenset({
+        "living_street", "pedestrian", "footway", "service",
+        "cycleway", "steps", "path", "track",
+    })
+    link_descs = []
+    non_routable_lids = []
+    has_link_type = "link_type" in lm.columns
     for lid, _ in resolved:
         match = lm[lm["link_id"] == lid]
         lname = str(match["name"].iloc[0]) if (not match.empty and "name" in match.columns) else "?"
-        link_names.append(f"{lid} ({lname})")
+        lt = str(match["link_type"].iloc[0]) if (not match.empty and has_link_type) else "?"
+        link_descs.append(f"{lid} ({lname}, {lt})")
+        if has_link_type and not match.empty and lt in _NON_ROUTABLE_TYPES:
+            non_routable_lids.append(lid)
+
     if resolved:
         logger.info(
             "Screenline '%s' resolved to %d link(s): %s",
-            sl.name, len(resolved), ", ".join(link_names),
+            sl.name, len(resolved), ", ".join(link_descs),
         )
     else:
         logger.warning(
             "Screenline '%s' resolved to 0 links (filter=%s)",
             sl.name, sl.attr_filter or "none",
         )
+
+    if non_routable_lids and len(non_routable_lids) == len(resolved):
+        logger.warning(
+            "Screenline '%s': ALL %d resolved link(s) are non-routable types "
+            "(%s) — this screenline will likely show zero modeled flow",
+            sl.name, len(resolved),
+            ", ".join(f"{lid}" for lid in non_routable_lids),
+        )
+        resolved = []
+    elif non_routable_lids:
+        logger.warning(
+            "Screenline '%s': %d of %d resolved link(s) are non-routable — "
+            "filtering them out: %s",
+            sl.name, len(non_routable_lids), len(resolved),
+            non_routable_lids,
+        )
+        nr_set = set(non_routable_lids)
+        resolved = [(lid, d) for lid, d in resolved if lid not in nr_set]
 
     return resolved
 
@@ -797,7 +825,9 @@ def auto_generate_screenlines(
 
         # Collect all road refs present in the model network so we only
         # generate screenlines for roads that the model can actually resolve.
+        # Also compute per-ref total link length for coverage filtering.
         network_refs: set[str] = set()
+        network_ref_km: Dict[str, float] = {}
         project_dir = Path(cfg.get("project_path", ""))
         if project_dir.exists():
             try:
@@ -807,11 +837,17 @@ def auto_generate_screenlines(
                 try:
                     _ldf = _prj.network.links.data
                     if "osm_ref_norm" in _ldf.columns:
-                        for ref_val in _ldf["osm_ref_norm"].dropna().unique():
-                            for part in str(ref_val).split(";"):
+                        _has_dist = "distance" in _ldf.columns
+                        for _, _lrow in _ldf.iterrows():
+                            _ref_raw = _lrow.get("osm_ref_norm")
+                            if pd.isna(_ref_raw):
+                                continue
+                            _link_km = float(_lrow["distance"]) / 1000.0 if _has_dist else 0.0
+                            for part in str(_ref_raw).split(";"):
                                 part = part.strip().lower()
                                 if part:
                                     network_refs.add(part)
+                                    network_ref_km[part] = network_ref_km.get(part, 0.0) + _link_km
                 finally:
                     _prj.close()
                 logger.info(
@@ -821,6 +857,18 @@ def auto_generate_screenlines(
             except Exception as exc:
                 logger.debug("Could not load network refs for CSD filter: %s", exc)
 
+        csd_for_coverage = csd_df_full if csd_df_full is not None else csd_df
+        csd_road_km: Dict[str, float] = {}
+        if (csd_for_coverage is not None and not csd_for_coverage.empty
+                and "sil" in csd_for_coverage.columns and "delka" in csd_for_coverage.columns):
+            for _sil, _grp in csd_for_coverage.groupby("sil"):
+                _rn = str(_sil).strip().upper().replace(" ", "")
+                try:
+                    _rn = str(int(_rn))
+                except ValueError:
+                    _rn = _rn.lstrip("0") or _rn
+                csd_road_km[_rn.lower()] = float(pd.to_numeric(_grp["delka"], errors="coerce").sum())
+
         if "sil" in csd_df.columns and "sv" in csd_df.columns:
             grouped = csd_df.groupby("sil", as_index=False).agg(
                 sv_mean=("sv", "mean"),
@@ -828,7 +876,9 @@ def auto_generate_screenlines(
             )
             major = grouped[grouped["sv_mean"] >= csd_min_aadt]
 
+            min_coverage = float(auto_cfg.get("csd_min_coverage", 0.5))
             n_skipped_no_network = 0
+            n_skipped_partial = 0
             for _, row in major.iterrows():
                 road = str(row["sil"]).strip()
 
@@ -842,6 +892,19 @@ def auto_generate_screenlines(
                 if network_refs and road_norm.lower() not in network_refs:
                     n_skipped_no_network += 1
                     continue
+
+                model_km = network_ref_km.get(road_norm.lower(), 0.0)
+                csd_km = csd_road_km.get(road_norm.lower(), 0.0)
+                coverage = model_km / csd_km if csd_km > 0 else 1.0
+                if coverage < min_coverage:
+                    n_skipped_partial += 1
+                    logger.debug(
+                        "Skipping CSD screenline %s: coverage=%.2f "
+                        "(model=%.1f km, csd=%.1f km) < %.2f",
+                        name, coverage, model_km, csd_km, min_coverage,
+                    )
+                    continue
+
                 result.append(ScreenlineDef(
                     name=name,
                     description=f"Auto-generated CSD screenline for road {road_norm}",
@@ -853,8 +916,9 @@ def auto_generate_screenlines(
             n_csd = len([s for s in result if s.name.startswith("auto_csd_")])
             logger.info(
                 "Auto-generated %d CSD screenlines (min AADT=%d, "
-                "skipped %d no-network)",
+                "skipped %d no-network, %d partial-coverage)",
                 n_csd, int(csd_min_aadt), n_skipped_no_network,
+                n_skipped_partial,
             )
 
     return result

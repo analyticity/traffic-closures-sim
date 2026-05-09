@@ -288,7 +288,7 @@ SIM_DEFAULTS: Dict[str, Any] = {
             "ipf_tolerance": 0.001,
             "blend_alpha": 0.7,
             "uniform_impedance_fallback": 5000.0,
-            "max_total_multiplier": 2.5,
+            "max_total_multiplier": 3.5,
         },
     },
 

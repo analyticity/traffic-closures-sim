@@ -811,9 +811,14 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
             cfg, csd_df=csd_for_auto, csd_df_full=csd_full_for_gw,
         )
         if screenlines:
-            screenlines, _dedup_log = _dedup_cross_screenline_links(screenlines)
-            if _dedup_log:
-                logger.info(f"  Cross-screenline dedup: {len(_dedup_log)} links reassigned")
+            sl_query = {sl.name: sl.links for sl in screenlines if sl.links}
+            if sl_query:
+                sl_query, _dedup_log = _dedup_cross_screenline_links(sl_query)
+                if _dedup_log:
+                    logger.info(f"  Cross-screenline dedup: {len(_dedup_log)} links reassigned")
+                for sl in screenlines:
+                    if sl.name in sl_query:
+                        sl.links = sl_query[sl.name]
             sl_res = evaluate_all_screenlines(
                 screenlines, vol_df,
                     matched if "matched" in locals() else gpd.GeoDataFrame(),

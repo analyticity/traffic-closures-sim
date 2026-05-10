@@ -17,7 +17,7 @@ screenlines:
     type: "radial"
     observed_aadt_cars: 46000
     observed_aadt_all: 52900
-    geometry_wkt: "LINESTRING(16.6140 49.1970, 16.6170 49.1930)"
+    geometry_wkt: "LINESTRING(16.6130 49.1975, 16.6180 49.1925)"
     filter:
       name: "Koliště,Příkop"
     expected_links: 2
@@ -37,7 +37,7 @@ screenlines:
     type: "radial"
     observed_aadt_cars: 22000
     observed_aadt_all: 25300
-    geometry_wkt: "LINESTRING(16.6220 49.1900, 16.6260 49.1925)"
+    geometry_wkt: "LINESTRING(16.6215 49.1895, 16.6265 49.1930)"
     filter:
       name: "Křenová"
     expected_links: 2
@@ -47,7 +47,7 @@ screenlines:
     type: "radial"
     observed_aadt_cars: 11000
     observed_aadt_all: 12650
-    geometry_wkt: "LINESTRING(16.5910 49.2115, 16.5945 49.2125)"
+    geometry_wkt: "LINESTRING(16.5900 49.2110, 16.5955 49.2130)"
     filter:
       name: "Kounicova"
     expected_links: 2

@@ -30,21 +30,22 @@ calibration:
   count_source: "csd_split"
   method: "entropy_odme"
   odme:
-    max_deviation: 3.0
-    stall_patience: 5
+    max_deviation: 2.5
+    entropy_step_size: 0.20
+    stall_patience: 6
     stages:
       - name: "stabilize"
-        max_iterations: 12
-        global_residual_damping: 0.15
-        max_iter_change_pct: 8.0
+        max_iterations: 15
+        global_residual_damping: 0.25
+        max_iter_change_pct: 6.0
         gateway_calibration:
           enabled: true
-          damping: 0.20
+          damping: 0.15
       - name: "refine"
-        max_iterations: 10
-        global_residual_damping: 0.12
-        max_iter_change_pct: 5.0
-        class_residual_damping: 0.05
+        max_iterations: 12
+        global_residual_damping: 0.18
+        max_iter_change_pct: 4.0
+        class_residual_damping: 0.04
   validation:
     match_buffer_m: 120.0
     match_quality_min: 0.25

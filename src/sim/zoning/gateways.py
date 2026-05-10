@@ -646,6 +646,13 @@ def select_gateway_target_nodes(
             len(gateway_meta),
         )
 
+    _ntl: Dict[int, List[int]] = {}
+    if "link_id" in links_gdf.columns and "a_node" in links_gdf.columns:
+        for _, lrow in links_gdf.iterrows():
+            lid = int(lrow["link_id"])
+            for nid in (int(lrow["a_node"]), int(lrow["b_node"])):
+                _ntl.setdefault(nid, []).append(lid)
+
     n_before_target_dedup = len(gateway_meta)
     gateway_targets, gateway_meta = _merge_gateways_by_shared_targets(
         gateway_targets=gateway_targets,
@@ -655,11 +662,12 @@ def select_gateway_target_nodes(
         model_area=model_area,
         nodes_per_gateway=int(nodes_per_gateway),
         scc_nodes=scc_nids,
+        node_to_links=_ntl if _ntl else None,
     )
     n_target_merged = n_before_target_dedup - len(gateway_meta)
     if n_target_merged > 0:
         logger.info(
-            "target-node dedup: merged %d gateway(s) sharing target nodes (%d -> %d)",
+            "target-node dedup: merged %d gateway(s) sharing target nodes/links (%d -> %d)",
             n_target_merged,
             n_before_target_dedup,
             len(gateway_meta),
@@ -813,14 +821,20 @@ def _merge_gateways_by_shared_targets(
     *,
     nodes_per_gateway: int,
     scc_nodes: Optional[set] = None,
+    node_to_links: Optional[Dict[int, List[int]]] = None,
 ) -> Tuple[Dict[str, List[int]], Dict[str, Dict[str, Any]]]:
-    """Merge gateways whose target nodes overlap to prevent demand inflation.
+    """Merge gateways whose target nodes or adjacent links overlap.
 
     Multiple boundary clusters for the same road (e.g. 379_NE, 379_NE_2,
     379_NE_3) can be far apart on the boundary ring but still route through
     the same physical link.  Each gets its own OD demand share, inflating
     the total.  This pass uses union-find to group overlapping gateways
     and keeps a single representative.
+
+    Two merge passes:
+      1. Shared target node IDs (original logic).
+      2. Shared adjacent link IDs -- gateways whose target nodes touch
+         the same network link are merged even if the nodes differ.
     """
     if len(gateway_meta) <= 1:
         return gateway_targets, gateway_meta
@@ -845,9 +859,22 @@ def _merge_gateways_by_shared_targets(
         if rx != ry:
             parent[rx] = ry
 
+    # Pass 1: shared target node IDs
     for _nid, gw_names in node_to_gws.items():
         for i in range(1, len(gw_names)):
             _union(gw_names[0], gw_names[i])
+
+    # Pass 2: shared adjacent link IDs
+    if node_to_links:
+        link_to_gws: Dict[int, List[str]] = defaultdict(list)
+        for gw_name, nodes in gateway_targets.items():
+            for nid in nodes:
+                for lid in node_to_links.get(nid, []):
+                    link_to_gws[lid].append(gw_name)
+        for lid, gw_names in link_to_gws.items():
+            if len(gw_names) > 1:
+                for i in range(1, len(gw_names)):
+                    _union(gw_names[0], gw_names[i])
 
     groups: Dict[str, List[str]] = defaultdict(list)
     for name in gateway_targets:
@@ -907,7 +934,7 @@ def _merge_gateways_by_shared_targets(
         merged_meta[rep_name] = new_meta
 
         logger.info(
-            "target-dedup: merged gateways %s -> %s (shared target nodes)",
+            "target-dedup: merged gateways %s -> %s (shared target nodes/links)",
             group_names, rep_name,
         )
 

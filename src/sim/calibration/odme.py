@@ -313,6 +313,20 @@ def run_odme_calibration(
                 and _sr_val(sl_results.get(sn, {}), "modeled_total") > 0
             )
 
+            if sl_matrices and sl_results:
+                dead_sls = [
+                    sn for sn in list(sl_matrices)
+                    if _sr_val(sl_results.get(sn, {}), "observed_total") > 0
+                    and _sr_val(sl_results.get(sn, {}), "modeled_total") <= 0
+                ]
+                for sn in dead_sls:
+                    del sl_matrices[sn]
+                    logger.warning(
+                        "  Deactivating screenline '%s': observed>0 but modeled=0 "
+                        "(dead-end or disconnected link)",
+                        sn,
+                    )
+
             iter_record = {
                 "iteration": outer_it,
                 "demand_total": round(total_demand, 0),

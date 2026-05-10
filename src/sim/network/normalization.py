@@ -478,7 +478,8 @@ def normalize_network_attributes(
 
     # --- CSD capacity hints (before experiment profile so caps/factors apply on top) ---
     if csd_path is not None:
-        _apply_csd_capacity_hints(links, csd_path)
+        phf = float(network_cfg.get("csd_peak_hour_factor", 0.10))
+        _apply_csd_capacity_hints(links, csd_path, peak_hour_factor=phf)
 
     links = _apply_experiment_profile(links, profile, thresholds)
 

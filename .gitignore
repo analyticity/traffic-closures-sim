@@ -236,6 +236,11 @@ excel_materials/poster_A1.png
 # Scratch scripts
 scritp.py
 
+# Thesis / documentation files (not part of the implementation)
+*.tex
+*.pdf
+excel_materials/
+
 # Experiment temp configs (must stay under repo root for path resolution)
 .tmp_metric_principle_configs/
 .tmp_tuning_configs/

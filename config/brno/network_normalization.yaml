@@ -13,6 +13,10 @@ experiment_profiles:
         set_link_type: trunk
         min_speed: 80
         comment: "Zabovreska corridor (II/640) — 50k AADT, misclassified as secondary in OSM"
+      - match: {osm_ref_norm: "52", link_type: "secondary"}
+        set_link_type: primary
+        min_speed: 60
+        comment: "I/52 urban section — 27k AADT, same corridor as trunk I/52"
 
     speed_caps:
       trunk: 90.0

@@ -144,6 +144,16 @@ _RAMP_LINK_TYPES = frozenset({
     "secondary_link", "tertiary_link",
 })
 
+_NON_MAINLINE_TYPES = frozenset({
+    "motorway_link", "trunk_link", "primary_link",
+    "secondary_link", "tertiary_link",
+    "living_street", "residential", "service",
+    "pedestrian", "footway", "cycleway",
+    "steps", "path", "track",
+})
+
+_MIN_MAINLINE_CAPACITY = 200
+
 
 def _resolve_attr_only_screenline(
     sl: "ScreenlineDef",
@@ -155,11 +165,14 @@ def _resolve_attr_only_screenline(
     cross-section of road X.  We pick a representative link that best
     captures the corridor's volume by:
 
-    1. Filtering out ramp/link types (e.g. ``trunk_link``) to keep only
-       mainline segments.
-    2. Sorting remaining links by geometric length (longest first) -- the
-       longest segment is most likely a straight mainline section.
-    3. Among the top candidates, selecting the one closest to the
+    1. Filtering out ramp types **and** non-routable types (living_street,
+       residential, service, …) as well as links with very low capacity.
+    2. If the filter references ``osm_ref_norm``, preferring links whose
+       ref is an *exact* match over composite refs (e.g. prefer ``50``
+       over ``D1;50``).
+    3. Sorting remaining links by **capacity** (highest first) — the
+       highest-capacity segment is most likely the mainline carriageway.
+    4. Among the top candidates, selecting the one closest to the
        geographic centroid of all candidates (to avoid boundary artifacts).
 
     Returns a single bidirectional link or a pair of one-way links.
@@ -178,25 +191,53 @@ def _resolve_attr_only_screenline(
     cand_df = gpd.GeoDataFrame(candidates)
     has_lt = "link_type" in cand_df.columns
 
+    # --- 1. Filter non-mainline types -----------------------------------
     mainline = (
-        cand_df[~cand_df["link_type"].isin(_RAMP_LINK_TYPES)]
+        cand_df[~cand_df["link_type"].isin(_NON_MAINLINE_TYPES)]
         if has_lt
         else cand_df
     )
     if mainline.empty:
         mainline = cand_df
 
+    # --- 1b. Filter low-capacity links ----------------------------------
+    has_cap = "capacity_ab" in mainline.columns
+    if has_cap:
+        cap_vals = pd.to_numeric(mainline["capacity_ab"], errors="coerce").fillna(0)
+        above_min = mainline[cap_vals >= _MIN_MAINLINE_CAPACITY]
+        if not above_min.empty:
+            mainline = above_min
+
+    # --- 2. Exact-ref preference for osm_ref_norm -----------------------
+    target_ref = (sl.attr_filter.get("osm_ref_norm") or "").strip().lower()
+    if target_ref and "osm_ref_norm" in mainline.columns:
+        exact = mainline[
+            mainline["osm_ref_norm"]
+            .astype(str).str.strip().str.lower()
+            .eq(target_ref)
+        ]
+        if not exact.empty:
+            mainline = exact
+
     mainline = mainline.copy()
-    mainline["_length"] = mainline.geometry.length
+
+    # --- 3. Sort by capacity (desc) instead of length -------------------
+    if has_cap:
+        mainline["_sort_key"] = pd.to_numeric(
+            mainline["capacity_ab"], errors="coerce",
+        ).fillna(0)
+    else:
+        mainline["_sort_key"] = mainline.geometry.length
 
     centroid_all = mainline.geometry.unary_union.centroid
 
     top_n = min(10, len(mainline))
-    longest = mainline.nlargest(top_n, "_length")
+    top_cands = mainline.nlargest(top_n, "_sort_key")
 
-    dists = longest.geometry.centroid.distance(centroid_all)
+    # --- 4. Nearest to centroid among top candidates --------------------
+    dists = top_cands.geometry.centroid.distance(centroid_all)
     best_idx = dists.idxmin()
-    chosen = longest.loc[best_idx]
+    chosen = top_cands.loc[best_idx]
 
     bidir = (
         int(chosen.get("direction", 0)) == 0
@@ -403,23 +444,31 @@ def resolve_screenline_links(
             sl.name, sl.attr_filter or "none",
         )
 
-    if non_routable_lids and len(non_routable_lids) == len(resolved):
-        logger.warning(
-            "Screenline '%s': ALL %d resolved link(s) are non-routable types "
-            "(%s) — this screenline will likely show zero modeled flow",
-            sl.name, len(resolved),
-            ", ".join(f"{lid}" for lid in non_routable_lids),
-        )
-        resolved = []
+    is_auto = sl.name.startswith("auto_gw_") or sl.name.startswith("auto_csd_")
+    if non_routable_lids and is_auto:
+        if len(non_routable_lids) == len(resolved):
+            logger.warning(
+                "Screenline '%s': ALL %d resolved link(s) are non-routable types "
+                "(%s) — this screenline will likely show zero modeled flow",
+                sl.name, len(resolved),
+                ", ".join(f"{lid}" for lid in non_routable_lids),
+            )
+            resolved = []
+        else:
+            logger.warning(
+                "Screenline '%s': %d of %d resolved link(s) are non-routable — "
+                "filtering them out: %s",
+                sl.name, len(non_routable_lids), len(resolved),
+                non_routable_lids,
+            )
+            nr_set = set(non_routable_lids)
+            resolved = [(lid, d) for lid, d in resolved if lid not in nr_set]
     elif non_routable_lids:
-        logger.warning(
-            "Screenline '%s': %d of %d resolved link(s) are non-routable — "
-            "filtering them out: %s",
+        logger.info(
+            "Screenline '%s': %d of %d resolved link(s) are non-routable "
+            "(kept — manual screenline)",
             sl.name, len(non_routable_lids), len(resolved),
-            non_routable_lids,
         )
-        nr_set = set(non_routable_lids)
-        resolved = [(lid, d) for lid, d in resolved if lid not in nr_set]
 
     return resolved
 
@@ -849,7 +898,7 @@ def auto_generate_screenlines(
             except Exception as exc:
                 logger.debug("Could not load network refs for CSD filter: %s", exc)
 
-        csd_agg_method = str(auto_cfg.get("csd_agg_method", "max"))
+        csd_agg_method = str(auto_cfg.get("csd_agg_method", "mean"))
 
         if "sil" in csd_df.columns and "sv" in csd_df.columns:
             agg_fn = csd_agg_method if csd_agg_method in ("mean", "max", "median") else "max"

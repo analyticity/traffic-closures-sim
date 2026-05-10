@@ -864,17 +864,9 @@ def _merge_gateways_by_shared_targets(
         for i in range(1, len(gw_names)):
             _union(gw_names[0], gw_names[i])
 
-    # Pass 2: shared adjacent link IDs
-    if node_to_links:
-        link_to_gws: Dict[int, List[str]] = defaultdict(list)
-        for gw_name, nodes in gateway_targets.items():
-            for nid in nodes:
-                for lid in node_to_links.get(nid, []):
-                    link_to_gws[lid].append(gw_name)
-        for lid, gw_names in link_to_gws.items():
-            if len(gw_names) > 1:
-                for i in range(1, len(gw_names)):
-                    _union(gw_names[0], gw_names[i])
+    # Pass 2 (disabled): shared adjacent link IDs — too aggressive,
+    # causes chain-merging at highway interchanges where many gateways
+    # touch the same junction links.
 
     groups: Dict[str, List[str]] = defaultdict(list)
     for name in gateway_targets:

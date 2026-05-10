@@ -314,17 +314,26 @@ def run_odme_calibration(
             )
 
             if sl_matrices and sl_results:
-                dead_sls = [
-                    sn for sn in list(sl_matrices)
-                    if _sr_val(sl_results.get(sn, {}), "observed_total") > 0
-                    and _sr_val(sl_results.get(sn, {}), "modeled_total") <= 0
-                ]
-                for sn in dead_sls:
+                _NEAR_ZERO_RATIO = 0.05
+                dead_sls = []
+                for sn in list(sl_matrices):
+                    obs_v = _sr_val(sl_results.get(sn, {}), "observed_total")
+                    mod_v = _sr_val(sl_results.get(sn, {}), "modeled_total")
+                    if obs_v > 0 and mod_v <= 0:
+                        dead_sls.append((sn, "modeled=0"))
+                    elif (
+                        obs_v > 0
+                        and mod_v > 0
+                        and mod_v / obs_v < _NEAR_ZERO_RATIO
+                        and (sn.startswith("auto_gw_") or sn.startswith("auto_csd_"))
+                    ):
+                        dead_sls.append((sn, f"ratio={mod_v / obs_v:.3f}"))
+                for sn, reason in dead_sls:
                     del sl_matrices[sn]
                     logger.warning(
-                        "  Deactivating screenline '%s': observed>0 but modeled=0 "
-                        "(dead-end or disconnected link)",
-                        sn,
+                        "  Deactivating screenline '%s': %s "
+                        "(boundary artifact or disconnected link)",
+                        sn, reason,
                     )
 
             iter_record = {

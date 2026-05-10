@@ -635,8 +635,17 @@ class _CalibrationContext:
             self.best_demand = self.mat.matrix[self.core_name][:, :].copy()
             self.best_iteration = iteration
 
+    _NEAR_ZERO_RATIO = 0.05
+
     def evaluate_and_log_screenlines(self, vol_df: pd.DataFrame, matched: gpd.GeoDataFrame, vol_col: Optional[str]):
-        """Evaluate screenlines and return (sl_results_dict, max_pct_dev)."""
+        """Evaluate screenlines and return (sl_results_dict, max_pct_dev).
+
+        Auto-generated screenlines (``auto_gw_*``, ``auto_csd_*``) whose
+        modeled/observed ratio falls below ``_NEAR_ZERO_RATIO`` are excluded
+        from the ``max_sl_pct_dev`` aggregate.  These typically represent
+        network-boundary artifacts where the resolved link carries almost no
+        assigned traffic despite a positive CSD observation.
+        """
         from sim.calibration.screenlines import evaluate_all_screenlines
 
         sl_results: Dict[str, Any] = {}
@@ -648,6 +657,14 @@ class _CalibrationContext:
             for sn, sr in sl_res.items():
                 sl_results[sn] = sr.to_dict()
                 if sr.observed_total > 0 and np.isfinite(sr.ratio):
+                    is_auto = sn.startswith("auto_gw_") or sn.startswith("auto_csd_")
+                    if is_auto and sr.ratio < self._NEAR_ZERO_RATIO:
+                        logger.warning(
+                            "  SL '%s': ratio=%.3f (mod=%.0f obs=%.0f) — "
+                            "near-zero auto screenline, excluded from max_pct_dev",
+                            sn, sr.ratio, sr.modeled_total, sr.observed_total,
+                        )
+                        continue
                     dev = abs(sr.ratio - 1.0) * 100.0
                     max_sl_pct_dev = max(max_sl_pct_dev, dev)
                     logger.info(

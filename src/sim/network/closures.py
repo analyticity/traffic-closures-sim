@@ -251,10 +251,17 @@ def _match_closure_to_links(
     for cidx in candidates:
         row = link_gdf.iloc[int(cidx)]
         lid = int(row["link_id"])
-        if closure_ref and link_ref_col:
+        if link_ref_col and require_ref:
             link_ref = str(row.get(link_ref_col, "") or "").strip()
-            if require_ref and closure_ref and link_ref and closure_ref != link_ref:
-                continue
+            if closure_ref:
+                if link_ref and closure_ref != link_ref:
+                    continue
+            else:
+                # Closure has no road_ref: skip classified links that have
+                # their own ref -- a local-street closure should not shut
+                # down a nearby trunk/primary road.
+                if link_ref:
+                    continue
         matched.append(lid)
     return matched
 

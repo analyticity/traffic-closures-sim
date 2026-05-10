@@ -537,8 +537,8 @@ def evaluate_screenline(
             obs_source = "csd_config"
         elif obs_total < 0.20 * config_aadt:
             logger.warning(
-                "Screenline '%s': matched obs=%,.0f is only %.0f%% of "
-                "config AADT=%,.0f — overriding with config AADT",
+                "Screenline '%s': matched obs=%.0f is only %.0f%% of "
+                "config AADT=%.0f — overriding with config AADT",
                 sl.name, obs_total,
                 100.0 * obs_total / config_aadt,
                 config_aadt,
@@ -601,13 +601,13 @@ def evaluate_all_screenlines(
         if r.observed_total and r.observed_total > 0:
             if r.modeled_total == 0:
                 logger.warning(
-                    "Screenline '%s': modeled=0 vs observed=%,.0f — "
+                    "Screenline '%s': modeled=0 vs observed=%.0f — "
                     "resolved links may be disconnected or missing demand",
                     sl.name, r.observed_total,
                 )
             elif r.ratio < 0.1:
                 logger.warning(
-                    "Screenline '%s': ratio=%.3f (modeled=%,.0f vs observed=%,.0f) — "
+                    "Screenline '%s': ratio=%.3f (modeled=%.0f vs observed=%.0f) — "
                     "severe under-assignment, check gateway demand",
                     sl.name, r.ratio, r.modeled_total, r.observed_total,
                 )
@@ -849,11 +849,21 @@ def auto_generate_screenlines(
             except Exception as exc:
                 logger.debug("Could not load network refs for CSD filter: %s", exc)
 
+        csd_agg_method = str(auto_cfg.get("csd_agg_method", "max"))
+
         if "sil" in csd_df.columns and "sv" in csd_df.columns:
-            grouped = csd_df.groupby("sil", as_index=False).agg(
-                sv_mean=("sv", "mean"),
-                o_mean=("o", "mean") if "o" in csd_df.columns else ("sv", "mean"),
-            )
+            agg_fn = csd_agg_method if csd_agg_method in ("mean", "max", "median") else "max"
+            agg_dict: dict = {
+                "sv_agg": ("sv", agg_fn),
+            }
+            if "o" in csd_df.columns:
+                agg_dict["o_agg"] = ("o", agg_fn)
+            else:
+                agg_dict["o_agg"] = ("sv", agg_fn)
+            # Also keep the mean for the AADT threshold filter
+            agg_dict["sv_mean"] = ("sv", "mean")
+
+            grouped = csd_df.groupby("sil", as_index=False).agg(**agg_dict)
             major = grouped[grouped["sv_mean"] >= csd_min_aadt]
 
             n_skipped_no_network = 0
@@ -874,8 +884,8 @@ def auto_generate_screenlines(
                     name=name,
                     description=f"Auto-generated CSD screenline for road {road_norm}",
                     sl_type="radial",
-                    observed_aadt_cars=float(row.get("o_mean", 0)),
-                    observed_aadt_all=float(row["sv_mean"]),
+                    observed_aadt_cars=float(row.get("o_agg", 0)),
+                    observed_aadt_all=float(row["sv_agg"]),
                     attr_filter={"osm_ref_norm": road_norm},
                 ))
             n_csd = len([s for s in result if s.name.startswith("auto_csd_")])

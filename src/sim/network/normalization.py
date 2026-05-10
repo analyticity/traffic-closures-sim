@@ -121,19 +121,23 @@ def _apply_csd_capacity_hints(
 
     n_updated = 0
     if has_aadt.any():
-        min_cap = merged.loc[has_aadt, "aadt"] * peak_hour_factor
+        idx = has_aadt[has_aadt].index
+        min_cap = merged.loc[idx, "aadt"].values * peak_hour_factor
         for suffix, lanes_col in [("ab", "lanes_ab"), ("ba", "lanes_ba")]:
             cap_col = f"capacity_{suffix}"
-            per_lane_min = min_cap / links.loc[has_aadt.values, lanes_col].clip(lower=1)
-            current = links.loc[has_aadt.values, cap_col]
-            upgrade_mask = has_aadt.values & (current < per_lane_min.values * links.loc[has_aadt.values, lanes_col].values)
-            if upgrade_mask.any():
-                new_cap = per_lane_min.values * links.loc[has_aadt.values, lanes_col].values
-                links.loc[upgrade_mask, cap_col] = np.maximum(
-                    links.loc[upgrade_mask, cap_col],
-                    new_cap[upgrade_mask[has_aadt.values]],
+            lanes_vals = links.loc[idx, lanes_col].clip(lower=1).values
+            per_lane_min = min_cap / lanes_vals
+            current = links.loc[idx, cap_col].values
+            threshold = per_lane_min * lanes_vals
+            upgrade = current < threshold
+            if upgrade.any():
+                new_cap = threshold[upgrade]
+                up_idx = idx[upgrade]
+                links.loc[up_idx, cap_col] = np.maximum(
+                    links.loc[up_idx, cap_col].values,
+                    new_cap,
                 )
-                n_updated += int(upgrade_mask.sum())
+                n_updated += int(upgrade.sum())
 
     links.drop(columns=["_ref_norm"], inplace=True, errors="ignore")
     if n_updated > 0:

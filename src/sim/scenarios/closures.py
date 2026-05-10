@@ -77,10 +77,14 @@ def _match_closures_to_links(
             row = gdf.iloc[int(cidx)]
             lid = int(row["link_id"])
 
-            if closure_ref and link_ref_col:
+            if link_ref_col and require_road_ref_match:
                 link_ref = str(row.get(link_ref_col, "") or "").strip()
-                if require_road_ref_match and closure_ref and link_ref and closure_ref != link_ref:
-                    continue
+                if closure_ref:
+                    if link_ref and closure_ref != link_ref:
+                        continue
+                else:
+                    if link_ref:
+                        continue
 
             link_closures.setdefault(lid, []).append(closure_dict)
 

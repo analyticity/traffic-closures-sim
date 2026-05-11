@@ -132,7 +132,12 @@ def _match_attr_filter(row: pd.Series, attr_filter: Dict[str, str]) -> bool:
         if val is None or (isinstance(val, float) and np.isnan(val)):
             return False
         val_str = str(val).strip().lower()
-        alternatives = {a.strip().lower() for a in pattern.split(",")}
+        alternatives = set()
+        for a in pattern.split(","):
+            for part in a.strip().lower().split(";"):
+                p = part.strip()
+                if p:
+                    alternatives.add(p)
         val_parts = {p.strip() for p in val_str.split(";")} if ";" in val_str else {val_str}
         if not val_parts & alternatives:
             return False
@@ -796,10 +801,10 @@ def auto_generate_screenlines(
                             adj_idxs = node_to_link_rows.get(nid, [])
                             adj = links_gdf.iloc[adj_idxs]
                             if ref:
-                                ref_lower = ref.lower()
+                                ref_parts = {p.strip() for p in ref.lower().split(";")}
                                 adj = adj[adj["osm_ref_norm"].apply(
-                                    lambda v, rl=ref_lower: (
-                                        rl in str(v).lower().split(";")
+                                    lambda v, rp=ref_parts: (
+                                        bool(rp & {p.strip() for p in str(v).lower().split(";")})
                                         if pd.notna(v) else False
                                     )
                                 )]

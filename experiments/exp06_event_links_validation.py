@@ -35,7 +35,7 @@ from _common import (
 )
 
 logger = logging.getLogger(__name__)
-NAME = "exp06_event_links"
+NAME = "exp06_event_links_validation"
 
 VC_DELTA_THRESHOLD = 0.15
 
@@ -117,8 +117,9 @@ def main() -> None:
     link_to_seg = {v: k for k, v in seg_map.items()}
 
     # Focus on closures that have real jam data
-    if "jam_count" in ri.columns:
-        closures_with_impact = ri[ri["jam_count"].fillna(0) > 0].copy()
+    jam_col = "jams_caused" if "jams_caused" in ri.columns else "jam_count"
+    if jam_col in ri.columns:
+        closures_with_impact = ri[ri[jam_col].fillna(0) > 0].copy()
     else:
         closures_with_impact = pd.DataFrame()
     if closures_with_impact.empty:
@@ -128,14 +129,18 @@ def main() -> None:
     logger.info("Evaluating %d closures with known jam impacts", len(test))
 
     # Map event_links jams to link_ids
-    if not el.empty and "segment_id" in el.columns:
-        el["link_id"] = el["segment_id"].map(seg_map)
+    seg_col = "jam_segment_id" if "jam_segment_id" in el.columns else "segment_id"
+    src_col = "source_id" if "source_id" in el.columns else "restriction_id"
+    if not el.empty and seg_col in el.columns:
+        el["link_id"] = el[seg_col].map(seg_map)
+        if src_col != "restriction_id":
+            el["restriction_id"] = el[src_col]
     else:
         el = pd.DataFrame(columns=["restriction_id", "link_id"])
 
     results = []
     for _, ri_row in test.iterrows():
-        rid = int(ri_row.get("restriction_id", ri_row.get("id", 0)))
+        rid = int(ri_row.get("source_id", ri_row.get("restriction_id", ri_row.get("id", 0))))
         cl_rows = closures[closures["id"] == rid]
         if cl_rows.empty:
             continue

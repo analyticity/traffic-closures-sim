@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import copy
 import logging
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -79,37 +81,50 @@ def _run_scaled_assignment(
     project_path = Path(cfg["project_path"])
     fix_node_ids(project_path)
 
-    mat = AequilibraeMatrix()
-    mat.load(str(demand_cfg.get("matrix_path")))
-    mat.computational_view([core_name])
-
-    # Scale demand in-memory
-    if demand_factor != 1.0:
-        mat.matrix_view[:] = mat.matrix_view[:] * demand_factor
-        logger.info("Demand scaled by %.2f (total trips: %.0f)", demand_factor, float(mat.matrix_view.sum()))
-
-    project = Project()
-    project.open(str(project_path))
+    orig_matrix_path = Path(demand_cfg.get("matrix_path"))
+    tmp_matrix = None
     try:
-        graph = build_graph(project, mat, bpr_parameters=bpr_params, assignment_cfg=assign_cfg)
-        if scenario_links:
-            apply_scenario_to_graph(graph, scenario_links)
+        if demand_factor != 1.0:
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".aem")
+            import os; os.close(tmp_fd)
+            tmp_matrix = Path(tmp_path)
+            shutil.copy2(orig_matrix_path, tmp_matrix)
+            mat = AequilibraeMatrix()
+            mat.load(str(tmp_matrix))
+        else:
+            mat = AequilibraeMatrix()
+            mat.load(str(orig_matrix_path))
+        mat.computational_view([core_name])
 
-        df, _skims, _sl, _conv = execute_assignment(
-            project, mat,
-            algorithm=_algorithm,
-            max_iter=_max_iter,
-            rgap_target=_rgap,
-            bpr_parameters=bpr_params,
-            multi_class=multi_classes,
-            fixed_cost_field=gc_field,
-            fixed_cost_multiplier=gc_mult,
-            vot=gc_vot,
-            graph=graph,
-        )
+        if demand_factor != 1.0:
+            mat.matrix_view[:] = mat.matrix_view[:] * demand_factor
+            logger.info("Demand scaled by %.2f (total trips: %.0f)", demand_factor, float(mat.matrix_view.sum()))
+
+        project = Project()
+        project.open(str(project_path))
+        try:
+            graph = build_graph(project, mat, bpr_parameters=bpr_params, assignment_cfg=assign_cfg)
+            if scenario_links:
+                apply_scenario_to_graph(graph, scenario_links)
+
+            df, _skims, _sl, _conv = execute_assignment(
+                project, mat,
+                algorithm=_algorithm,
+                max_iter=_max_iter,
+                rgap_target=_rgap,
+                bpr_parameters=bpr_params,
+                multi_class=multi_classes,
+                fixed_cost_field=gc_field,
+                fixed_cost_multiplier=gc_mult,
+                vot=gc_vot,
+                graph=graph,
+            )
+        finally:
+            project.close()
+            mat.close()
     finally:
-        project.close()
-        mat.close()
+        if tmp_matrix and tmp_matrix.exists():
+            tmp_matrix.unlink()
 
     aggregate_daily_volumes(df)
     return df

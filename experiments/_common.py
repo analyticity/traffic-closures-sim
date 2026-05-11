@@ -238,7 +238,14 @@ def compute_scenario_kpis(
     b_vht = compute_vht(baseline)
     s_vht = compute_vht(scenario)
     b_vkt = compute_vkt(baseline)
-    s_vkt = compute_vkt(scenario)
+    if "distance" not in scenario.columns and "distance" in baseline.columns:
+        scenario_with_dist = scenario.merge(
+            baseline[["link_id", "distance"]].drop_duplicates("link_id"),
+            on="link_id", how="left",
+        )
+        s_vkt = compute_vkt(scenario_with_dist)
+    else:
+        s_vkt = compute_vkt(scenario)
 
     b_overloaded = int((baseline.get("VOC_max", pd.Series(dtype=float)).fillna(0) > 1.0).sum())
     s_overloaded = int((scenario.get("VOC_max", pd.Series(dtype=float)).fillna(0) > 1.0).sum())

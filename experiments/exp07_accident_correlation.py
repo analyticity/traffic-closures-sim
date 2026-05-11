@@ -26,7 +26,7 @@ from _common import (
 )
 
 logger = logging.getLogger(__name__)
-NAME = "exp07_accidents"
+NAME = "exp07_accident_correlation"
 
 
 def _load_accidents(cfg: dict) -> pd.DataFrame:

@@ -28,7 +28,7 @@ from _common import (
 )
 
 logger = logging.getLogger(__name__)
-NAME = "exp10_quality_score"
+NAME = "exp10_quality_score_sensitivity"
 
 QUALITY_THRESHOLDS = [0, 30, 50, 70, 90]
 

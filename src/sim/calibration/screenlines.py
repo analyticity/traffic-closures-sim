@@ -705,6 +705,7 @@ def auto_generate_screenlines(
     zoning_out = Path(cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones"))
 
     result: List[ScreenlineDef] = []
+    gw_df: Optional[pd.DataFrame] = None
 
     # --- 1) Gateway-based screenlines ---------------------------------------
     if bool(auto_cfg.get("gateway_screenlines", True)):
@@ -877,26 +878,169 @@ def auto_generate_screenlines(
                 len(result), n_with_obs,
             )
 
+            # --- Post-processing A: Cap explicit_links to max 2 per gateway --
+            # At interchanges, multiple parallel carriageway links get picked
+            # up (e.g. 4 links at a D1 exit). Keep only the 2 highest-capacity
+            # links to avoid quadruple-counting the same corridor.
+            _MAX_GW_LINKS = 2
+            if links_gdf is not None and "capacity_ab" in links_gdf.columns:
+                for sl in result:
+                    if sl.has_explicit_links and len(sl.links) > _MAX_GW_LINKS:
+                        lid_set = {lid for lid, _ in sl.links}
+                        cap_lookup = links_gdf[links_gdf["link_id"].isin(lid_set)].set_index("link_id")["capacity_ab"]
+                        scored = sorted(
+                            sl.links,
+                            key=lambda t: float(cap_lookup.get(t[0], 0)),
+                            reverse=True,
+                        )
+                        old_count = len(sl.links)
+                        sl.links = scored[:_MAX_GW_LINKS]
+                        logger.info(
+                            "Gateway screenline '%s': capped links from %d to %d "
+                            "(kept highest-capacity)",
+                            sl.name, old_count, len(sl.links),
+                        )
+
+            # --- Post-processing B: Fix merged-gateway observed values -------
+            # When a gateway merged refs from different roads (e.g. 449_NW
+            # merged from 449_NW|447_NW), sum CSD AADT of all absorbed roads.
+            if csd_mean_by_road:
+                for sl in result:
+                    if not sl.name.startswith("auto_gw_"):
+                        continue
+                    gw_short = sl.name[len("auto_gw_"):]
+                    gw_row = gw_df[gw_df["gateway_name"] == gw_short]
+                    if gw_row.empty:
+                        continue
+                    merged_from = str(gw_row.iloc[0].get("merged_from", ""))
+                    if not merged_from or "|" not in merged_from:
+                        continue
+                    merged_refs: set[str] = set()
+                    for part in merged_from.split("|"):
+                        part = part.strip()
+                        # Extract road ref from gateway name (e.g. 447_NW -> 447)
+                        ref_part = part.rsplit("_", 1)[0] if "_" in part else part
+                        # Handle numbered suffixes like 150_SW_4 -> 150
+                        while ref_part and ref_part[-1].isdigit() and "_" in ref_part:
+                            candidate = ref_part.rsplit("_", 1)[0]
+                            if candidate.rsplit("_", 1)[-1] in ("N", "S", "E", "W", "NE", "NW", "SE", "SW"):
+                                ref_part = candidate.rsplit("_", 1)[0]
+                                break
+                            ref_part = candidate
+                        if "_" in ref_part:
+                            ref_part = ref_part.rsplit("_", 1)[0]
+                        ref_norm_m = ref_part.upper().replace(" ", "")
+                        try:
+                            ref_norm_m = str(int(ref_norm_m))
+                        except ValueError:
+                            ref_norm_m = ref_norm_m.lstrip("0") or ref_norm_m
+                        if ref_norm_m:
+                            merged_refs.add(ref_norm_m)
+
+                    if len(merged_refs) > 1:
+                        total_all = 0.0
+                        total_cars = 0.0
+                        for mref in merged_refs:
+                            csd_hit = csd_mean_by_road.get(mref)
+                            if csd_hit:
+                                total_all += csd_hit["sv"]
+                                total_cars += csd_hit["o"]
+                        if total_all > 0:
+                            logger.info(
+                                "Gateway '%s': merged from roads %s — summing "
+                                "CSD obs to %.0f (was %.0f)",
+                                sl.name, merged_refs, total_all,
+                                sl.observed_aadt_all or 0,
+                            )
+                            sl.observed_aadt_all = total_all
+                            sl.observed_aadt_cars = total_cars
+
+            # --- Post-processing C: Divide observed by per-road-per-side count -
+            # If road X has N gateway screenlines on the SAME side of the model,
+            # each gets the full CSD observed value. Divide by N so ODME sees
+            # correct total weight.  Gateways on OPPOSITE sides (e.g. 13_E vs
+            # 13_W) are independent entry points and should NOT be divided.
+            from collections import Counter
+            _DIR_SUFFIXES = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
+
+            def _extract_direction(gw_name: str) -> str:
+                """Extract cardinal direction suffix from gateway name."""
+                parts = gw_name.rsplit("_", 1)
+                if len(parts) == 2 and parts[1] in _DIR_SUFFIXES:
+                    return parts[1]
+                # Handle numbered variants like 379_NE_2 -> NE
+                if len(parts) == 2 and parts[1].isdigit():
+                    inner = parts[0].rsplit("_", 1)
+                    if len(inner) == 2 and inner[1] in _DIR_SUFFIXES:
+                        return inner[1]
+                return ""
+
+            # Group by (road_ref, direction_side)
+            gw_side_counter: Counter = Counter()
+            gw_side_map: Dict[str, Tuple[str, str]] = {}  # sl.name -> (ref, side)
+            for sl in result:
+                if not sl.name.startswith("auto_gw_"):
+                    continue
+                gw_short = sl.name[len("auto_gw_"):]
+                gw_row_c = gw_df[gw_df["gateway_name"] == gw_short]
+                if gw_row_c.empty:
+                    continue
+                ref_c = str(gw_row_c.iloc[0].get("matched_ref", "")).strip()
+                if not ref_c:
+                    continue
+                ref_norm_c = ref_c.upper().replace(" ", "")
+                try:
+                    ref_norm_c = str(int(ref_norm_c))
+                except ValueError:
+                    ref_norm_c = ref_norm_c.lstrip("0") or ref_norm_c
+                direction = _extract_direction(gw_short)
+                key = (ref_norm_c, direction)
+                gw_side_counter[key] += 1
+                gw_side_map[sl.name] = key
+
+            for sl in result:
+                if sl.name not in gw_side_map:
+                    continue
+                key = gw_side_map[sl.name]
+                count = gw_side_counter[key]
+                if count > 1:
+                    if sl.observed_aadt_all:
+                        sl.observed_aadt_all = sl.observed_aadt_all / count
+                    if sl.observed_aadt_cars:
+                        sl.observed_aadt_cars = sl.observed_aadt_cars / count
+                    logger.info(
+                        "Gateway '%s': road %s side %s has %d gateways — "
+                        "dividing observed by %d (now %.0f)",
+                        sl.name, key[0], key[1], count, count,
+                        sl.observed_aadt_all or 0,
+                    )
+
     # --- 2) CSD-based screenlines -------------------------------------------
     # Collect road refs already covered by gateway screenlines to avoid
     # giving the same corridor double weight in ODME calibration.
+    # Only add the SURVIVING gateway's matched_ref — merged-away road refs
+    # should still get their own CSD screenlines.
     gw_road_refs: set[str] = set()
     for sl in result:
-        if sl.name.startswith("auto_gw_") and sl.has_explicit_links:
-            af = getattr(sl, "attr_filter", None) or {}
-            ref_val = af.get("osm_ref_norm", "")
-            if not ref_val and sl.name.startswith("auto_gw_"):
-                # Extract ref from gateway name (e.g. auto_gw_D52_S -> D52)
-                parts = sl.name[len("auto_gw_"):].rsplit("_", 1)
-                if parts:
-                    ref_val = parts[0]
-            if ref_val:
-                norm_ref = ref_val.upper().replace(" ", "")
-                try:
-                    norm_ref = str(int(norm_ref))
-                except ValueError:
-                    norm_ref = norm_ref.lstrip("0") or norm_ref
-                gw_road_refs.add(norm_ref)
+        if not sl.name.startswith("auto_gw_"):
+            continue
+        gw_short = sl.name[len("auto_gw_"):]
+        ref_val = ""
+        if gw_df is not None:
+            _gw_row = gw_df[gw_df["gateway_name"] == gw_short]
+            if not _gw_row.empty:
+                ref_val = str(_gw_row.iloc[0].get("matched_ref", "")).strip()
+        if not ref_val:
+            parts = gw_short.rsplit("_", 1)
+            if parts:
+                ref_val = parts[0]
+        if ref_val:
+            norm_ref = ref_val.upper().replace(" ", "")
+            try:
+                norm_ref = str(int(norm_ref))
+            except ValueError:
+                norm_ref = norm_ref.lstrip("0") or norm_ref
+            gw_road_refs.add(norm_ref)
 
     csd_min_aadt = float(auto_cfg.get("csd_min_aadt", 5000))
     if csd_df is not None and not csd_df.empty and bool(auto_cfg.get("csd_screenlines", True)):

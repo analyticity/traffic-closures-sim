@@ -1,6 +1,6 @@
-# Network normalization: experiment profiles.
+# Network normalization: Brno-specific overrides.
 # Speed/lanes/capacity defaults for Czech link types are built into the code
-# (see _DEFAULT_*_BY_LINK_TYPE in network_normalization.py).
+# (see defaults.py NETWORK_NORM_DEFAULTS).
 # This file only needs experiment_profiles with city-specific overrides.
 
 experiment_profiles:
@@ -18,10 +18,6 @@ experiment_profiles:
         min_speed: 60
         comment: "I/52 urban section — 27k AADT, same corridor as trunk I/52"
 
-    lanes_by_link_type:
-      secondary: 2
-    capacity_per_lane_by_link_type:
-      secondary: 900
     speed_caps:
       trunk: 80.0
       trunk_link: 60.0

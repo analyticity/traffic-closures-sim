@@ -161,6 +161,13 @@ def _log_connectivity(connectivity_info: dict) -> None:
         connectivity_info["isolated_nodes_count"],
         connectivity_info["isolated_components_count"],
     )
+    major_outside = connectivity_info.get("major_links_outside_scc", 0)
+    if major_outside > 0:
+        logger.warning(
+            "Connectivity: %d motorway/trunk links outside largest SCC "
+            "— these will carry zero flow and distort screenline calibration",
+            major_outside,
+        )
 
 
 def _apply_closures_if_enabled(

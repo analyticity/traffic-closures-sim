@@ -290,15 +290,24 @@ def normalize_network_attributes(
     on matched roads.
     """
     defaults, thresholds = _normalization_defaults(network_cfg)
-    default_speeds = defaults["speed_by_link_type"]
-    default_lanes = defaults["lanes_by_link_type"]
-    cap_per_lane = defaults["capacity_per_lane_by_link_type"]
     fallback_speed = _threshold(thresholds, "fallback_speed_kmh", 50.0)
     generic_cpl = _threshold(thresholds, "generic_capacity_per_lane", 900.0)
     min_tt = _threshold(thresholds, "min_travel_time_s", 0.01)
 
     profile = _resolved_experiment_profile(network_cfg, experiment_profile)
     logger.info("Applying network experiment profile: %s", experiment_profile)
+
+    # Merge lanes/capacity overrides from the experiment profile into defaults
+    # so that per-city profiles can set these without requiring a separate
+    # normalization.defaults block.
+    for key in ("speed_by_link_type", "lanes_by_link_type", "capacity_per_lane_by_link_type"):
+        profile_vals = profile.get(key)
+        if isinstance(profile_vals, dict) and profile_vals:
+            defaults[key] = {**defaults[key], **profile_vals}
+
+    default_speeds = defaults["speed_by_link_type"]
+    default_lanes = defaults["lanes_by_link_type"]
+    cap_per_lane = defaults["capacity_per_lane_by_link_type"]
 
     links = project.network.links.data.copy()
 

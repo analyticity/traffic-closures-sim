@@ -23,8 +23,6 @@ demand:
   segments:
     external_local:
       total_daily_trips: "auto"
-  distribution:
-    blend_alpha: 0.75
 
 calibration:
   rgap_target: 0.002

@@ -149,6 +149,13 @@ def repair_divided_highway_dead_ends(
     from shapely.geometry import LineString
 
     _IGNORE = _MAJOR_ROAD_TYPES | {"centroid_connector"}
+    # Minor link types that don't disqualify a node as a dead end --
+    # service roads and driveways often connect at highway endpoints
+    # without providing real cross-traffic connectivity.
+    _MINOR_ALLOWABLE = frozenset({
+        "service", "living_street", "residential", "unclassified",
+        "tertiary_link", "secondary_link", "primary_link",
+    })
 
     with project_db(project) as conn:
         rows = conn.execute(
@@ -157,6 +164,7 @@ def repair_divided_highway_dead_ends(
 
         node_major: Dict[int, list] = defaultdict(list)
         node_nonmajor: Dict[int, int] = defaultdict(int)
+        node_nonmajor_significant: Dict[int, int] = defaultdict(int)
         link_ref: Dict[int, str] = {}
         link_lt: Dict[int, str] = {}
 
@@ -171,10 +179,19 @@ def repair_divided_highway_dead_ends(
             elif lt_str not in _IGNORE:
                 node_nonmajor[a] += 1
                 node_nonmajor[b] += 1
+                if lt_str not in _MINOR_ALLOWABLE:
+                    node_nonmajor_significant[a] += 1
+                    node_nonmajor_significant[b] += 1
 
         dead_ends: Dict[int, int] = {}
         for nid, major_lids in node_major.items():
-            if len(major_lids) == 1 and node_nonmajor[nid] == 0:
+            if len(major_lids) != 1:
+                continue
+            # Strict: no non-major links at all
+            if node_nonmajor[nid] == 0:
+                dead_ends[nid] = major_lids[0]
+            # Relaxed: only minor/service links (no significant cross-traffic)
+            elif node_nonmajor_significant[nid] == 0:
                 dead_ends[nid] = major_lids[0]
 
         if not dead_ends:
@@ -194,6 +211,7 @@ def repair_divided_highway_dead_ends(
     remaining = set(dead_ends.keys()) & set(node_coords.keys())
     pairs_to_create: list = []
 
+    # Pass 1: pair dead ends that share the same osm_ref_norm
     while remaining:
         best_pair = None
         best_dist = max_snap_distance_m + 1
@@ -217,6 +235,49 @@ def repair_divided_highway_dead_ends(
         remaining.discard(n1)
         remaining.discard(n2)
         pairs_to_create.append((n1, n2, dist, ref))
+
+    # Pass 2: pair remaining dead ends by proximity + matching link_type,
+    # even without osm_ref_norm (handles missing/inconsistent refs)
+    if remaining:
+        remaining_list = sorted(remaining)
+        for i, n1 in enumerate(remaining_list):
+            if n1 not in remaining:
+                continue
+            lt1 = dead_lt.get(n1, "")
+            c1 = node_coords.get(n1)
+            if not c1:
+                continue
+            best_n2 = None
+            best_dist = max_snap_distance_m + 1
+            best_ref = ""
+            for n2 in remaining_list[i + 1:]:
+                if n2 not in remaining or n2 == n1:
+                    continue
+                lt2 = dead_lt.get(n2, "")
+                if lt1 != lt2:
+                    continue
+                c2 = node_coords.get(n2)
+                if not c2:
+                    continue
+                _, _, dist = geod.inv(c1[0], c1[1], c2[0], c2[1])
+                if dist < best_dist:
+                    best_dist = dist
+                    best_n2 = n2
+                    best_ref = dead_ref.get(n1, "") or dead_ref.get(n2, "")
+            if best_n2 is not None and best_dist <= max_snap_distance_m:
+                remaining.discard(n1)
+                remaining.discard(best_n2)
+                pairs_to_create.append((n1, best_n2, best_dist, best_ref))
+
+    if remaining:
+        for nid in sorted(remaining):
+            ref = dead_ref.get(nid, "<no ref>")
+            lt = dead_lt.get(nid, "?")
+            logger.warning(
+                "Divided highway repair: unpaired dead-end node %d "
+                "(ref=%s, type=%s) — may cause one-way disconnection",
+                nid, ref, lt,
+            )
 
     if not pairs_to_create:
         logger.info("Divided highway repair: no pairs within snap distance")

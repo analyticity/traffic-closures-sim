@@ -4,6 +4,22 @@
 
 experiment_profiles:
   baseline:
+    link_type_overrides:
+      - match: {osm_ref_norm: "35", link_type: "primary"}
+        set_link_type: trunk
+        comment: "I/35 — trunk road misclassified as primary in OSM"
+      - match: {osm_ref_norm: "46", link_type: "primary"}
+        set_link_type: trunk
+        comment: "I/46 — trunk road misclassified as primary in OSM"
+      - match: {osm_ref_norm: "47", link_type: "primary"}
+        set_link_type: trunk
+        comment: "I/47 — trunk road misclassified as primary in OSM"
+      - match: {osm_ref_norm: "55", link_type: "primary"}
+        set_link_type: trunk
+        comment: "I/55 — partly misclassified as primary in OSM"
+      - match: {osm_ref_norm: "55", link_type: "secondary"}
+        set_link_type: trunk
+        comment: "I/55 — secondary sections reclassified to trunk"
     speed_caps:
       trunk: 80.0
       trunk_link: 55.0

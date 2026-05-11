@@ -579,6 +579,17 @@ def evaluate_screenline(
             "observed": round(ov, 0),
         })
 
+    # Warn about individual zero-flow links within multi-link screenlines —
+    # a strong indicator of a disconnected one-way carriageway.
+    if len(per_link) > 1:
+        for pl in per_link:
+            if pl["modeled"] == 0 and pl["observed"] > 0:
+                logger.warning(
+                    "Screenline '%s': link %d (dir=%s) has modeled=0 but "
+                    "observed=%.0f — likely a disconnected one-way link",
+                    sl.name, pl["link_id"], pl["direction"], pl["observed"],
+                )
+
     # Use CSD AADT from config when pentlogram gives no observed data,
     # or when matched counts are suspiciously low (< 20% of known AADT).
     # The latter catches cases where CSD-split puts the main road section

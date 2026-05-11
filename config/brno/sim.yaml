@@ -23,6 +23,10 @@ demand:
   segments:
     external_local:
       total_daily_trips: "auto"
+  distribution:
+    blend_alpha: 0.75
+    pa_trip_rate: 2.2
+    pa_car_share: 0.45
 
 calibration:
   rgap_target: 0.002

@@ -955,12 +955,12 @@ def auto_generate_screenlines(
                             sl.observed_aadt_all = total_all
                             sl.observed_aadt_cars = total_cars
 
-            # --- Post-processing C: Divide observed by per-road-per-side count -
-            # If road X has N gateway screenlines on the SAME side of the model,
-            # each gets the full CSD observed value. Divide by N so ODME sees
-            # correct total weight.  Gateways on OPPOSITE sides (e.g. 13_E vs
-            # 13_W) are independent entry points and should NOT be divided.
-            from collections import Counter
+            # --- Post-processing C: Divide observed for PROXIMATE duplicates ----
+            # Gateways on the same road+side that are very close together
+            # (< 1500m) are likely duplicate clusters from the same boundary
+            # crossing. Divide their observed equally so ODME doesn't over-
+            # weight. Gateways further apart are independent entry points.
+            _PROXIMITY_THRESHOLD_M = 1500.0
             _DIR_SUFFIXES = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
 
             def _extract_direction(gw_name: str) -> str:
@@ -968,16 +968,14 @@ def auto_generate_screenlines(
                 parts = gw_name.rsplit("_", 1)
                 if len(parts) == 2 and parts[1] in _DIR_SUFFIXES:
                     return parts[1]
-                # Handle numbered variants like 379_NE_2 -> NE
                 if len(parts) == 2 and parts[1].isdigit():
                     inner = parts[0].rsplit("_", 1)
                     if len(inner) == 2 and inner[1] in _DIR_SUFFIXES:
                         return inner[1]
                 return ""
 
-            # Group by (road_ref, direction_side)
-            gw_side_counter: Counter = Counter()
-            gw_side_map: Dict[str, Tuple[str, str]] = {}  # sl.name -> (ref, side)
+            # Collect gateway info: (sl, ref_norm, direction, bx, by)
+            _gw_info: List[Tuple[ScreenlineDef, str, str, float, float]] = []
             for sl in result:
                 if not sl.name.startswith("auto_gw_"):
                     continue
@@ -994,26 +992,62 @@ def auto_generate_screenlines(
                 except ValueError:
                     ref_norm_c = ref_norm_c.lstrip("0") or ref_norm_c
                 direction = _extract_direction(gw_short)
-                key = (ref_norm_c, direction)
-                gw_side_counter[key] += 1
-                gw_side_map[sl.name] = key
+                bx = float(gw_row_c.iloc[0].get("boundary_x", 0))
+                by = float(gw_row_c.iloc[0].get("boundary_y", 0))
+                _gw_info.append((sl, ref_norm_c, direction, bx, by))
 
-            for sl in result:
-                if sl.name not in gw_side_map:
+            # Group by (road, direction) and cluster by proximity
+            from collections import defaultdict
+            _groups: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+            for idx, (_, ref, dirn, _, _) in enumerate(_gw_info):
+                _groups[(ref, dirn)].append(idx)
+
+            for key, indices in _groups.items():
+                if len(indices) < 2:
                     continue
-                key = gw_side_map[sl.name]
-                count = gw_side_counter[key]
-                if count > 1:
-                    if sl.observed_aadt_all:
-                        sl.observed_aadt_all = sl.observed_aadt_all / count
-                    if sl.observed_aadt_cars:
-                        sl.observed_aadt_cars = sl.observed_aadt_cars / count
-                    logger.info(
-                        "Gateway '%s': road %s side %s has %d gateways — "
-                        "dividing observed by %d (now %.0f)",
-                        sl.name, key[0], key[1], count, count,
-                        sl.observed_aadt_all or 0,
-                    )
+                # Single-linkage clustering within threshold
+                clusters: List[List[int]] = [[i] for i in indices]
+                merged = True
+                while merged:
+                    merged = False
+                    for ci in range(len(clusters)):
+                        if not clusters[ci]:
+                            continue
+                        for cj in range(ci + 1, len(clusters)):
+                            if not clusters[cj]:
+                                continue
+                            # Check if any pair across clusters is within threshold
+                            should_merge = False
+                            for a in clusters[ci]:
+                                for b in clusters[cj]:
+                                    dx = _gw_info[a][3] - _gw_info[b][3]
+                                    dy = _gw_info[a][4] - _gw_info[b][4]
+                                    if (dx * dx + dy * dy) ** 0.5 < _PROXIMITY_THRESHOLD_M:
+                                        should_merge = True
+                                        break
+                                if should_merge:
+                                    break
+                            if should_merge:
+                                clusters[ci].extend(clusters[cj])
+                                clusters[cj] = []
+                                merged = True
+
+                for cluster in clusters:
+                    if len(cluster) < 2:
+                        continue
+                    n = len(cluster)
+                    for idx in cluster:
+                        sl_c = _gw_info[idx][0]
+                        if sl_c.observed_aadt_all:
+                            sl_c.observed_aadt_all = sl_c.observed_aadt_all / n
+                        if sl_c.observed_aadt_cars:
+                            sl_c.observed_aadt_cars = sl_c.observed_aadt_cars / n
+                        logger.info(
+                            "Gateway '%s': proximity cluster (road %s, %s) "
+                            "size %d — dividing observed by %d (now %.0f)",
+                            sl_c.name, key[0], key[1], n, n,
+                            sl_c.observed_aadt_all or 0,
+                        )
 
     # --- 2) CSD-based screenlines -------------------------------------------
     # Collect road refs already covered by gateway screenlines to avoid

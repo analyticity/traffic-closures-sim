@@ -177,19 +177,25 @@ def auto_discover_boundary_roads(
 
     existing_norms = {norm_text(r) for r in existing_refs}
 
-    results: List[Dict[str, Any]] = []
+    # Decompose composite osm_ref values (e.g. "52;41") so each road
+    # number is discovered independently. Without this, a link tagged
+    # "52;41" would be skipped entirely once "52" is already known,
+    # preventing road 41 from ever getting its own gateway.
+    per_road: Dict[str, List[int]] = {}
+    per_road_weight: Dict[str, float] = {}
+    per_road_lanes: Dict[str, int] = {}
+
     for ref_val, group in has_ref.groupby("osm_ref"):
         ref_str = str(ref_val).strip()
         if not ref_str:
             continue
-        ref_norm = norm_text(ref_str)
-        if ref_norm in existing_norms:
-            continue
-        parts = ref_str.split(";")
-        if any(norm_text(p) in existing_norms for p in parts):
+
+        parts = [p.strip() for p in ref_str.split(";") if p.strip()]
+        if not parts:
             continue
 
         best_type = group["link_type"].map(ROAD_CLASS_WEIGHT).max()
+        weight = float(best_type) if pd.notna(best_type) else 0.0
         max_lanes = 1
         for col in ("lanes_ab", "lanes_ba"):
             if col in group.columns:
@@ -197,15 +203,30 @@ def auto_discover_boundary_roads(
                 if pd.notna(v):
                     max_lanes = max(max_lanes, int(v))
 
-        if max_lanes < min_lanes:
-            continue
+        for part in parts:
+            part_norm = norm_text(part)
+            if not part_norm:
+                continue
+            if part_norm not in per_road:
+                per_road[part_norm] = []
+                per_road_weight[part_norm] = 0.0
+                per_road_lanes[part_norm] = 1
+            per_road[part_norm].append(len(group))
+            per_road_weight[part_norm] = max(per_road_weight[part_norm], weight)
+            per_road_lanes[part_norm] = max(per_road_lanes[part_norm], max_lanes)
 
+    results: List[Dict[str, Any]] = []
+    for road_norm, link_counts in per_road.items():
+        if road_norm in existing_norms:
+            continue
+        if per_road_lanes[road_norm] < min_lanes:
+            continue
         results.append({
-            "raw": ref_str,
-            "norm": ref_norm,
-            "slug": slug_token(ref_str),
-            "_class_weight": float(best_type) if pd.notna(best_type) else 0.0,
-            "_n_boundary_links": len(group),
+            "raw": road_norm,
+            "norm": road_norm,
+            "slug": slug_token(road_norm),
+            "_class_weight": per_road_weight[road_norm],
+            "_n_boundary_links": sum(link_counts),
         })
 
     results.sort(key=lambda r: (-r["_class_weight"], -r["_n_boundary_links"]))

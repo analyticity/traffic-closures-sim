@@ -183,7 +183,7 @@ def build_zones_and_connectors(
                         "motorway", "motorway_link", "trunk", "trunk_link",
                         "primary", "primary_link", "secondary", "secondary_link",
                     ]
-                    default_max = 20
+                    default_max = 50
                 else:
                     auto_types = auto_cfg.get("link_types", [
                         "secondary", "secondary_link",

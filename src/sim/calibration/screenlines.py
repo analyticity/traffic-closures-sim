@@ -744,8 +744,8 @@ def auto_generate_screenlines(
 
             # Pre-load network links for anchor-node matching.
             links_gdf: Optional[gpd.GeoDataFrame] = None
-            network_gpkg = Path(cfg.get("demand", {}).get(
-                "network_dir", "outputs/baseline/network",
+            network_gpkg = Path(cfg.get("network", {}).get(
+                "output_dir", "outputs/baseline/network",
             )) / "network_links.gpkg"
             network_geojson = network_gpkg.with_suffix(".geojson")
             for net_path in (network_gpkg, network_geojson):
@@ -759,8 +759,10 @@ def auto_generate_screenlines(
             node_to_link_rows: dict = {}
             if links_gdf is not None:
                 for i, (a, b) in enumerate(zip(links_gdf["a_node"].values, links_gdf["b_node"].values)):
-                    node_to_link_rows.setdefault(int(a), []).append(i)
-                    node_to_link_rows.setdefault(int(b), []).append(i)
+                    if pd.notna(a):
+                        node_to_link_rows.setdefault(int(a), []).append(i)
+                    if pd.notna(b):
+                        node_to_link_rows.setdefault(int(b), []).append(i)
 
             for _, row in gw_df.iterrows():
                 gw_name = str(row.get("gateway_name", ""))
@@ -776,6 +778,9 @@ def auto_generate_screenlines(
                 target_nodes_raw = str(row.get("target_node_ids", ""))
 
                 # --- resolve explicit links from anchor/target nodes ------
+                # Pick links adjacent to target nodes that lead INTO the
+                # network (not hinge links connecting two target nodes to
+                # each other, which get bypassed by dual connectors).
                 explicit_links: List[Tuple[int, int]] = []
                 if links_gdf is not None and target_nodes_raw:
                     try:
@@ -797,6 +802,13 @@ def auto_generate_screenlines(
                                         if pd.notna(v) else False
                                     )
                                 )]
+                            # Exclude hinge links (both ends are target
+                            # nodes) -- assignment bypasses these via the
+                            # dual connector topology.
+                            adj = adj[~(
+                                adj["a_node"].astype(int).isin(tnodes)
+                                & adj["b_node"].astype(int).isin(tnodes)
+                            )]
                             for _, lrow in adj.iterrows():
                                 lid = int(lrow["link_id"])
                                 if lid not in {l[0] for l in explicit_links}:
@@ -866,6 +878,26 @@ def auto_generate_screenlines(
             )
 
     # --- 2) CSD-based screenlines -------------------------------------------
+    # Collect road refs already covered by gateway screenlines to avoid
+    # giving the same corridor double weight in ODME calibration.
+    gw_road_refs: set[str] = set()
+    for sl in result:
+        if sl.name.startswith("auto_gw_") and sl.has_explicit_links:
+            af = getattr(sl, "attr_filter", None) or {}
+            ref_val = af.get("osm_ref_norm", "")
+            if not ref_val and sl.name.startswith("auto_gw_"):
+                # Extract ref from gateway name (e.g. auto_gw_D52_S -> D52)
+                parts = sl.name[len("auto_gw_"):].rsplit("_", 1)
+                if parts:
+                    ref_val = parts[0]
+            if ref_val:
+                norm_ref = ref_val.upper().replace(" ", "")
+                try:
+                    norm_ref = str(int(norm_ref))
+                except ValueError:
+                    norm_ref = norm_ref.lstrip("0") or norm_ref
+                gw_road_refs.add(norm_ref)
+
     csd_min_aadt = float(auto_cfg.get("csd_min_aadt", 5000))
     if csd_df is not None and not csd_df.empty and bool(auto_cfg.get("csd_screenlines", True)):
         for col in ("sv", "o", "tv"):
@@ -874,7 +906,9 @@ def auto_generate_screenlines(
 
         # Collect all road refs present in the model network so we only
         # generate screenlines for roads that the model can actually resolve.
+        # Also compute per-road network distance (km) for coverage filtering.
         network_refs: set[str] = set()
+        network_road_km: Dict[str, float] = {}
         project_dir = Path(cfg.get("project_path", ""))
         if project_dir.exists():
             try:
@@ -889,6 +923,19 @@ def auto_generate_screenlines(
                                 part = part.strip().lower()
                                 if part:
                                     network_refs.add(part)
+                        if "distance" in _ldf.columns:
+                            _ldf = _ldf[_ldf["osm_ref_norm"].notna()].copy()
+                            _ldf["_dist_km"] = pd.to_numeric(
+                                _ldf["distance"], errors="coerce"
+                            ).fillna(0) / 1000.0
+                            for _, row in _ldf.iterrows():
+                                for part in str(row["osm_ref_norm"]).split(";"):
+                                    part = part.strip().lower()
+                                    if part:
+                                        network_road_km[part] = (
+                                            network_road_km.get(part, 0.0)
+                                            + float(row["_dist_km"])
+                                        )
                 finally:
                     _prj.close()
                 logger.info(
@@ -899,6 +946,15 @@ def auto_generate_screenlines(
                 logger.debug("Could not load network refs for CSD filter: %s", exc)
 
         csd_agg_method = str(auto_cfg.get("csd_agg_method", "mean"))
+        csd_min_coverage = float(auto_cfg.get("csd_min_coverage", 0.5))
+
+        # Pre-compute CSD total road-km per road for coverage filtering
+        csd_road_km: Dict[str, float] = {}
+        if "delka" in csd_df.columns:
+            _csd_len = csd_df[["sil", "delka"]].copy()
+            _csd_len["delka"] = pd.to_numeric(_csd_len["delka"], errors="coerce").fillna(0)
+            for sil_val, grp in _csd_len.groupby("sil"):
+                csd_road_km[str(sil_val).strip().lower()] = float(grp["delka"].sum())
 
         if "sil" in csd_df.columns and "sv" in csd_df.columns:
             agg_fn = csd_agg_method if csd_agg_method in ("mean", "max", "median") else "max"
@@ -916,6 +972,8 @@ def auto_generate_screenlines(
             major = grouped[grouped["sv_mean"] >= csd_min_aadt]
 
             n_skipped_no_network = 0
+            n_skipped_partial = 0
+            n_skipped_gw_dup = 0
             for _, row in major.iterrows():
                 road = str(row["sil"]).strip()
 
@@ -926,9 +984,29 @@ def auto_generate_screenlines(
                     road_norm = road_norm.lstrip("0") or road_norm
 
                 name = f"auto_csd_{road_norm}"
+
+                # Skip if a gateway screenline already covers this road
+                if road_norm in gw_road_refs:
+                    n_skipped_gw_dup += 1
+                    continue
+
                 if network_refs and road_norm.lower() not in network_refs:
                     n_skipped_no_network += 1
                     continue
+
+                # Skip roads with low coverage (mostly outside the model area)
+                if network_road_km and csd_road_km:
+                    net_km = network_road_km.get(road_norm.lower(), 0.0)
+                    csd_km = csd_road_km.get(road.strip().lower(), 0.0)
+                    if csd_km > 0 and net_km / csd_km < csd_min_coverage:
+                        n_skipped_partial += 1
+                        logger.debug(
+                            "CSD screenline %s skipped: coverage %.2f "
+                            "(model %.1f km vs CSD %.1f km)",
+                            name, net_km / csd_km, net_km, csd_km,
+                        )
+                        continue
+
                 result.append(ScreenlineDef(
                     name=name,
                     description=f"Auto-generated CSD screenline for road {road_norm}",
@@ -940,8 +1018,10 @@ def auto_generate_screenlines(
             n_csd = len([s for s in result if s.name.startswith("auto_csd_")])
             logger.info(
                 "Auto-generated %d CSD screenlines (min AADT=%d, "
-                "skipped %d no-network)",
+                "skipped %d no-network, %d partial-coverage, "
+                "%d gateway-duplicate)",
                 n_csd, int(csd_min_aadt), n_skipped_no_network,
+                n_skipped_partial, n_skipped_gw_dup,
             )
 
     return result

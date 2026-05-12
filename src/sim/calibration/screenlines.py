@@ -18,6 +18,7 @@ import geopandas as gpd
 import yaml
 
 from sim._metrics import compute_geh
+from sim.calibration.validation import merge_divided_highway_screenline_per_link
 
 logger = logging.getLogger(__name__)
 
@@ -556,8 +557,6 @@ def evaluate_screenline(
     if not resolved and links_gdf is not None:
         resolved = resolve_screenline_links(sl, links_gdf)
 
-    mod_total = 0.0
-    obs_total = 0.0
     per_link: List[Dict[str, Any]] = []
 
     vol_idx = vol_df.set_index("link_id", drop=False) if "link_id" in vol_df.columns else vol_df
@@ -570,14 +569,18 @@ def evaluate_screenline(
     for link_id, direction in resolved:
         mv = _get_link_volume(vol_df, link_id, direction, vol_col, _vol_idx=vol_idx)
         ov = _get_link_observed(matched_counts, link_id, obs_col, _obs_idx=obs_idx)
-        mod_total += mv
-        obs_total += ov
         per_link.append({
             "link_id": link_id,
             "direction": direction,
             "modeled": round(mv, 0),
             "observed": round(ov, 0),
         })
+
+    if links_gdf is not None:
+        per_link = merge_divided_highway_screenline_per_link(per_link, links_gdf)
+
+    mod_total = float(sum(float(pl.get("modeled", 0) or 0) for pl in per_link))
+    obs_total = float(sum(float(pl.get("observed", 0) or 0) for pl in per_link))
 
     # Warn about individual zero-flow links within multi-link screenlines —
     # a strong indicator of a disconnected one-way carriageway.

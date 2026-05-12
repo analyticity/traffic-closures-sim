@@ -234,6 +234,28 @@ def _apply_time_penalties(links: pd.DataFrame, time_penalties: dict) -> None:
         links.loc[m, "travel_time_ba"] = links.loc[m, "travel_time_ba"] + penalty_s
 
 
+def _zero_oneway_reverse_attributes(links: pd.DataFrame, min_tt: float) -> None:
+    """Clear reverse-direction capacity/speed/time on true one-way links.
+
+    After backfill and experiment clipping, ``direction == 1`` links must not
+    retain synthetic ``*_ba`` attributes (phantom reverse arcs in the graph).
+    ``direction == -1`` clears the ``*_ab`` side symmetrically.
+    """
+    if "direction" not in links.columns:
+        return
+    dirs = pd.to_numeric(links["direction"], errors="coerce").fillna(0).astype(int)
+    fwd = dirs == 1
+    rev = dirs == -1
+    if fwd.any():
+        links.loc[fwd, "capacity_ba"] = 0
+        links.loc[fwd, "speed_ba"] = 0
+        links.loc[fwd, "travel_time_ba"] = min_tt
+    if rev.any():
+        links.loc[rev, "capacity_ab"] = 0
+        links.loc[rev, "speed_ab"] = 0
+        links.loc[rev, "travel_time_ab"] = min_tt
+
+
 def _apply_experiment_profile(
     links: pd.DataFrame,
     profile: dict,
@@ -516,6 +538,8 @@ def normalize_network_attributes(
     _apply_time_penalties(links, profile.get("time_penalties") or {})
     for tt_col in ("travel_time_ab", "travel_time_ba"):
         links[tt_col] = links[tt_col].clip(lower=min_tt)
+
+    _zero_oneway_reverse_attributes(links, min_tt)
 
     # --- Write link attributes to DB ---
     db_path = project_db_path(project)

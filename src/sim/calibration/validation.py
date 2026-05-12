@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import geopandas as gpd
 import numpy as np
@@ -51,6 +51,137 @@ from sim.defaults import SIM_DEFAULTS as _SIM_DEFAULTS  # noqa: F401
 from sim.io_project import get_metric_epsg, get_nested, load_config
 
 logger = logging.getLogger(__name__)
+
+# CSD divided-highway: only motorway/trunk when a large share of matched length
+# is one-way (dual carriageway). Avoids false positives from a few urban
+# one-way segments on secondary/tertiary refs sharing the same osm_ref.
+_DH_ROAD_CLASSES_FOR_CSD = frozenset({"motorway", "trunk"})
+_DH_MIN_ONEWAY_SHARE = 0.5
+
+
+def _base_divided_highway_link_type(link_type: Any) -> Optional[str]:
+    """Return ``motorway`` or ``trunk`` if *link_type* is a mainline DH class."""
+    lt = str(link_type or "").lower().strip()
+    if lt in _DH_ROAD_CLASSES_FOR_CSD:
+        return lt
+    if lt.endswith("_link"):
+        base = lt[: -len("_link")]
+        if base in _DH_ROAD_CLASSES_FOR_CSD:
+            return base
+    return None
+
+
+def merge_divided_highway_screenline_per_link(
+    per_link: List[Dict[str, Any]],
+    links_gdf: Optional[gpd.GeoDataFrame],
+) -> List[Dict[str, Any]]:
+    """Merge twin one-way motorway/trunk links sharing ``osm_id`` for screenline rows.
+
+    Equilibrium can load all PCE on one directed arc of a divided carriageway
+    while CSD / pent observations are corridor-level. Summing modeled volumes
+    for the pair and de-duplicating near-duplicate observed totals keeps
+    screenline ratios and GEH comparable to observations (read-only).
+    """
+    if not per_link or links_gdf is None or len(per_link) < 2:
+        return per_link
+    if "link_id" not in links_gdf.columns:
+        return per_link
+    osm_col = "osm_id" if "osm_id" in links_gdf.columns else None
+    if osm_col is None:
+        return per_link
+
+    lk = links_gdf.set_index("link_id", drop=False)
+
+    def _row_for(lid: int) -> Optional[pd.Series]:
+        try:
+            row = lk.loc[int(lid)]
+        except (KeyError, TypeError, ValueError):
+            return None
+        if isinstance(row, pd.DataFrame):
+            return row.iloc[0] if len(row) else None
+        return row
+
+    from collections import defaultdict
+
+    by_osm: Dict[str, List[int]] = defaultdict(list)
+    for i, pl in enumerate(per_link):
+        lid = int(pl.get("link_id", 0) or 0)
+        if lid <= 0:
+            continue
+        row = _row_for(lid)
+        if row is None:
+            continue
+        raw_osm = row.get(osm_col)
+        if raw_osm is None or (isinstance(raw_osm, float) and np.isnan(raw_osm)):
+            continue
+        try:
+            osm_key = str(int(raw_osm))
+        except (TypeError, ValueError):
+            s = str(raw_osm).strip()
+            if not s:
+                continue
+            osm_key = s
+        dirn = int(pd.to_numeric(row.get("direction"), errors="coerce") or 0)
+        if dirn == 0:
+            continue
+        if _base_divided_highway_link_type(row.get("link_type")) is None:
+            continue
+        by_osm[osm_key].append(i)
+
+    merge_meta: List[Tuple[str, List[int]]] = []
+    for osm_key, idxs in by_osm.items():
+        u = sorted(set(idxs))
+        if len(u) >= 2:
+            merge_meta.append((osm_key, u))
+
+    if not merge_meta:
+        return per_link
+
+    idx_to_group: Dict[int, Tuple[int, ...]] = {}
+    group_osm: Dict[Tuple[int, ...], str] = {}
+    for osm_key, grp in merge_meta:
+        t = tuple(grp)
+        group_osm[t] = osm_key
+        for j in t:
+            idx_to_group[j] = t
+
+    out: List[Dict[str, Any]] = []
+    seen_group: set[Tuple[int, ...]] = set()
+    for i, pl in enumerate(per_link):
+        grp = idx_to_group.get(i)
+        if grp is None:
+            out.append(dict(pl))
+            continue
+        if grp in seen_group:
+            continue
+        seen_group.add(grp)
+        models = [float(per_link[j].get("modeled", 0) or 0) for j in grp]
+        obss = [float(per_link[j].get("observed", 0) or 0) for j in grp]
+        sm = float(sum(models))
+        nonzero = [o for o in obss if o > 0]
+        if len(nonzero) >= 2:
+            mx, mn = max(nonzero), min(nonzero)
+            if mx > 0 and mn >= 0.75 * mx:
+                so = float(mx)
+            else:
+                so = float(sum(nonzero))
+        elif len(nonzero) == 1:
+            so = float(nonzero[0])
+        else:
+            so = 0.0
+        lids = [int(per_link[j].get("link_id", 0) or 0) for j in grp]
+        lead = lids[0] if lids else int(pl.get("link_id", 0) or 0)
+        osm_merged = group_osm.get(grp, "")
+        out.append({
+            "link_id": lead,
+            "direction": int(per_link[grp[0]].get("direction", 0) or 0),
+            "modeled": round(sm, 0),
+            "observed": round(so, 0),
+            "divided_highway_merged": True,
+            "merged_link_ids": lids,
+            "merged_osm_id": osm_merged,
+        })
+    return out
 
 
 def _ensure_dir(p: Path) -> None:
@@ -202,7 +333,9 @@ def match_csd_to_links(
     mean model volume, compared against the CSD section-averaged AADT.
 
     Links with near-zero volume (< 100 veh/day) are excluded from the
-    length-weighted mean to avoid dilution by boundary artifacts.
+    length-weighted mean to avoid dilution by boundary artifacts, except for
+    motorway/trunk roads classified as divided highways (length-weighted
+    one-way share >= 50%), where zero-flow carriageways are kept in the mean.
     Link types are filtered to be compatible with the CSD road class.
 
     *csd_full* (optional): pre-split full CSD dataset used for accurate
@@ -280,9 +413,18 @@ def match_csd_to_links(
 
         has_direction = "direction" in car_links.columns
         is_divided = False
-        if has_direction:
+        if has_direction and str(road_class) in _DH_ROAD_CLASSES_FOR_CSD:
             dirs = pd.to_numeric(car_links["direction"], errors="coerce").fillna(0).astype(int)
-            is_divided = (dirs != 0).any()
+            oneway_mask = dirs != 0
+            if "distance" in car_links.columns:
+                dist_arr = car_links["distance"].to_numpy(dtype=float, copy=False)
+                total_len = float(np.nansum(dist_arr))
+                oneway_len = float(np.nansum(dist_arr[oneway_mask.to_numpy()]))
+                oneway_share = oneway_len / total_len if total_len > 0 else 0.0
+            else:
+                n = int(len(dirs))
+                oneway_share = float(oneway_mask.sum()) / float(max(n, 1))
+            is_divided = oneway_share >= _DH_MIN_ONEWAY_SHARE
 
         if is_divided:
             active = car_links

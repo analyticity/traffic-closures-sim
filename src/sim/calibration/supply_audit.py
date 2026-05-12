@@ -227,31 +227,37 @@ def _compute_vc_diagnostics(
     except Exception:
         return {"available": False, "reason": "cannot_read_results"}
 
-    vol_col = None
-    for candidate in ("PCE_tot", "tot_flow_ab", "matrix_ab", "PCE_tot_ab", "volume_ab",
-                      "wd_daily_local_tot", "Preload_tot"):
-        if candidate in vol_df.columns:
-            vol_col = candidate
+    vol_col_ab = None
+    vol_col_ba = None
+    for base in ("PCE", "tot_flow", "matrix", "volume", "wd_daily_local", "Preload"):
+        ab = f"{base}_ab"
+        ba = f"{base}_ba"
+        if ab in vol_df.columns:
+            vol_col_ab = ab
+            vol_col_ba = ba if ba in vol_df.columns else None
             break
-    if vol_col is None:
+    if vol_col_ab is None:
+        for candidate in ("PCE_tot", "wd_daily_local_tot", "Preload_tot"):
+            if candidate in vol_df.columns:
+                vol_col_ab = candidate
+                break
+    if vol_col_ab is None:
         return {"available": False, "reason": "no_volume_column"}
 
     conn = sqlite3.connect(str(db_path))
     try:
         cap_rows = conn.execute(
-            "SELECT link_id, link_type, capacity_ab FROM links "
+            "SELECT link_id, link_type, capacity_ab, capacity_ba, direction FROM links "
             "WHERE link_type != 'centroid_connector'"
         ).fetchall()
     finally:
         conn.close()
 
-    cap_df = pd.DataFrame(cap_rows, columns=["link_id", "link_type", "capacity_ab"])
+    cap_df = pd.DataFrame(cap_rows, columns=["link_id", "link_type", "capacity_ab", "capacity_ba", "direction"])
     cap_df["link_id"] = cap_df["link_id"].astype(int)
     vol_df["link_id"] = vol_df["link_id"].astype(int) if "link_id" in vol_df.columns else vol_df.index
 
     merged = vol_df.merge(cap_df, on="link_id", how="inner")
-    merged["volume"] = pd.to_numeric(merged[vol_col], errors="coerce").fillna(0)
-    merged["capacity"] = pd.to_numeric(merged["capacity_ab"], errors="coerce").fillna(1)
 
     bpr_cfg = assign_cfg.get("bpr") or {}
     dcf_raw = bpr_cfg.get("daily_capacity_factor", {})
@@ -263,10 +269,25 @@ def _compute_vc_diagnostics(
     def _get_dcf(lt: str) -> float:
         return float(dcf_by_lt.get(lt, dcf_default))
 
-    merged["daily_capacity"] = merged.apply(
-        lambda r: r["capacity"] * _get_dcf(str(r.get("link_type", ""))), axis=1,
-    )
-    merged["vc_ratio"] = merged["volume"] / merged["daily_capacity"].clip(lower=1)
+    merged["dcf"] = merged["link_type"].apply(lambda lt: _get_dcf(str(lt)))
+    cap_ab = pd.to_numeric(merged["capacity_ab"], errors="coerce").fillna(1)
+    cap_ba = pd.to_numeric(merged["capacity_ba"], errors="coerce").fillna(1)
+    daily_cap_ab = (cap_ab * merged["dcf"]).clip(lower=1)
+    daily_cap_ba = (cap_ba * merged["dcf"]).clip(lower=1)
+
+    vol_ab = pd.to_numeric(merged[vol_col_ab], errors="coerce").fillna(0)
+    if vol_col_ba and vol_col_ba in merged.columns:
+        vol_ba = pd.to_numeric(merged[vol_col_ba], errors="coerce").fillna(0)
+    else:
+        vol_ba = pd.Series(0.0, index=merged.index)
+
+    vc_ab = vol_ab / daily_cap_ab
+    vc_ba = vol_ba / daily_cap_ba
+    direction = pd.to_numeric(merged["direction"], errors="coerce").fillna(0).astype(int)
+    is_oneway = direction != 0
+    merged["vc_ratio"] = pd.Series(0.0, index=merged.index)
+    merged.loc[is_oneway, "vc_ratio"] = vc_ab[is_oneway]
+    merged.loc[~is_oneway, "vc_ratio"] = pd.concat([vc_ab[~is_oneway], vc_ba[~is_oneway]], axis=1).max(axis=1)
 
     total = len(merged)
     if total == 0:

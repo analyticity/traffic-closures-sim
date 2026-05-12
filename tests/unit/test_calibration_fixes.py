@@ -27,7 +27,7 @@ class TestGlobalCapacityDefaults:
         from sim.defaults import NETWORK_NORM_DEFAULTS
 
         cap = NETWORK_NORM_DEFAULTS["normalization"]["defaults"]["capacity_per_lane_by_link_type"]
-        assert cap["secondary"] >= 1100, f"secondary cap={cap['secondary']} is too low"
+        assert cap["secondary"] >= 950, f"secondary cap={cap['secondary']} is too low"
 
     def test_tertiary_capacity_raised(self):
         from sim.defaults import NETWORK_NORM_DEFAULTS

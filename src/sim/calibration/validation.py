@@ -278,9 +278,18 @@ def match_csd_to_links(
         if n_model == 0:
             continue
 
-        active = car_links[car_links[tot_col] >= _MIN_VOL_FOR_CSD_LW]
-        if active.empty:
+        has_direction = "direction" in car_links.columns
+        is_divided = False
+        if has_direction:
+            dirs = pd.to_numeric(car_links["direction"], errors="coerce").fillna(0).astype(int)
+            is_divided = (dirs != 0).any()
+
+        if is_divided:
             active = car_links
+        else:
+            active = car_links[car_links[tot_col] >= _MIN_VOL_FOR_CSD_LW]
+            if active.empty:
+                active = car_links
 
         vols = active[tot_col].values
         if "distance" in active.columns:
@@ -308,6 +317,14 @@ def match_csd_to_links(
         is_partial = coverage < 0.5
         is_over_aggregated = coverage > 2.0
 
+        all_zero = float(car_links[tot_col].sum()) == 0
+        if all_zero:
+            logger.warning(
+                "CSD road '%s': all %d matched links have zero modeled flow "
+                "(observed=%.0f) — likely disconnected, excluded from summary metrics",
+                road, n_model, csd_mean_sv,
+            )
+
         matched_roads.append({
             "road": road,
             "road_class": road_class,
@@ -322,6 +339,8 @@ def match_csd_to_links(
             "coverage_ratio": round(coverage, 2),
             "partial_coverage": is_partial,
             "over_aggregated": is_over_aggregated,
+            "zero_flow": all_zero,
+            "divided_highway": is_divided,
         })
 
     if not matched_roads:
@@ -329,10 +348,14 @@ def match_csd_to_links(
 
     result = pd.DataFrame(matched_roads)
 
-    # Summary statistics: exclude partial-coverage and over-aggregated roads
+    if "zero_flow" not in result.columns:
+        result["zero_flow"] = False
+    n_zero_flow = int(result["zero_flow"].astype(bool).sum())
+
     reliable = (
         ~result["partial_coverage"].astype(bool)
         & ~result["over_aggregated"].astype(bool)
+        & ~result["zero_flow"].astype(bool)
     )
     sub = result[reliable]
     n_partial = int(result["partial_coverage"].astype(bool).sum())
@@ -358,6 +381,7 @@ def match_csd_to_links(
                 "n_roads": int(mask.sum()),
                 "n_partial_excluded": n_partial,
                 "n_over_aggregated_excluded": n_over_agg,
+                "n_zero_flow_excluded": n_zero_flow,
                 "r2": round(r2, 3),
                 "slope": round(slope, 4),
                 "bias_pct": round(bias, 1),

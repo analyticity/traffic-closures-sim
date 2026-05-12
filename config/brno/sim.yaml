@@ -22,11 +22,14 @@ zoning:
 demand:
   segments:
     external_local:
-      total_daily_trips: "auto"
+      total_daily_trips: 150000
   distribution:
     blend_alpha: 0.75
     pa_trip_rate: 2.2
     pa_car_share: 0.45
+  sldb:
+    external_processing:
+      through_traffic_scale: 0.35
 
 calibration:
   rgap_target: 0.002

@@ -423,9 +423,9 @@ class TestScreenlineFactorsConfig:
     def test_gateway_defaults_match_sim_defaults(self):
         from sim.defaults import SIM_DEFAULTS
         gw = SIM_DEFAULTS["calibration"]["gateway_calibration"]
-        assert gw["damping"] == 0.30
-        assert gw["min_factor"] == 0.50
-        assert gw["max_factor"] == 2.00
+        assert gw["damping"] == 0.20
+        assert gw["min_factor"] == 0.60
+        assert gw["max_factor"] == 1.45
 
     def test_auto_screenlines_defaults(self):
         from sim.defaults import SIM_DEFAULTS

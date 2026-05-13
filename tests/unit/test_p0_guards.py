@@ -240,9 +240,9 @@ class TestP0Defaults:
         from sim.defaults import SIM_DEFAULTS
         assert SIM_DEFAULTS["calibration"]["allow_aon"] is False
 
-    def test_strict_convergence_default_true(self):
+    def test_strict_convergence_default_false(self):
         from sim.defaults import SIM_DEFAULTS
-        assert SIM_DEFAULTS["calibration"]["strict_convergence"] is True
+        assert SIM_DEFAULTS["calibration"]["strict_convergence"] is False
 
     def test_require_supply_audit_default_true(self):
         from sim.defaults import SIM_DEFAULTS

@@ -235,15 +235,22 @@ def _resolve_attr_only_screenline(
     else:
         mainline["_sort_key"] = mainline.geometry.length
 
-    centroid_all = mainline.geometry.unary_union.centroid
+    # --- 4. Pick a representative cross-section -------------------------
+    # CSD screenlines: pick the highest-capacity link directly — it is the
+    # mainline carriageway that a CSD station would sit on.  The centroid
+    # approach can land on a low-flow boundary segment for long roads.
+    # For non-CSD (manual) screenlines: keep centroid-nearest among top-10.
+    is_csd_auto = sl.name.startswith("auto_csd_")
 
-    top_n = min(10, len(mainline))
-    top_cands = mainline.nlargest(top_n, "_sort_key")
-
-    # --- 4. Nearest to centroid among top candidates --------------------
-    dists = top_cands.geometry.centroid.distance(centroid_all)
-    best_idx = dists.idxmin()
-    chosen = top_cands.loc[best_idx]
+    if is_csd_auto:
+        chosen = mainline.nlargest(1, "_sort_key").iloc[0]
+    else:
+        centroid_all = mainline.geometry.unary_union.centroid
+        top_n = min(10, len(mainline))
+        top_cands = mainline.nlargest(top_n, "_sort_key")
+        dists = top_cands.geometry.centroid.distance(centroid_all)
+        best_idx = dists.idxmin()
+        chosen = top_cands.loc[best_idx]
 
     bidir = (
         int(chosen.get("direction", 0)) == 0
@@ -252,7 +259,19 @@ def _resolve_attr_only_screenline(
     )
 
     if bidir:
-        return [(int(chosen["link_id"]), 0)]
+        chosen_lid = int(chosen["link_id"])
+        result_links = [(chosen_lid, 0)]
+        # For CSD auto: add the closest parallel link at the same spot
+        # (opposite carriageway of a divided road) if it exists.
+        if is_csd_auto and len(mainline) > 1:
+            pt = chosen.geometry.centroid
+            others = mainline[mainline["link_id"] != chosen_lid]
+            odists = others.geometry.centroid.distance(pt)
+            nearest_idx = odists.idxmin()
+            nearest = others.loc[nearest_idx]
+            if float(odists[nearest_idx]) < 50.0:
+                result_links.append((int(nearest["link_id"]), 0))
+        return result_links
 
     pair: List[Tuple[int, int]] = [(int(chosen["link_id"]), 0)]
     pt = chosen.geometry.centroid
@@ -833,6 +852,18 @@ def auto_generate_screenlines(
                                 lid = int(lrow["link_id"])
                                 if lid not in {l[0] for l in explicit_links}:
                                     explicit_links.append((lid, 0))
+
+                # One explicit link with multiple target nodes usually means
+                # the anchor side had no in-network ref match — fall back to
+                # geometry + attr resolution so ODME does not over-concentrate flow.
+                if (
+                    explicit_links
+                    and len(explicit_links) == 1
+                    and ref
+                    and target_nodes_raw
+                    and "," in str(target_nodes_raw)
+                ):
+                    explicit_links = []
 
                 # --- CSD observed AADT ------------------------------------
                 obs_all = 0.0

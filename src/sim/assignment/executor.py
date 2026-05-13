@@ -14,6 +14,7 @@ from aequilibrae import Project
 from aequilibrae.matrix import AequilibraeMatrix
 from aequilibrae.paths import TrafficAssignment, TrafficClass
 
+from sim.assignment.config import multiclass_matrix_core_status
 from sim.assignment.graph import build_graph, _resolve_time_field, _resolve_vdf_params
 
 logger = logging.getLogger(__name__)
@@ -100,8 +101,26 @@ def execute_assignment(
     vdf_params = _resolve_vdf_params(bpr_parameters, list(gdf.columns))
 
     use_gc = fixed_cost_field and fixed_cost_multiplier > 0 and fixed_cost_field in gdf.columns
-    mat_cores = list(mat.names) if hasattr(mat, "names") else []
-    use_multi = bool(multi_class) and all(c.get("core") in mat_cores for c in (multi_class or []))
+    mat_cores = [str(x) for x in (list(mat.names) if hasattr(mat, "names") else [])]
+    mc_enabled, mc_required, mc_missing = multiclass_matrix_core_status(mat_cores, multi_class)
+    use_multi = bool(multi_class) and mc_enabled
+    if multi_class:
+        if use_multi:
+            logger.info(
+                "Multi-class equilibrium: %d class(es), cores %s (matrix exposes %d OD name(s)).",
+                len(multi_class),
+                mc_required,
+                len(mat_cores),
+            )
+        else:
+            logger.warning(
+                "Multi-class equilibrium DISABLED — missing OD cores %s "
+                "(matrix has %d name(s); first names: %s). "
+                "Using a single TrafficClass.",
+                mc_missing,
+                len(mat_cores),
+                mat_cores[:12],
+            )
 
     traffic_classes: list = []
     primary_tc = None

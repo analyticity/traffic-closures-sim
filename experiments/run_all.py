@@ -29,10 +29,9 @@ from _common import DEFAULT_CONFIG, EXPERIMENTS_OUTPUT, city_from_config
 logger = logging.getLogger(__name__)
 
 ALL_EXPERIMENTS = [
-    "exp01_baseline_validation",
-    "exp02_freeflow_speed",
+    "exp01_baseline_plausibility",
+    "exp02_closure_response",
     "exp03_congestion_patterns",
-    "exp04_closure_scenarios",
     "exp05_line_vs_point",
     "exp06_event_links_validation",
     "exp07_accident_correlation",

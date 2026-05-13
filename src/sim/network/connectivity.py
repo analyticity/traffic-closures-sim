@@ -20,10 +20,11 @@ from sim.network.normalization import ensure_link_types_registered
 logger = logging.getLogger(__name__)
 
 _MAJOR_ROAD_TYPES = frozenset({"motorway", "motorway_link", "trunk", "trunk_link"})
-# Only ramp/link types are eligible for SCC bidirectionalization — mainline
-# carriageways (motorway, trunk) must never be reversed as that creates
-# physically impossible routes.
-_SCC_REPAIR_ELIGIBLE = frozenset({"motorway_link", "trunk_link"})
+# Eligible for SCC boundary bidirectionalization: ramps plus mainline trunk.
+# Mainline motorway stays excluded (true divided carriageways; wrong-way would
+# be unrealistic). Trunk (incl. reclassified Czech I-class) often needs this
+# when one carriageway is disconnected from the largest SCC at the model edge.
+_SCC_REPAIR_ELIGIBLE = frozenset({"motorway_link", "trunk_link", "trunk"})
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +36,9 @@ def repair_boundary_scc(
     *,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Make one-way motorway/trunk links with nodes outside the largest directed
-    SCC bidirectional, so that gateway nodes can participate in directed routing.
+    """Make selected one-way major links (motorway_link, trunk_link, trunk)
+    bidirectional when at least one endpoint lies outside the largest directed
+    SCC, so gateway nodes can participate in directed routing.
 
     When *dry_run* is ``True``, compute which links would be repaired and
     return the report **without** modifying the database.

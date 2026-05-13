@@ -10,7 +10,11 @@ from aequilibrae import Project
 from aequilibrae.matrix import AequilibraeMatrix
 
 from sim.io_project import load_config
-from sim.assignment.config import _apply_bpr_defaults, _resolve_multi_class
+from sim.assignment.config import (
+    _apply_bpr_defaults,
+    _resolve_multi_class,
+    multiclass_matrix_core_status,
+)
 from sim.assignment.preflight import _check_connectors, fix_node_ids
 from sim.assignment.executor import _detect_volume_col, execute_assignment
 
@@ -64,6 +68,20 @@ def _run_assignment_pass(
     logger.info(f"\n2) Loading matrix: {matrix_path}")
     mat = AequilibraeMatrix()
     mat.load(str(matrix_path))
+    mat_core_names = [str(x) for x in (list(mat.names) if hasattr(mat, "names") else [])]
+    bpr_params = _apply_bpr_defaults(assign_cfg.get("bpr") or {})
+    mc_cfg = assign_cfg.get("multi_class") or {}
+    multi_classes = _resolve_multi_class(mc_cfg)
+    mc_ok, mc_req, mc_miss = multiclass_matrix_core_status(mat_core_names, multi_classes)
+    logger.info(
+        "   Matrix stores %d OD core name(s); multi-class prerequisites ok=%s (required %s)",
+        len(mat_core_names),
+        mc_ok,
+        mc_req or "—",
+    )
+    if multi_classes and not mc_ok:
+        logger.warning("   Missing multi-class cores on matrix file: %s", mc_miss)
+
     mat.computational_view([core_name])
     total_demand = float(mat.matrix_view.sum())
     logger.info(f"   Core '{core_name}': {mat.zones} zones, demand={total_demand:,.0f}")
@@ -73,9 +91,6 @@ def _run_assignment_pass(
     gc_field = str(gc_cfg.get("fixed_cost_field", "distance")) if gc_enabled else None
     gc_mult = float(gc_cfg.get("fixed_cost_multiplier", 0.006)) if gc_enabled else 0.0
     gc_vot = float(gc_cfg.get("vot", 1.0))
-    bpr_params = _apply_bpr_defaults(assign_cfg.get("bpr") or {})
-    mc_cfg = assign_cfg.get("multi_class") or {}
-    multi_classes = _resolve_multi_class(mc_cfg)
 
     if gc_enabled and gc_mult > 0:
         penalty_per_km = gc_mult * 1000.0 / max(gc_vot, 1e-9)

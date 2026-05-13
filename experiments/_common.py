@@ -10,7 +10,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import geopandas as gpd
 import numpy as np
@@ -373,3 +373,101 @@ def save_figure(fig, path: Path, dpi: int = 150) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     logger.info("Saved %s", path)
+
+
+# ---------------------------------------------------------------------------
+# Experiment metric helpers (plausibility / scenarios / congestion)
+# ---------------------------------------------------------------------------
+
+def compute_factor_of_2_pct(
+    modeled: np.ndarray,
+    observed: np.ndarray,
+) -> Dict[str, Any]:
+    """Share of count stations where modeled/observed lies in [0.5, 2].
+
+    Suitable for **daily** OD models with sparse CSD coverage (no GEH gates).
+    """
+    m = np.asarray(modeled, dtype=float)
+    o = np.asarray(observed, dtype=float)
+    valid = np.isfinite(m) & np.isfinite(o) & (o > 0)
+    if not valid.any():
+        return {"n": 0, "pct_in_factor_of_2": None, "median_ratio": None}
+    m_v, o_v = m[valid], o[valid]
+    ratio = m_v / o_v
+    in_band = (ratio >= 0.5) & (ratio <= 2.0)
+    return {
+        "n": int(valid.sum()),
+        "pct_in_factor_of_2": round(float(np.mean(in_band) * 100), 2),
+        "median_ratio": round(float(np.median(ratio)), 4),
+        "mean_ratio": round(float(np.mean(ratio)), 4),
+    }
+
+
+def top_n_links_by_delta(
+    baseline_df: pd.DataFrame,
+    scenario_df: pd.DataFrame,
+    *,
+    vol_col: str = "wd_daily_tot",
+    n: int = 10,
+    exclude_link_ids: Optional[Set[int]] = None,
+    ascending: bool = False,
+) -> pd.DataFrame:
+    """Largest absolute volume changes between baseline and scenario (by *vol_col*)."""
+    b = baseline_df[["link_id", vol_col]].copy() if "link_id" in baseline_df.columns else pd.DataFrame()
+    s = scenario_df[["link_id", vol_col]].copy()
+    if b.empty or vol_col not in b.columns or vol_col not in s.columns:
+        return pd.DataFrame()
+    merged = b.merge(s, on="link_id", how="inner", suffixes=("_base", "_scen"))
+    merged["delta_vol"] = merged[f"{vol_col}_scen"].fillna(0) - merged[f"{vol_col}_base"].fillna(0)
+    merged["abs_delta_vol"] = merged["delta_vol"].abs()
+    if exclude_link_ids:
+        merged = merged[~merged["link_id"].astype(int).isin(exclude_link_ids)]
+    merged = merged.sort_values("abs_delta_vol", ascending=ascending)
+    return merged.head(n).reset_index(drop=True)
+
+
+def compute_quartile_comparison(
+    df: pd.DataFrame,
+    vc_col: str,
+    jam_col: str,
+    *,
+    n_quartiles: int = 4,
+) -> Dict[str, Any]:
+    """Summarise *jam_col* by V/C quartiles + Q4/Q1 median ratio and Mann–Whitney U.
+
+    Returns JSON-serialisable dict for experiment summaries.
+    """
+    from scipy import stats as sp_stats
+
+    d = df[[vc_col, jam_col]].dropna().copy()
+    d = d[(d[vc_col] >= 0) & (d[jam_col] >= 0)]
+    if len(d) < n_quartiles * 5:
+        return {"n_links": len(d), "error": "too_few_rows_for_quartiles"}
+
+    try:
+        d["vc_quartile"] = pd.qcut(d[vc_col], n_quartiles, labels=False, duplicates="drop")
+    except ValueError:
+        return {"n_links": len(d), "error": "qcut_failed"}
+
+    medians = d.groupby("vc_quartile", observed=True)[jam_col].median().to_dict()
+    medians_str = {f"Q{int(k) + 1}": float(v) for k, v in sorted(medians.items())}
+
+    q1 = d[d["vc_quartile"] == 0][jam_col]
+    q4 = d[d["vc_quartile"] == n_quartiles - 1][jam_col]
+    ratio = None
+    mw_p = None
+    if len(q1) > 2 and len(q4) > 2:
+        m1, m4 = float(q1.median()), float(q4.median())
+        ratio = round(m4 / max(m1, 1e-9), 4) if m1 > 0 else None
+        try:
+            _, mw_p = sp_stats.mannwhitneyu(q4, q1, alternative="greater")
+            mw_p = float(mw_p)
+        except ValueError:
+            mw_p = None
+
+    return {
+        "n_links": len(d),
+        "quartile_medians": medians_str,
+        "median_ratio_Q4_over_Q1": ratio,
+        "mannwhitney_greater_p": mw_p,
+    }

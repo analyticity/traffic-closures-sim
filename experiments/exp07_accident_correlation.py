@@ -7,7 +7,6 @@ Also fits a simple logistic regression P(accident) ~ V/C + road_type.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -72,6 +71,10 @@ def main() -> None:
     try:
         accidents = _load_accidents(cfg)
     except FileNotFoundError as e:
+        save_json(
+            {"status": "skipped", "reason": str(e), "experiment": NAME},
+            out_dir / "summary.json",
+        )
         print(f"[{NAME}] {e}")
         return
 
@@ -92,6 +95,10 @@ def main() -> None:
             joined = _gpd.sjoin_nearest(acc_gdf, links[["link_id", "geometry"]], how="left", max_distance=150)
             accidents = pd.DataFrame(joined)
         else:
+            save_json(
+                {"status": "skipped", "reason": "no lat/lon for spatial accident join", "experiment": NAME},
+                out_dir / "summary.json",
+            )
             print(f"[{NAME}] Cannot map accidents to links.")
             return
 
@@ -123,6 +130,10 @@ def main() -> None:
     df = df[df["vc"] > 0].copy()
 
     if df.empty:
+        save_json(
+            {"status": "skipped", "reason": "no data after merge (vc>0)", "experiment": NAME},
+            out_dir / "summary.json",
+        )
         print(f"[{NAME}] No data after merge.")
         return
 
@@ -136,11 +147,13 @@ def main() -> None:
         rho, p_val = float("nan"), float("nan")
 
     summary = {
+        "status": "ok",
+        "experiment": NAME,
         "n_links_total": len(df),
         "n_links_with_accidents": len(has_acc),
         "total_accidents": int(df["accident_count"].sum()),
-        "spearman_rho": round(float(rho), 4),
-        "spearman_p": float(p_val),
+        "spearman_rho": round(float(rho), 4) if np.isfinite(rho) else None,
+        "spearman_p": float(p_val) if np.isfinite(p_val) else None,
     }
 
     # ------------------------------------------------------------------
@@ -205,6 +218,7 @@ def main() -> None:
         logger.info("sklearn not available, skipping logistic regression")
 
     save_json(summary, out_dir / "correlation.json")
+    save_json(summary, out_dir / "summary.json")
     print(f"[{NAME}] Done → {out_dir}")
 
 

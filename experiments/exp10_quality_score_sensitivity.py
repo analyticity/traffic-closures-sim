@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Experiment 10: Sensitivity to quality_score filtering of closures.
+"""Experiment 10: Sensitivity of closure scenarios to ``quality_score`` filtering.
 
-Compares scenario results when including ALL closures (min_quality_score=0)
-versus only high-quality closures (min_quality_score ≥ 70).  Determines
-whether low-quality records add noise without changing aggregate KPIs.
+Unlike a single-closure sweep, this builds **one combined scenario per threshold**
+that applies *all* active closures whose ``quality_score`` meets the minimum.
+That way lowering the threshold monotonically adds links and should move ΔVHT,
+instead of trivial flat curves when only one closure exists in the pool.
 """
 from __future__ import annotations
 
@@ -30,59 +31,60 @@ from _common import (
 logger = logging.getLogger(__name__)
 NAME = "exp10_quality_score_sensitivity"
 
-QUALITY_THRESHOLDS = [0, 30, 50, 70, 90]
+THRESHOLDS = [0, 30, 50, 70, 90]
+MAX_CLOSURES_PER_THRESHOLD = 40
+MATCH_RADIUS_M = 200.0
 
 
-def _closures_to_scenario_links(
+def _closures_meeting_qs(closures: pd.DataFrame, min_qs: float) -> pd.DataFrame:
+    c = closures.copy()
+    if "quality_score" not in c.columns:
+        c["quality_score"] = 100.0
+    c["_qs"] = pd.to_numeric(c["quality_score"], errors="coerce").fillna(0)
+    c = c[c["_qs"] >= float(min_qs)]
+    c = c[c["lat"].notna() & c["lon"].notna()]
+    sev_col = "pg_severity" if "pg_severity" in c.columns else "severity"
+    if sev_col in c.columns:
+        sev = c[sev_col].astype(str)
+        major = c[sev.str.contains("full|serious|standstill|closure", case=False, na=False)]
+        if len(major) >= 3:
+            c = major
+    return c.sort_values("_qs", ascending=False)
+
+
+def _build_union_scenario(
     closures_subset: pd.DataFrame,
-    links: pd.DataFrame,
+    links,
 ) -> List[Dict[str, Any]]:
-    """Convert a set of closures into scenario_links for a single day."""
-    result: List[Dict[str, Any]] = []
-    seen_link_ids: set = set()
-
-    for _, cl in closures_subset.iterrows():
-        lat, lon = cl.get("lat"), cl.get("lon")
-        if pd.isna(lat) or pd.isna(lon):
-            continue
-
-        nearby = match_links_near_point(float(lat), float(lon), links, max_dist_m=150)
-
-        sev = str(cl.get("pg_severity", cl.get("severity", "")))
-        is_full = "full" in sev.lower() or "closure" in sev.lower()
-
-        direction = "both"
-        raw_dir = str(cl.get("closure_direction", "")).strip().lower()
-        if raw_dir == "aligned":
-            direction = "ab"
-        elif raw_dir == "opposite":
-            direction = "ba"
-
+    """Merge unique link hits from many closures into one scenario list."""
+    scenario: Dict[int, Dict[str, Any]] = {}
+    for _, row in closures_subset.iterrows():
+        lat, lon = float(row["lat"]), float(row["lon"])
+        nearby = match_links_near_point(lat, lon, links, max_dist_m=MATCH_RADIUS_M)
         for _, link in nearby.iterrows():
             lid = int(link["link_id"])
-            if lid in seen_link_ids:
+            if lid in scenario:
                 continue
-            seen_link_ids.add(lid)
             lanes = max(int(link.get("lanes", 2)), 1)
-            result.append({
+            scenario[lid] = {
                 "link_id": lid,
-                "direction": direction,
-                "closure_type": "full" if is_full else "lanes",
+                "direction": "both",
+                "closure_type": "full",
                 "lanes": lanes,
-                "lanes_remaining": 0 if is_full else max(lanes - 1, 1),
-            })
-
-    return result
+                "lanes_remaining": 0,
+            }
+    return list(scenario.values())
 
 
 def main() -> None:
     cfg, out_dir = init_experiment(NAME)
 
-    closures = load_closures(cfg)
     links = load_baseline_links(cfg)
     baseline = load_assignment_results(cfg)
+    closures = load_closures(cfg)
 
     from sim._metrics import aggregate_daily_volumes
+
     aggregate_daily_volumes(baseline)
 
     baseline_merged = links.copy()
@@ -91,146 +93,85 @@ def main() -> None:
             baseline_merged = baseline_merged.merge(baseline[["link_id", c]], on="link_id", how="left")
     aggregate_daily_volumes(baseline_merged)
 
-    # Ensure quality_score is numeric
-    if "quality_score" in closures.columns:
-        closures["quality_score"] = pd.to_numeric(closures["quality_score"], errors="coerce").fillna(0)
-    else:
-        closures["quality_score"] = 50
-        logger.warning("No quality_score in closures — using default 50 for all")
+    qs_vals = pd.to_numeric(closures.get("quality_score", pd.Series(dtype=float)), errors="coerce")
 
-    # Pick a representative date with many active closures
-    if "valid_from" in closures.columns and "valid_to" in closures.columns:
-        closures["valid_from"] = pd.to_datetime(closures["valid_from"], errors="coerce")
-        closures["valid_to"] = pd.to_datetime(closures["valid_to"], errors="coerce")
-        # Use the date with most active closures
-        valid = closures.dropna(subset=["valid_from", "valid_to"])
-        if not valid.empty:
-            all_dates = pd.date_range(valid["valid_from"].min(), valid["valid_to"].max(), freq="D")
-            best_date = None
-            best_count = 0
-            for d in all_dates[:365]:
-                active = valid[(valid["valid_from"] <= d) & (valid["valid_to"] >= d)]
-                if len(active) > best_count:
-                    best_count = len(active)
-                    best_date = d
-            if best_date is not None:
-                closures = closures[
-                    (closures["valid_from"] <= best_date) & (closures["valid_to"] >= best_date)
-                ].copy()
-                logger.info("Using date %s with %d active closures", best_date.date(), len(closures))
-    else:
-        # Use all closures if no date columns
-        closures = closures.head(50)
+    summary: Dict[str, Any] = {
+        "total_closures": int(len(closures)),
+        "quality_score_stats": {
+            "mean": round(float(qs_vals.mean()), 3) if len(qs_vals) else None,
+            "median": round(float(qs_vals.median()), 3) if len(qs_vals) else None,
+            "null_pct": round(float(qs_vals.isna().mean() * 100), 2) if len(qs_vals) else None,
+        },
+        "threshold_results": [],
+    }
 
-    if closures.empty:
-        print(f"[{NAME}] No closures found for the selected date.")
-        return
-
-    # ------------------------------------------------------------------
-    # Run scenario for each quality threshold
-    # ------------------------------------------------------------------
-    results = []
-    for threshold in QUALITY_THRESHOLDS:
-        subset = closures[closures["quality_score"] >= threshold]
-        n_closures = len(subset)
-        logger.info("Threshold %d: %d closures", threshold, n_closures)
-
-        if subset.empty:
-            results.append({
-                "min_quality_score": threshold,
-                "n_closures": 0,
+    rows = []
+    for thr in THRESHOLDS:
+        pool = _closures_meeting_qs(closures, thr).head(MAX_CLOSURES_PER_THRESHOLD)
+        scen = _build_union_scenario(pool, links)
+        if not scen:
+            rows.append({
+                "min_quality_score": thr,
+                "n_closures": int(len(pool)),
                 "n_affected_links": 0,
-                "delta_vht": 0,
-                "delta_vht_pct": 0,
-                "delta_overloaded": 0,
+                "skipped": True,
             })
             continue
-
-        scenario_links = _closures_to_scenario_links(subset, links)
-        if not scenario_links:
-            results.append({
-                "min_quality_score": threshold,
-                "n_closures": n_closures,
-                "n_affected_links": 0,
-                "delta_vht": 0,
-                "delta_vht_pct": 0,
-                "delta_overloaded": 0,
-            })
-            continue
-
         try:
-            scenario_df = run_scenario_assignment(cfg, scenario_links)
-            kpis = compute_scenario_kpis(baseline_merged, scenario_df)
-        except Exception as e:
-            logger.error("Threshold %d failed: %s", threshold, e)
+            df = run_scenario_assignment(cfg, scen)
+            kpis = compute_scenario_kpis(baseline_merged, df)
+        except Exception as exc:
+            logger.error("Threshold %s failed: %s", thr, exc)
+            rows.append({"min_quality_score": thr, "error": str(exc)})
             continue
-
         row = {
-            "min_quality_score": threshold,
-            "n_closures": n_closures,
-            "n_affected_links": len(scenario_links),
+            "min_quality_score": thr,
+            "n_closures": int(len(pool)),
+            "n_affected_links": len(scen),
             **kpis,
         }
-        results.append(row)
+        rows.append(row)
+        summary["threshold_results"].append(row)
 
-    if not results:
-        print(f"[{NAME}] No scenarios completed.")
-        return
+    if rows:
+        save_csv(pd.DataFrame(rows), out_dir / "quality_score_sensitivity.csv")
 
-    results_df = pd.DataFrame(results)
-    save_csv(results_df, out_dir / "quality_score_sensitivity.csv")
+    # Histogram of quality scores (closures with coords)
+    valid_qs = closures.dropna(subset=["lat", "lon"])
+    if "quality_score" in valid_qs.columns and len(valid_qs):
+        fig0, ax0 = plt.subplots(figsize=(7, 4))
+        qs = pd.to_numeric(valid_qs["quality_score"], errors="coerce").dropna()
+        if len(qs):
+            ax0.hist(qs, bins=min(20, max(5, int(len(qs) ** 0.5))), color="steelblue", edgecolor="white")
+        for thr in THRESHOLDS[1:]:
+            ax0.axvline(thr, color="red", linestyle="--", linewidth=1, alpha=0.6)
+        ax0.set_xlabel("Quality score")
+        ax0.set_ylabel("Počet uzavírek")
+        ax0.set_title("Distribuce quality_score aktivních uzavírek")
+        fig0.tight_layout()
+        save_figure(fig0, out_dir / "quality_distribution.png")
+        plt.close(fig0)
 
-    # ------------------------------------------------------------------
-    # Quality score distribution of closures
-    # ------------------------------------------------------------------
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.hist(closures["quality_score"], bins=20, edgecolor="white", alpha=0.8)
-    for t in QUALITY_THRESHOLDS[1:]:
-        ax.axvline(t, color="red", ls="--", alpha=0.5)
-    ax.set_xlabel("Quality Score")
-    ax.set_ylabel("Počet uzavírek")
-    ax.set_title("Distribuce quality_score aktivních uzavírek")
-    save_figure(fig, out_dir / "quality_distribution.png")
-    plt.close(fig)
-
-    # ------------------------------------------------------------------
-    # ΔVHT vs quality threshold
-    # ------------------------------------------------------------------
-    valid_results = results_df.dropna(subset=["delta_vht"])
-    if len(valid_results) >= 2:
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-        ax1.plot(valid_results["min_quality_score"], valid_results["delta_vht"],
-                 "o-", color="steelblue", markersize=8)
+    # Sensitivity curves
+    df_r = pd.DataFrame([r for r in rows if "delta_vht" in r and not r.get("skipped")])
+    if not df_r.empty:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+        ax1.plot(df_r["min_quality_score"], df_r["delta_vht"], "o-", color="steelblue")
         ax1.set_xlabel("Minimální quality_score")
         ax1.set_ylabel("ΔVHT (voz·hod)")
         ax1.set_title("Dopad na VHT podle kvality uzavírek")
         ax1.grid(True, alpha=0.3)
 
-        ax2.plot(valid_results["min_quality_score"], valid_results["n_closures"],
-                 "s-", color="coral", markersize=8)
+        ax2.plot(df_r["min_quality_score"], df_r["n_affected_links"], "s-", color="darkorange")
         ax2.set_xlabel("Minimální quality_score")
-        ax2.set_ylabel("Počet uzavírek")
-        ax2.set_title("Počet zahrnutých uzavírek")
+        ax2.set_ylabel("Počet zasažených hran (unie)")
+        ax2.set_title("Počet zahrnutých hran ve scénáři")
         ax2.grid(True, alpha=0.3)
-
-        fig.suptitle("Citlivost na filtraci quality_score", fontsize=13)
+        fig.suptitle("Citlivost na filtraci quality_score (kombinované scénáře)", fontsize=12)
         fig.tight_layout()
         save_figure(fig, out_dir / "sensitivity_curves.png")
         plt.close(fig)
 
-    # ------------------------------------------------------------------
-    # Summary
-    # ------------------------------------------------------------------
-    summary = {
-        "total_closures": len(closures),
-        "quality_score_stats": {
-            "mean": round(float(closures["quality_score"].mean()), 1),
-            "median": round(float(closures["quality_score"].median()), 1),
-            "null_pct": round(float((closures["quality_score"] == 0).mean() * 100), 1),
-        },
-        "threshold_results": results,
-    }
     save_json(summary, out_dir / "summary.json")
     print(f"[{NAME}] Done → {out_dir}")
 

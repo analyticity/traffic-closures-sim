@@ -68,7 +68,11 @@ def apply_scenario_to_graph(graph, scenario_links: List[Dict[str, Any]]) -> None
         direction = sl.get("direction", "both")
         closure_type = sl.get("closure_type", "full")
         lanes_orig = max(int(sl.get("lanes", 1)), 1)
-        lanes_remaining = max(int(sl.get("lanes_remaining", 1)), 1)
+        # Allow partial lane reduction (ratio < 1). Previously min(..., 1) on
+        # lanes_remaining forced at least one lane open, so 10%/30%/50%
+        # reductions on 2-lane links all collapsed to the same capacity.
+        _rem = int(sl.get("lanes_remaining", lanes_orig))
+        lanes_remaining = max(0, min(_rem, lanes_orig))
 
         row_indices = link_id_to_rows.get(link_id)
         if not row_indices:
@@ -80,6 +84,9 @@ def apply_scenario_to_graph(graph, scenario_links: List[Dict[str, Any]]) -> None
 
         if not row_indices:
             continue
+
+        if closure_type == "lanes" and lanes_remaining <= 0:
+            closure_type = "full"
 
         if closure_type == "full":
             for i in row_indices:

@@ -1007,6 +1007,10 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
                 vol_col or "", obs_col, links_gdf,
             )
             for sn, sr in sl_res.items():
+                # Omit screenlines with no trustworthy observed total (would
+                # inflate ratios via max(obs,1) in evaluate_screenline).
+                if not sr.observed_total or float(sr.observed_total) <= 0:
+                    continue
                 sl_results[sn] = sr.to_dict()
                 if sr.observed_total and sr.observed_total > 0:
                     logger.info(f"  {sn}: mod={sr.modeled_total:,.0f} obs={sr.observed_total:,.0f} "

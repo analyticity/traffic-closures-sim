@@ -223,24 +223,34 @@ def main() -> None:
     # B) Severity variation
     # ==================================================================
     logger.info("=== B) Severity variation ===")
-    capacity_factors = [0.0, 0.1, 0.3, 0.5]
+    # Fraction of original lanes *remaining open* (1.0 = no closure effect on
+    # capacity for the lane-reduction path).  Values must differ after rounding
+    # for typical 2-lane links — e.g. 0.1/0.3/0.5 all collapsed to 1 open lane
+    # when combined with the old engine clamp (see scenarios/engine.py).
+    capacity_factors = [0.0, 0.5, 1.0]
     severity_rows = []
 
     for cap_frac in capacity_factors:
         label = f"capacity_{cap_frac}"
-        logger.info("Running capacity fraction %.1f ...", cap_frac)
+        logger.info("Running lane-open fraction %.2f ...", cap_frac)
 
-        # Modify scenario_links to use partial closure
-        variant = []
-        for sl in test_scenario:
-            sl_copy = dict(sl)
-            if cap_frac == 0.0:
-                sl_copy["closure_type"] = "full"
-                sl_copy["lanes_remaining"] = 0
-            else:
-                sl_copy["closure_type"] = "lanes"
-                sl_copy["lanes_remaining"] = max(1, int(sl_copy["lanes"] * cap_frac))
-            variant.append(sl_copy)
+        if cap_frac >= 1.0:
+            # No modifications — baseline-equivalent (ΔVHT ≈ 0)
+            variant = []
+        else:
+            variant = []
+            for sl in test_scenario:
+                sl_copy = dict(sl)
+                lanes = max(int(sl_copy.get("lanes", 1)), 1)
+                if cap_frac <= 0.0:
+                    sl_copy["closure_type"] = "full"
+                    sl_copy["lanes_remaining"] = 0
+                else:
+                    sl_copy["closure_type"] = "lanes"
+                    sl_copy["lanes_remaining"] = max(
+                        0, min(lanes, int(round(lanes * float(cap_frac)))),
+                    )
+                variant.append(sl_copy)
 
         try:
             df = _run_scaled_assignment(cfg, variant, demand_factor=1.0)

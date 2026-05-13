@@ -1,7 +1,7 @@
 """BPR and multi-class methodology defaults, YAML merge helpers."""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sim.defaults import SIM_DEFAULTS
 
@@ -55,6 +55,37 @@ def _resolve_multi_class(mc_cfg: Optional[Dict[str, Any]]) -> Optional[list]:
     if not mc_cfg.get("enabled", True):
         return None
     return list(mc_cfg.get("classes", _DEFAULT_MULTI_CLASS))
+
+
+def multiclass_matrix_core_status(
+    mat_cores: Sequence[str],
+    multi_class: Optional[list],
+) -> Tuple[bool, List[str], List[str]]:
+    """Return whether multi-class UE can run with the given matrix cores.
+
+    Mirrors the gate in ``execute_assignment``: every configured class
+    ``core`` must appear in ``mat_cores`` (typically ``mat.names`` on an
+    open ``AequilibraeMatrix``).
+
+    Returns
+    -------
+    enabled
+        True when *multi_class* is non-empty and all class cores exist.
+    required
+        Ordered list of class core names from *multi_class*.
+    missing
+        Subset of *required* not found in *mat_cores*.
+    """
+    if not multi_class:
+        return False, [], []
+    have = {str(x) for x in mat_cores}
+    required: List[str] = []
+    for c in multi_class:
+        core = c.get("core")
+        if core is not None:
+            required.append(str(core))
+    missing = [c for c in required if c not in have]
+    return (not missing, required, missing)
 
 
 def resolve_daily_cap_factor_default(bpr_cfg: dict) -> float:

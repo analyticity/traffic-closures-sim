@@ -1,0 +1,14 @@
+# Presets for parallel-route / BPR diagnostics (see scripts/export_parallel_corridor_diagnostics.py).
+# Link IDs were taken from outputs/brno/baseline/demand/validation_report.json screenline
+# "per_link" entries (commit / re-run validation if screenline geometry changes).
+
+corridors:
+  - id: D52_S_motorway_parallel
+    validation_screenline: auto_gw_D52_S
+    description: "D52 south radial — two motorway links same osm_id; UE often loads one link only (~0 on twin)."
+    link_ids: [6724, 6725]
+
+  - id: I416_S_secondary_split
+    validation_screenline: auto_gw_416_S
+    description: "I/416 south — two secondary links; uneven split vs paired CSD (baseline screenline ratio ~2.0)."
+    link_ids: [33571, 79448]

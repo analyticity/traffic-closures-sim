@@ -1,34 +1,33 @@
 #!/usr/bin/env python3
-"""Experiment 06: Validate model predictions against real Waze jams (event_links).
+"""Experiment 06: Event / jam link validation (local precision–recall).
 
-The most novel validation — for closures with known jam impacts (via
-``event_links`` + ``restriction_impact``), check whether the model
-predicts congestion on the same links where real jams occurred.
+The naive global rule "all links with V/C>1 are congested" yields near-zero
+precision because most overloaded links are unrelated to a specific closure.
 
-Computes precision/recall of model congestion prediction and scatter of
-model ΔVHT vs real total_delay_s.
+This experiment scores **local** consistency: for each real closure, compare
+Waze jam density on nearby links to model V/C on the *same* link set within a
+fixed-radius buffer around the closure anchor.
 """
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set, Tuple
 
+import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy import stats as sp_stats
+from shapely.geometry import Point
 
 from _common import (
-    _cache_dir,
-    compute_scenario_kpis,
-    compute_vht,
+    ensure_metric_links,
     init_experiment,
     load_assignment_results,
     load_baseline_links,
     load_closures,
+    load_jams_stats,
     load_segment_map,
-    run_scenario_assignment,
     save_csv,
     save_figure,
     save_json,
@@ -37,223 +36,247 @@ from _common import (
 logger = logging.getLogger(__name__)
 NAME = "exp06_event_links_validation"
 
-VC_DELTA_THRESHOLD = 0.15
+BUFFER_M = 400.0
+N_CLOSURES = 12
+# Minimum V/C to count as "model congested" inside the buffer.  Using only
+# global thresholds often yields zero overlap because jam segments map to
+# slightly different link_ids than the highest-V/C arterial in the same disk.
+VC_THRESHOLD = 1.0
+VC_POOL_PERCENTILE = 70.0  # at least this percentile within the buffer, >= VC_THRESHOLD
+# Waze segments often map to a parallel/adjacent OSM link vs the MATSim arc with
+# highest V/C — require geometry proximity for TP, not exact link_id equality.
+MATCH_DISTANCE_M = 55.0
 
 
-def _closure_to_scenario_links(
-    closure: pd.Series,
-    links: pd.DataFrame,
-) -> List[Dict[str, Any]]:
-    """Simple spatial matching for a closure."""
-    lat, lon = closure.get("lat"), closure.get("lon")
-    if pd.isna(lat) or pd.isna(lon):
-        return []
+def _link_metric_geometries(links: gpd.GeoDataFrame) -> Dict[int, Any]:
+    """link_id -> geometry in metric CRS for distance tests."""
+    metric = ensure_metric_links(links)
+    out: Dict[int, Any] = {}
+    for _, r in metric.iterrows():
+        lid = int(r["link_id"])
+        geom = r.geometry
+        if geom is not None and not geom.is_empty:
+            out[lid] = geom
+    return out
 
-    import geopandas as _gpd
-    from shapely.geometry import Point
 
-    pt = Point(float(lon), float(lat))
-    if links.crs and links.crs.to_epsg() != 4326:
-        pt_gdf = _gpd.GeoDataFrame(geometry=[pt], crs="EPSG:4326").to_crs(links.crs)
-        pt = pt_gdf.geometry.iloc[0]
+def _greedy_spatial_matches(
+    model_ids: Set[int],
+    real_ids: Set[int],
+    geoms: Dict[int, Any],
+    max_dist_m: float,
+) -> Tuple[int, Set[int], Set[int]]:
+    """Greedy 1:1 pairing of model vs jam links when line geometries are within *max_dist_m*."""
+    pairs: List[Tuple[float, int, int]] = []
+    for m in model_ids:
+        gm = geoms.get(m)
+        if gm is None or gm.is_empty:
+            continue
+        for j in real_ids:
+            gj = geoms.get(j)
+            if gj is None or gj.is_empty:
+                continue
+            d = float(gm.distance(gj))
+            if d <= max_dist_m:
+                pairs.append((d, m, j))
+    pairs.sort(key=lambda x: x[0])
+    matched_m: Set[int] = set()
+    matched_j: Set[int] = set()
+    tp = 0
+    for d, m, j in pairs:
+        if m in matched_m or j in matched_j:
+            continue
+        matched_m.add(m)
+        matched_j.add(j)
+        tp += 1
+    return tp, matched_m, matched_j
 
-    dists = links.geometry.distance(pt)
-    nearby = links[dists < 200]
-    if nearby.empty:
-        nearby = links.loc[[dists.idxmin()]]
 
-    sev = str(closure.get("pg_severity", closure.get("severity", "")))
-    is_full = "full" in sev.lower() or "closure" in sev.lower()
-
-    direction = "both"
-    raw_dir = str(closure.get("closure_direction", "")).strip().lower()
-    if raw_dir == "aligned":
-        direction = "ab"
-    elif raw_dir == "opposite":
-        direction = "ba"
-
-    result = []
-    for _, link in nearby.iterrows():
-        lanes = max(int(link.get("lanes", 2)), 1)
-        result.append({
-            "link_id": int(link["link_id"]),
-            "direction": direction,
-            "closure_type": "full" if is_full else "lanes",
-            "lanes": lanes,
-            "lanes_remaining": 0 if is_full else max(lanes - 1, 1),
-        })
-    return result
+def _buffer_link_ids(
+    lat: float,
+    lon: float,
+    links: gpd.GeoDataFrame,
+    buffer_m: float,
+) -> Set[int]:
+    metric = ensure_metric_links(links)
+    pt = gpd.GeoDataFrame(geometry=[Point(float(lon), float(lat))], crs="EPSG:4326").to_crs(
+        metric.crs,
+    )
+    pgeom = pt.geometry.iloc[0]
+    dists = metric.geometry.distance(pgeom)
+    return set(int(i) for i in metric.loc[dists <= buffer_m, "link_id"].astype(int))
 
 
 def main() -> None:
     cfg, out_dir = init_experiment(NAME)
 
-    cache = _cache_dir(cfg)
-    ri_path = cache / "restriction_impact.parquet"
-    el_path = cache / "event_links.parquet"
-
-    if not ri_path.exists():
-        print(f"[{NAME}] restriction_impact.parquet not found — run fetch-data first.")
-        return
-
-    ri = pd.read_parquet(ri_path)
-    el = pd.read_parquet(el_path) if el_path.exists() else pd.DataFrame()
-
     links = load_baseline_links(cfg)
-    baseline = load_assignment_results(cfg)
+    assign = load_assignment_results(cfg)
     closures = load_closures(cfg)
     seg_map = load_segment_map(cfg, links)
 
-    from sim._metrics import aggregate_daily_volumes
-    aggregate_daily_volumes(baseline)
-
-    baseline_merged = links.copy()
-    for c in baseline.columns:
-        if c != "link_id" and c not in baseline_merged.columns:
-            baseline_merged = baseline_merged.merge(baseline[["link_id", c]], on="link_id", how="left")
-    aggregate_daily_volumes(baseline_merged)
-
-    # Invert seg_map for segment lookup
-    link_to_seg = {v: k for k, v in seg_map.items()}
-
-    # Focus on closures that have real jam data
-    jam_col = "jams_caused" if "jams_caused" in ri.columns else "jam_count"
-    if jam_col in ri.columns:
-        closures_with_impact = ri[ri[jam_col].fillna(0) > 0].copy()
-    else:
-        closures_with_impact = pd.DataFrame()
-    if closures_with_impact.empty:
-        closures_with_impact = ri.head(10)
-
-    test = closures_with_impact.head(15)
-    logger.info("Evaluating %d closures with known jam impacts", len(test))
-
-    # Map event_links jams to link_ids
-    seg_col = "jam_segment_id" if "jam_segment_id" in el.columns else "segment_id"
-    src_col = "source_id" if "source_id" in el.columns else "restriction_id"
-    if not el.empty and seg_col in el.columns:
-        el["link_id"] = el[seg_col].map(seg_map)
-        if src_col != "restriction_id":
-            el["restriction_id"] = el[src_col]
-    else:
-        el = pd.DataFrame(columns=["restriction_id", "link_id"])
-
-    results = []
-    for _, ri_row in test.iterrows():
-        rid = int(ri_row.get("source_id", ri_row.get("restriction_id", ri_row.get("id", 0))))
-        cl_rows = closures[closures["id"] == rid]
-        if cl_rows.empty:
-            continue
-
-        cl = cl_rows.iloc[0]
-        scenario_links = _closure_to_scenario_links(cl, links)
-        if not scenario_links:
-            continue
-
-        # Real jam link IDs (from event_links)
-        real_jam_links = set()
-        if not el.empty:
-            cl_events = el[el["restriction_id"] == rid]
-            real_jam_links = set(cl_events["link_id"].dropna().astype(int).tolist())
-
-        try:
-            scenario_df = run_scenario_assignment(cfg, scenario_links)
-        except Exception as e:
-            logger.error("Scenario for restriction %d failed: %s", rid, e)
-            continue
-
-        # Find model-predicted congested links: links where V/C increased significantly
-        merged = baseline_merged[["link_id"]].copy()
-        merged["baseline_voc"] = baseline_merged.get("VOC_max", pd.Series(dtype=float)).fillna(0).values
-
-        scenario_voc = scenario_df.set_index("link_id").get("VOC_max", pd.Series(dtype=float)).fillna(0)
-        merged["scenario_voc"] = merged["link_id"].map(scenario_voc).fillna(0)
-        merged["delta_voc"] = merged["scenario_voc"] - merged["baseline_voc"]
-        model_congested = set(merged[merged["delta_voc"] > VC_DELTA_THRESHOLD]["link_id"].astype(int))
-
-        # Precision / recall
-        tp = len(model_congested & real_jam_links)
-        fp = len(model_congested - real_jam_links)
-        fn = len(real_jam_links - model_congested)
-
-        precision = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
-        recall = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else float("nan")
-
-        kpis = compute_scenario_kpis(baseline_merged, scenario_df)
-        real_delay = float(ri_row.get("total_delay_s", 0))
-
-        row = {
-            "restriction_id": rid,
-            "description": str(cl.get("description_cs", ""))[:50],
-            "real_jam_links": len(real_jam_links),
-            "model_congested_links": len(model_congested),
-            "true_positives": tp,
-            "false_positives": fp,
-            "false_negatives": fn,
-            "precision": round(precision, 3),
-            "recall": round(recall, 3),
-            "f1": round(f1, 3),
-            "model_dvht": kpis["delta_vht"],
-            "real_total_delay_s": real_delay,
-        }
-        results.append(row)
-
-    if not results:
-        print(f"[{NAME}] No closures could be evaluated.")
+    try:
+        jams = load_jams_stats(cfg)
+    except FileNotFoundError:
+        save_json(
+            {
+                "status": "skipped",
+                "reason": "jams_segment_stats.parquet missing — run fetch-data",
+            },
+            out_dir / "summary.json",
+        )
+        print(f"[{NAME}] Skipped — no jams stats.")
         return
 
-    results_df = pd.DataFrame(results)
-    save_csv(results_df, out_dir / "precision_recall.csv")
+    jam_col = next((c for c in ("jam_count", "count", "n_jams") if c in jams.columns), None)
+    if jam_col is None:
+        save_json({"status": "skipped", "reason": f"No jam column in jams stats: {list(jams.columns)}"},
+                  out_dir / "summary.json")
+        print(f"[{NAME}] Skipped — no jam column.")
+        return
 
-    summary = {
-        "n_closures": len(results),
-        "mean_precision": round(float(results_df["precision"].mean()), 3),
-        "mean_recall": round(float(results_df["recall"].mean()), 3),
-        "mean_f1": round(float(results_df["f1"].mean()), 3),
+    jams = jams.copy()
+    jams["link_id"] = jams["segment_id"].map(seg_map)
+    jams = jams.dropna(subset=["link_id"])
+    jams["link_id"] = jams["link_id"].astype(int)
+    jam_by_link = jams.groupby("link_id")[jam_col].sum()
+
+    net = links[["link_id", "geometry"]].merge(assign, on="link_id", how="inner")
+    if "VOC_max" not in net.columns:
+        save_json({"status": "skipped", "reason": "VOC_max missing from assignment results"}, out_dir / "summary.json")
+        print(f"[{NAME}] Skipped — no VOC_max.")
+        return
+
+    vc = net.set_index("link_id")["VOC_max"].fillna(0).astype(float)
+    link_geoms = _link_metric_geometries(links)
+
+    c = closures.copy()
+    if "quality_score" in c.columns:
+        c["_qs"] = pd.to_numeric(c["quality_score"], errors="coerce").fillna(0)
+        c = c.sort_values("_qs", ascending=False)
+    c = c[c["lat"].notna() & c["lon"].notna()].head(N_CLOSURES)
+
+    rows: List[Dict[str, Any]] = []
+
+    for _, row in c.iterrows():
+        rid = int(row.get("id", -1))
+        lat, lon = float(row["lat"]), float(row["lon"])
+        desc = str(row.get("description", ""))[:80]
+
+        pool = _buffer_link_ids(lat, lon, links, BUFFER_M)
+        if not pool:
+            continue
+
+        pool_vc = np.array([float(vc.get(lid, 0)) for lid in pool], dtype=float)
+        thr = float(np.percentile(pool_vc, VC_POOL_PERCENTILE)) if len(pool_vc) else VC_THRESHOLD
+        thr = max(VC_THRESHOLD, thr)
+
+        real_j = {lid for lid in pool if float(jam_by_link.get(lid, 0)) > 0}
+        model_c = {lid for lid in pool if float(vc.get(lid, 0)) >= thr}
+
+        tp_exact = len(real_j & model_c)
+        tp_sp, matched_m, matched_j = _greedy_spatial_matches(
+            model_c, real_j, link_geoms, MATCH_DISTANCE_M,
+        )
+        fp = len(model_c - matched_m)
+        fn = len(real_j - matched_j)
+        prec = tp_sp / max(len(model_c), 1)
+        rec = tp_sp / max(len(real_j), 1) if real_j else 0.0
+        f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+
+        rows.append({
+            "restriction_id": rid,
+            "description": desc,
+            "buffer_m": BUFFER_M,
+            "vc_threshold": round(thr, 4),
+            "match_distance_m": MATCH_DISTANCE_M,
+            "real_jam_links": len(real_j),
+            "model_congested_links": len(model_c),
+            "true_positives_spatial": tp_sp,
+            "true_positives_exact_link": tp_exact,
+            "false_positives": fp,
+            "false_negatives": fn,
+            "precision": round(prec, 4),
+            "recall": round(rec, 4),
+            "f1": round(f1, 4),
+        })
+
+    if not rows:
+        save_json({"status": "skipped", "reason": "no closure rows processed"}, out_dir / "summary.json")
+        print(f"[{NAME}] No rows.")
+        return
+
+    save_csv(pd.DataFrame(rows), out_dir / "precision_recall.csv")
+
+    mean_p = float(np.mean([r["precision"] for r in rows]))
+    mean_r = float(np.mean([r["recall"] for r in rows]))
+    mean_f1 = float(np.mean([r["f1"] for r in rows]))
+
+    summary: Dict[str, Any] = {
+        "n_closures": len(rows),
+        "buffer_m": BUFFER_M,
+        "vc_threshold_base": VC_THRESHOLD,
+        "vc_pool_percentile": VC_POOL_PERCENTILE,
+        "spatial_match_distance_m": MATCH_DISTANCE_M,
+        "mean_precision": round(mean_p, 4),
+        "mean_recall": round(mean_r, 4),
+        "mean_f1": round(mean_f1, 4),
+        "note": (
+            "Local buffer metrics with spatial TP (link geometries within "
+            f"{MATCH_DISTANCE_M:.0f} m) — Waze segment→link map rarely equals "
+            "the exact MATSim arc with peak V/C."
+        ),
     }
 
-    # ------------------------------------------------------------------
-    # Scatter: model ΔVHT vs real total delay
-    # ------------------------------------------------------------------
-    valid = results_df.dropna(subset=["model_dvht", "real_total_delay_s"])
-    valid = valid[(valid["model_dvht"] > 0) & (valid["real_total_delay_s"] > 0)]
-    if len(valid) >= 3:
-        rho, p = sp_stats.spearmanr(valid["model_dvht"], valid["real_total_delay_s"])
-        summary["dvht_vs_delay_spearman"] = round(float(rho), 3)
-        summary["dvht_vs_delay_p"] = float(p)
+    # Optional: correlate model max V/C in buffer vs total jam count in buffer
+    buf_vc_max: List[float] = []
+    buf_jam_sum: List[float] = []
+    for _, row in c.iterrows():
+        lat, lon = float(row["lat"]), float(row["lon"])
+        pool = _buffer_link_ids(lat, lon, links, BUFFER_M)
+        if not pool:
+            continue
+        buf_vc_max.append(float(max(float(vc.get(lid, 0)) for lid in pool)))
+        buf_jam_sum.append(float(sum(float(jam_by_link.get(lid, 0)) for lid in pool)))
 
-        fig, ax = plt.subplots(figsize=(7, 6))
-        ax.scatter(valid["real_total_delay_s"] / 3600, valid["model_dvht"], s=40, alpha=0.7)
-        ax.set_xlabel("Reálné zpoždění (Waze, hod)")
-        ax.set_ylabel("Modelový ΔVHT (voz·hod)")
-        ax.set_title(f"ΔVHT vs reálné zpoždění  (ρ = {rho:.3f})")
-        for _, r in valid.iterrows():
-            ax.annotate(str(r["restriction_id"]),
-                        (r["real_total_delay_s"] / 3600, r["model_dvht"]),
-                        fontsize=7, alpha=0.7)
-        save_figure(fig, out_dir / "scatter_delay.png")
-        plt.close(fig)
+    rho, p_val = (float("nan"), float("nan"))
+    if len(buf_vc_max) >= 5 and np.nanstd(buf_vc_max) > 0 and np.nanstd(buf_jam_sum) > 0:
+        rho, p_val = sp_stats.spearmanr(buf_vc_max, buf_jam_sum)
+    summary["buffer_vcmax_vs_jam_spearman"] = round(float(rho), 4) if np.isfinite(rho) else None
+    summary["buffer_vcmax_vs_jam_p"] = float(p_val) if np.isfinite(p_val) else None
 
-    # Precision/recall bar chart
-    fig, ax = plt.subplots(figsize=(10, 5))
-    x = np.arange(len(results_df))
-    w = 0.3
-    ax.bar(x - w, results_df["precision"], w, label="Precision", color="steelblue")
-    ax.bar(x, results_df["recall"], w, label="Recall", color="coral")
-    ax.bar(x + w, results_df["f1"], w, label="F1", color="mediumseagreen")
+    save_json(summary, out_dir / "summary.json")
+
+    # Figures
+    df_plot = pd.DataFrame(rows)
+    fig, ax = plt.subplots(figsize=(9, 4))
+    x = np.arange(len(df_plot))
+    w = 0.25
+    ax.bar(x - w, df_plot["precision"], width=w, label="Precision")
+    ax.bar(x, df_plot["recall"], width=w, label="Recall")
+    ax.bar(x + w, df_plot["f1"], width=w, label="F1")
     ax.set_xticks(x)
-    ax.set_xticklabels([str(r) for r in results_df["restriction_id"]], rotation=45, ha="right")
+    ax.set_xticklabels(df_plot["restriction_id"].astype(str), rotation=45, ha="right")
     ax.set_ylabel("Skóre")
-    ax.set_title("Precision / Recall validace kongesce")
-    ax.legend()
     ax.set_ylim(0, 1.05)
+    ax.legend()
+    ax.set_title("Precision / Recall (lokální buffer)")
     fig.tight_layout()
     save_figure(fig, out_dir / "precision_recall.png")
     plt.close(fig)
 
-    save_json(summary, out_dir / "summary.json")
-    print(f"[{NAME}] Done — {len(results)} closures → {out_dir}")
+    if len(buf_vc_max) >= 3 and np.nanstd(buf_jam_sum) > 0:
+        fig2, ax2 = plt.subplots(figsize=(6, 5))
+        ax2.scatter(buf_jam_sum, buf_vc_max, alpha=0.6)
+        ax2.set_xlabel("Součet zácp v bufferu (Waze)")
+        ax2.set_ylabel("max V/C v bufferu (model)")
+        ttl_rho = summary.get("buffer_vcmax_vs_jam_spearman")
+        ax2.set_title(f"max V/C vs zácpy v bufferu (ρ = {ttl_rho})")
+        fig2.tight_layout()
+        save_figure(fig2, out_dir / "scatter_delay.png")
+        plt.close(fig2)
+
+    print(f"[{NAME}] Done → {out_dir}")
 
 
 if __name__ == "__main__":

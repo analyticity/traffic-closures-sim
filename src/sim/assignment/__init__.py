@@ -7,6 +7,7 @@ from ``sim.assignment`` directly or from the individual sub-modules.
 from sim.assignment.config import (
     _apply_bpr_defaults,
     _resolve_multi_class,
+    multiclass_matrix_core_status,
     resolve_daily_cap_factor_default,
 )
 
@@ -39,6 +40,7 @@ __all__ = [
     # config
     "_apply_bpr_defaults",
     "_resolve_multi_class",
+    "multiclass_matrix_core_status",
     "resolve_daily_cap_factor_default",
     # preflight
     "fix_node_ids",

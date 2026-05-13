@@ -765,6 +765,9 @@ def auto_generate_screenlines(
                 for col in ("sv", "o"):
                     if col in _gw_csd.columns:
                         _gw_csd[col] = pd.to_numeric(_gw_csd[col], errors="coerce").fillna(0)
+                _has_delka = "delka" in _gw_csd.columns
+                if _has_delka:
+                    _gw_csd["delka"] = pd.to_numeric(_gw_csd["delka"], errors="coerce").fillna(0)
 
                 for road_sil, grp in _gw_csd.groupby("sil"):
                     road_raw = str(road_sil).strip().upper().replace(" ", "")
@@ -776,9 +779,20 @@ def auto_generate_screenlines(
                     sv_vals = grp["sv"].values
                     o_vals = grp["o"].values if "o" in grp.columns else sv_vals
 
+                    # Length-weighted mean: longer CSD sections are
+                    # suburban/rural with representative AADT, short sections
+                    # are urban pinch-points that skew the simple mean upward.
+                    weights = grp["delka"].values if _has_delka else None
+                    if weights is not None and weights.sum() > 0:
+                        sv_agg = float(np.average(sv_vals, weights=weights))
+                        o_agg = float(np.average(o_vals, weights=weights))
+                    else:
+                        sv_agg = float(sv_vals.mean())
+                        o_agg = float(o_vals.mean())
+
                     csd_mean_by_road[road_key] = {
-                        "sv": float(sv_vals.mean()),
-                        "o": float(o_vals.mean()),
+                        "sv": sv_agg,
+                        "o": o_agg,
                     }
 
             # Pre-load network links for anchor-node matching.
@@ -829,6 +843,12 @@ def auto_generate_screenlines(
                     except (ValueError, TypeError):
                         tnodes = set()
 
+                    # Transform boundary point to links_gdf CRS (WGS84)
+                    # for distance comparisons in the inner-link filter below.
+                    bx_wgs, by_wgs = transformer.transform(
+                        float(bx), float(by),
+                    ) if not (pd.isna(bx) or pd.isna(by)) else (None, None)
+
                     if tnodes:
                         for nid in tnodes:
                             adj_idxs = node_to_link_rows.get(nid, [])
@@ -841,6 +861,36 @@ def auto_generate_screenlines(
                                         if pd.notna(v) else False
                                     )
                                 )]
+                                # Fallback: if strict ref match yields nothing,
+                                # retry with numeric-only refs. Czech road refs
+                                # like "D55" (motorway) and "55" (trunk I/55) are
+                                # the same corridor but different classifications.
+                                if adj.empty:
+                                    import re as _re
+                                    numeric_parts = {
+                                        _re.sub(r"^[a-z]+", "", p)
+                                        for p in ref_parts
+                                    }
+                                    numeric_parts.discard("")
+                                    if numeric_parts and numeric_parts != ref_parts:
+                                        adj_all = links_gdf.iloc[adj_idxs]
+                                        adj = adj_all[adj_all["osm_ref_norm"].apply(
+                                            lambda v, np_=numeric_parts: (
+                                                bool(np_ & {
+                                                    _re.sub(r"^[a-z]+", "", p.strip())
+                                                    for p in str(v).lower().split(";")
+                                                })
+                                                if pd.notna(v) else False
+                                            )
+                                        )]
+                                        if not adj.empty:
+                                            logger.info(
+                                                "Gateway '%s' node %d: strict ref '%s' "
+                                                "matched 0 links, numeric fallback '%s' "
+                                                "matched %d",
+                                                gw_name, nid, ref,
+                                                numeric_parts, len(adj),
+                                            )
                             # Exclude hinge links (both ends are target
                             # nodes) -- assignment bypasses these via the
                             # dual connector topology.
@@ -848,6 +898,47 @@ def auto_generate_screenlines(
                                 adj["a_node"].astype(int).isin(tnodes)
                                 & adj["b_node"].astype(int).isin(tnodes)
                             )]
+
+                            # Among remaining links for this target node,
+                            # keep only the one whose *other* endpoint is
+                            # farthest from the boundary point (= deepest
+                            # into the network).  Links on the boundary side
+                            # of the centroid connector carry zero flow.
+                            #
+                            # Exception: one-way pairs (inbound + outbound
+                            # on a divided motorway) must BOTH be kept,
+                            # otherwise the screenline only captures one
+                            # direction.
+                            if len(adj) > 1 and bx_wgs is not None:
+                                _has_dir = "direction" in adj.columns
+                                _oneway_mask = (
+                                    adj["direction"].astype(int) == 1
+                                ) if _has_dir else pd.Series(False, index=adj.index)
+                                _n_oneway = _oneway_mask.sum()
+
+                                if _n_oneway >= 2:
+                                    # Multiple one-way links at this node:
+                                    # keep all one-way links (both directions
+                                    # of a divided highway), drop bidirectional
+                                    # duplicates if any.
+                                    adj = adj[_oneway_mask]
+                                else:
+                                    def _other_end_boundary_dist(lrow):
+                                        a = int(lrow["a_node"])
+                                        b = int(lrow["b_node"])
+                                        geom = lrow.geometry
+                                        if geom is None:
+                                            return 0.0
+                                        coords = list(geom.coords)
+                                        ox, oy = (coords[-1] if a == nid
+                                                  else coords[0])
+                                        return (ox - bx_wgs) ** 2 + (oy - by_wgs) ** 2
+
+                                    best_idx = adj.apply(
+                                        _other_end_boundary_dist, axis=1,
+                                    ).idxmax()
+                                    adj = adj.loc[[best_idx]]
+
                             for _, lrow in adj.iterrows():
                                 lid = int(lrow["link_id"])
                                 if lid not in {l[0] for l in explicit_links}:
@@ -856,14 +947,29 @@ def auto_generate_screenlines(
                 # One explicit link with multiple target nodes usually means
                 # the anchor side had no in-network ref match — fall back to
                 # geometry + attr resolution so ODME does not over-concentrate flow.
+                # Exceptions where the single link is fine:
+                #   - Compound refs (e.g. "13;27") legitimately list several
+                #     target nodes.
+                #   - Bidirectional link already captures both directions
+                #     (common where trunk transitions to motorway near boundary).
                 if (
                     explicit_links
                     and len(explicit_links) == 1
                     and ref
                     and target_nodes_raw
                     and "," in str(target_nodes_raw)
+                    and ";" not in str(ref)
                 ):
-                    explicit_links = []
+                    keep_single = False
+                    if links_gdf is not None:
+                        _sl_lid = explicit_links[0][0]
+                        _sl_row = links_gdf[links_gdf["link_id"] == _sl_lid]
+                        if not _sl_row.empty:
+                            _sl_dir = int(_sl_row.iloc[0].get("direction", 0))
+                            if _sl_dir == 0:
+                                keep_single = True
+                    if not keep_single:
+                        explicit_links = []
 
                 # --- CSD observed AADT ------------------------------------
                 obs_all = 0.0
@@ -929,25 +1035,62 @@ def auto_generate_screenlines(
             )
 
             # --- Post-processing A: Cap explicit_links to max 2 per gateway --
-            # At interchanges, multiple parallel carriageway links get picked
-            # up (e.g. 4 links at a D1 exit). Keep only the 2 highest-capacity
-            # links to avoid quadruple-counting the same corridor.
+            # At divided-highway gateways each target node contributes an
+            # inbound + outbound one-way link (4 links total).  We keep one
+            # link per *direction of travel* so the screenline captures both
+            # carriageways without double-counting.  Direction of travel is
+            # determined by whether the gateway target node is the link's
+            # a_node (outbound) or b_node (inbound).
             _MAX_GW_LINKS = 2
             if links_gdf is not None and "capacity_ab" in links_gdf.columns:
+                _lid_to_row = links_gdf.set_index("link_id")
                 for sl in result:
-                    if sl.has_explicit_links and len(sl.links) > _MAX_GW_LINKS:
-                        lid_set = {lid for lid, _ in sl.links}
-                        cap_lookup = links_gdf[links_gdf["link_id"].isin(lid_set)].set_index("link_id")["capacity_ab"]
-                        scored = sorted(
-                            sl.links,
-                            key=lambda t: float(cap_lookup.get(t[0], 0)),
-                            reverse=True,
-                        )
-                        old_count = len(sl.links)
-                        sl.links = scored[:_MAX_GW_LINKS]
+                    if not sl.has_explicit_links or len(sl.links) <= _MAX_GW_LINKS:
+                        continue
+                    gw_short = sl.name[len("auto_gw_"):] if sl.name.startswith("auto_gw_") else ""
+                    _gw_tnodes: set = set()
+                    if gw_short and gw_df is not None:
+                        _gr = gw_df[gw_df["gateway_name"] == gw_short]
+                        if not _gr.empty:
+                            _raw = str(_gr.iloc[0].get("target_node_ids", ""))
+                            _gw_tnodes = {
+                                int(float(x.strip()))
+                                for x in _raw.split(",") if x.strip()
+                            }
+
+                    # Classify each link as inbound or outbound relative to
+                    # its target node.  Outbound = traffic flowing from
+                    # gateway into the network (a_node is target).
+                    outbound: list = []
+                    inbound: list = []
+                    for lid, d in sl.links:
+                        try:
+                            lr = _lid_to_row.loc[lid]
+                        except KeyError:
+                            outbound.append((lid, d))
+                            continue
+                        a = int(lr["a_node"])
+                        if a in _gw_tnodes:
+                            outbound.append((lid, d))
+                        else:
+                            inbound.append((lid, d))
+
+                    def _pick_best(group):
+                        if not group:
+                            return []
+                        return [max(
+                            group,
+                            key=lambda t: float(
+                                _lid_to_row.loc[t[0]]["capacity_ab"]
+                            ) if t[0] in _lid_to_row.index else 0,
+                        )]
+
+                    old_count = len(sl.links)
+                    sl.links = _pick_best(outbound) + _pick_best(inbound)
+                    if len(sl.links) != old_count:
                         logger.info(
                             "Gateway screenline '%s': capped links from %d to %d "
-                            "(kept highest-capacity)",
+                            "(1 outbound + 1 inbound)",
                             sl.name, old_count, len(sl.links),
                         )
 
@@ -987,10 +1130,22 @@ def auto_generate_screenlines(
                         if ref_norm_m:
                             merged_refs.add(ref_norm_m)
 
-                    if len(merged_refs) > 1:
+                    # Deduplicate refs that differ only by classification
+                    # prefix (D/I/E): "D46", "46", "I46" are the same
+                    # corridor and must not be summed.
+                    import re as _re_b
+                    _numeric_groups: dict[str, list[str]] = {}
+                    for mref in merged_refs:
+                        num_key = _re_b.sub(r"^[A-Za-z]+", "", mref) or mref
+                        _numeric_groups.setdefault(num_key, []).append(mref)
+                    deduped_refs: set[str] = set()
+                    for num_key, variants in _numeric_groups.items():
+                        deduped_refs.add(variants[0])
+
+                    if len(deduped_refs) > 1:
                         total_all = 0.0
                         total_cars = 0.0
-                        for mref in merged_refs:
+                        for mref in deduped_refs:
                             csd_hit = csd_mean_by_road.get(mref)
                             if csd_hit:
                                 total_all += csd_hit["sv"]
@@ -999,7 +1154,7 @@ def auto_generate_screenlines(
                             logger.info(
                                 "Gateway '%s': merged from roads %s — summing "
                                 "CSD obs to %.0f (was %.0f)",
-                                sl.name, merged_refs, total_all,
+                                sl.name, deduped_refs, total_all,
                                 sl.observed_aadt_all or 0,
                             )
                             sl.observed_aadt_all = total_all
@@ -1010,7 +1165,7 @@ def auto_generate_screenlines(
             # (< 1500m) are likely duplicate clusters from the same boundary
             # crossing. Divide their observed equally so ODME doesn't over-
             # weight. Gateways further apart are independent entry points.
-            _PROXIMITY_THRESHOLD_M = 1500.0
+            _PROXIMITY_THRESHOLD_M = 2500.0
             _DIR_SUFFIXES = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
 
             def _extract_direction(gw_name: str) -> str:
@@ -1100,31 +1255,13 @@ def auto_generate_screenlines(
                         )
 
     # --- 2) CSD-based screenlines -------------------------------------------
-    # Collect road refs already covered by gateway screenlines to avoid
-    # giving the same corridor double weight in ODME calibration.
-    # Only add the SURVIVING gateway's matched_ref — merged-away road refs
-    # should still get their own CSD screenlines.
-    gw_road_refs: set[str] = set()
-    for sl in result:
-        if not sl.name.startswith("auto_gw_"):
-            continue
-        gw_short = sl.name[len("auto_gw_"):]
-        ref_val = ""
-        if gw_df is not None:
-            _gw_row = gw_df[gw_df["gateway_name"] == gw_short]
-            if not _gw_row.empty:
-                ref_val = str(_gw_row.iloc[0].get("matched_ref", "")).strip()
-        if not ref_val:
-            parts = gw_short.rsplit("_", 1)
-            if parts:
-                ref_val = parts[0]
-        if ref_val:
-            norm_ref = ref_val.upper().replace(" ", "")
-            try:
-                norm_ref = str(int(norm_ref))
-            except ValueError:
-                norm_ref = norm_ref.lstrip("0") or norm_ref
-            gw_road_refs.add(norm_ref)
+    # Gateway and CSD screenlines serve complementary roles: gateways
+    # control boundary throughput while CSD stations measure *internal*
+    # corridor volumes.  Allowing both gives ODME the information it
+    # needs to distribute traffic correctly inside the model.
+    # Cross-screenline link dedup (_dedup_cross_screenline_links) already
+    # prevents the same physical link from appearing in two screenlines.
+    gw_road_refs: set[str] = set()  # kept for logging only
 
     csd_min_aadt = float(auto_cfg.get("csd_min_aadt", 5000))
     if csd_df is not None and not csd_df.empty and bool(auto_cfg.get("csd_screenlines", True)):
@@ -1173,7 +1310,7 @@ def auto_generate_screenlines(
             except Exception as exc:
                 logger.debug("Could not load network refs for CSD filter: %s", exc)
 
-        csd_agg_method = str(auto_cfg.get("csd_agg_method", "mean"))
+        csd_agg_method = str(auto_cfg.get("csd_agg_method", "length_weighted"))
         csd_min_coverage = float(auto_cfg.get("csd_min_coverage", 0.5))
 
         # Pre-compute CSD total road-km per road for coverage filtering
@@ -1184,19 +1321,45 @@ def auto_generate_screenlines(
             for sil_val, grp in _csd_len.groupby("sil"):
                 csd_road_km[str(sil_val).strip().lower()] = float(grp["delka"].sum())
 
-        if "sil" in csd_df.columns and "sv" in csd_df.columns:
-            agg_fn = csd_agg_method if csd_agg_method in ("mean", "max", "median") else "max"
-            agg_dict: dict = {
-                "sv_agg": ("sv", agg_fn),
-            }
-            if "o" in csd_df.columns:
-                agg_dict["o_agg"] = ("o", agg_fn)
-            else:
-                agg_dict["o_agg"] = ("sv", agg_fn)
-            # Also keep the mean for the AADT threshold filter
-            agg_dict["sv_mean"] = ("sv", "mean")
+        _use_length_weighted = (
+            csd_agg_method == "length_weighted"
+            and "delka" in csd_df.columns
+        )
 
-            grouped = csd_df.groupby("sil", as_index=False).agg(**agg_dict)
+        if "sil" in csd_df.columns and "sv" in csd_df.columns:
+            if _use_length_weighted:
+                _csd_lw = csd_df.copy()
+                _csd_lw["delka"] = pd.to_numeric(_csd_lw["delka"], errors="coerce").fillna(0)
+                _csd_lw_records: List[Dict[str, Any]] = []
+                for sil_val, grp in _csd_lw.groupby("sil"):
+                    weights = grp["delka"].values
+                    sv_vals = grp["sv"].values
+                    o_vals = grp["o"].values if "o" in grp.columns else sv_vals
+                    if weights.sum() > 0:
+                        sv_agg = float(np.average(sv_vals, weights=weights))
+                        o_agg = float(np.average(o_vals, weights=weights))
+                    else:
+                        sv_agg = float(sv_vals.mean())
+                        o_agg = float(o_vals.mean())
+                    _csd_lw_records.append({
+                        "sil": sil_val,
+                        "sv_agg": sv_agg,
+                        "o_agg": o_agg,
+                        "sv_mean": float(sv_vals.mean()),
+                    })
+                grouped = pd.DataFrame(_csd_lw_records)
+            else:
+                agg_fn = csd_agg_method if csd_agg_method in ("mean", "max", "median") else "max"
+                agg_dict: dict = {
+                    "sv_agg": ("sv", agg_fn),
+                }
+                if "o" in csd_df.columns:
+                    agg_dict["o_agg"] = ("o", agg_fn)
+                else:
+                    agg_dict["o_agg"] = ("sv", agg_fn)
+                agg_dict["sv_mean"] = ("sv", "mean")
+                grouped = csd_df.groupby("sil", as_index=False).agg(**agg_dict)
+
             major = grouped[grouped["sv_mean"] >= csd_min_aadt]
 
             n_skipped_no_network = 0
@@ -1213,10 +1376,10 @@ def auto_generate_screenlines(
 
                 name = f"auto_csd_{road_norm}"
 
-                # Skip if a gateway screenline already covers this road
-                if road_norm in gw_road_refs:
-                    n_skipped_gw_dup += 1
-                    continue
+                # Gateway screenlines at the boundary and CSD screenlines
+                # at internal locations are complementary — do not skip.
+                # (Previously skipped gateway-covered roads, which
+                # prevented ODME from controlling internal distribution.)
 
                 if network_refs and road_norm.lower() not in network_refs:
                     n_skipped_no_network += 1

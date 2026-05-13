@@ -299,39 +299,47 @@ SIM_DEFAULTS: Dict[str, Any] = {
     "calibration": {
         "algorithm": "bfw",
         "allow_aon": False,
-        "strict_convergence": True,
+        "strict_convergence": False,
         "max_iter": 200,
-        "rgap_target": 0.01,
+        "rgap_target": 0.002,
         "core_name": "wd_daily",
         "model_time_period": "daily",
         "min_obs_per_zone": 0.5,
 
         "count_source": "csd_split",
         "require_holdout": True,
+        "method": "entropy_odme",
+
+        "match_buffer_m": 120.0,
+        "match_direction_aware": True,
+        "match_conflict_resolution": "nearest",
+        "match_quality_min": 0.25,
+        "count_target": "motor_total",
+        "aggregate_corridor": True,
+        "save_skims": False,
+        "require_supply_audit": True,
 
         "csd_split": {
-            "strategy": "alternating",
+            "strategy": "corridor",
             "calib_share": 0.65,
             "random_seed": 42,
         },
 
         "gateway_calibration": {
             "enabled": True,
-            "damping": 0.30,
-            "min_factor": 0.50,
-            "max_factor": 2.00,
+            "damping": 0.20,
+            "min_factor": 0.60,
+            "max_factor": 1.45,
             "rebase_seed_bounds": True,
         },
 
-        "match_buffer_m": 80.0,
-        "match_direction_aware": True,
-        "match_conflict_resolution": "nearest",
-        "match_quality_min": 0.35,
-        "count_target": "motor_total",
-        "aggregate_corridor": True,
-        "save_skims": False,
-        "require_supply_audit": True,
-        "supply_tuning": {"enabled": False},
+        "supply_tuning": {
+            "enabled": True,
+            "road_classes": ["motorway", "trunk", "primary", "secondary", "tertiary"],
+            "speed_factor_range": [0.85, 0.90, 0.95, 1.0, 1.05, 1.10, 1.15],
+            "capacity_factor_range": [0.70, 0.85, 1.0, 1.15, 1.30, 1.50],
+            "inner_max_iterations": 3,
+        },
 
         "max_iterations": 50,
         "reset_matrix_before_run": True,
@@ -362,17 +370,53 @@ SIM_DEFAULTS: Dict[str, Any] = {
         },
 
         "odme": {
-            "max_outer_iterations": 30,
+            "max_outer_iterations": 35,
             "gradient_descent_iterations": 8,
+            "stall_patience": 14,
+            "entropy_step_size": 0.20,
+            "convergence_tol": 0.001,
             "max_deviation": 4.0,
             "weight_function": "inverse_sqrt",
-            "convergence_tol": 0.001,
             "global_residual_damping": 0.20,
-            "max_iter_change_pct": 10.0,
-            "stall_patience": 6,
+            "max_iter_change_pct": 12.0,
+            "assign_max_iter": 100,
+            "assign_rgap_target": 0.008,
             "class_residual_enabled": True,
             "class_residual_damping": 0.06,
             "class_residual_min_counts": 3,
+            "stages": [
+                {
+                    "name": "stabilize",
+                    "max_iterations": 16,
+                    "max_deviation": 5.0,
+                    "global_residual_damping": 0.15,
+                    "max_iter_change_pct": 15.0,
+                    "gateway_calibration": {
+                        "enabled": True,
+                        "damping": 0.15,
+                    },
+                },
+                {
+                    "name": "refine",
+                    "max_iterations": 25,
+                    "max_deviation": 3.5,
+                    "global_residual_damping": 0.20,
+                    "max_iter_change_pct": 10.0,
+                },
+            ],
+        },
+
+        "validation": {
+            "match_buffer_m": 120.0,
+            "match_quality_min": 0.25,
+        },
+
+        "auto_screenlines": {
+            "enabled": True,
+            "gateway_screenlines": True,
+            "csd_screenlines": True,
+            "csd_min_aadt": 5000,
+            "csd_agg_method": "length_weighted",
         },
 
         "matching": {
@@ -403,13 +447,6 @@ SIM_DEFAULTS: Dict[str, Any] = {
 
         "screenline_dedup_strict": False,
         "screenline_cross_dedup": True,
-
-        "auto_screenlines": {
-            "enabled": False,
-            "gateway_screenlines": True,
-            "csd_screenlines": True,
-            "csd_min_aadt": 5000,
-        },
 
         "multistage": {
             "max_total_change_pct": 50.0,

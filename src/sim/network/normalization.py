@@ -145,6 +145,139 @@ def _apply_csd_capacity_hints(
     return n_updated
 
 
+_PINCH_ELIGIBLE = frozenset({"trunk", "motorway"})
+
+
+def _fix_lane_pinch_points(links: pd.DataFrame) -> int:
+    """Propagate lane count at divided-highway transition pinch points.
+
+    OSM often maps the transition from a bidirectional road to a divided
+    highway (separate one-way carriageways) with a short 1-lane connecting
+    link, creating an artificial capacity bottleneck.  This function:
+
+    1. **One-way pinch**: if a one-way trunk/motorway link has fewer lanes
+       than the downstream one-way link of the same type, increase its
+       ``lanes_ab`` to match.
+    2. **Bidirectional asymmetry**: if a bidirectional trunk/motorway link
+       connects to a one-way link with more lanes than its weak direction,
+       increase the weak direction's lane count to match.
+
+    Must be called *after* lanes are resolved and *before* capacity is
+    derived so that ``capacity = cap_per_lane × lanes`` picks up the fix.
+    """
+    if "link_type" not in links.columns or "direction" not in links.columns:
+        return 0
+
+    major = links["link_type"].isin(_PINCH_ELIGIBLE)
+    if not major.any():
+        return 0
+
+    oneway = major & (links["direction"] == 1)
+    bidir = major & (links["direction"] == 0)
+
+    a_col = links["a_node"].astype(int)
+    b_col = links["b_node"].astype(int)
+
+    node_to_idx: dict[int, list] = {}
+    for idx in links.index[major]:
+        node_to_idx.setdefault(int(a_col[idx]), []).append(idx)
+        node_to_idx.setdefault(int(b_col[idx]), []).append(idx)
+
+    n_fixed = 0
+
+    # --- 1) One-way pinch points -------------------------------------------
+    # Only fix genuine 1-lane bottlenecks before a wider section, not
+    # legitimate road widenings (2→3 etc.).
+    for idx in links.index[oneway]:
+        my_lanes = int(links.at[idx, "lanes_ab"])
+        if my_lanes > 1:
+            continue
+        b_node = int(b_col[idx])
+        my_lt = links.at[idx, "link_type"]
+        for adj_idx in node_to_idx.get(b_node, []):
+            if adj_idx == idx:
+                continue
+            adj = links.loc[adj_idx]
+            if int(adj["direction"]) != 1 or int(adj["a_node"]) != b_node:
+                continue
+            if adj["link_type"] != my_lt:
+                continue
+            adj_lanes = int(adj["lanes_ab"])
+            if adj_lanes > my_lanes:
+                links.at[idx, "lanes_ab"] = adj_lanes
+                links.at[idx, "capacity_ab"] = np.nan
+                n_fixed += 1
+                logger.debug(
+                    "Pinch fix: link %d lanes_ab %d→%d (downstream match)",
+                    int(links.at[idx, "link_id"]), my_lanes, adj_lanes,
+                )
+                break
+
+    # --- 2) Bidirectional asymmetry at divided-highway junctions ------------
+    # Only fix when lanes_ba == 1 (weak direction) and the link connects
+    # to a one-way or already-fixed bidirectional link with 2+ lanes.
+    # Iterate until stable to propagate along bidirectional chains
+    # (e.g. a short sequence of bidir links between a divided highway and
+    # a gateway node).
+    for _iteration in range(5):
+        n_this_round = 0
+        for idx in links.index[bidir]:
+            lanes_ab = int(links.at[idx, "lanes_ab"])
+            lanes_ba = int(links.at[idx, "lanes_ba"])
+            if lanes_ba > 1:
+                continue
+            a_node = int(a_col[idx])
+            b_node = int(b_col[idx])
+            my_lt = links.at[idx, "link_type"]
+
+            max_adj = 0
+            for nid in (a_node, b_node):
+                for adj_idx in node_to_idx.get(nid, []):
+                    if adj_idx == idx:
+                        continue
+                    adj = links.loc[adj_idx]
+                    if adj["link_type"] != my_lt:
+                        continue
+                    d = int(adj["direction"])
+                    if d == 1:
+                        max_adj = max(max_adj, int(adj["lanes_ab"]))
+                    elif d == 0 and int(adj["lanes_ba"]) > 1:
+                        max_adj = max(max_adj, int(adj["lanes_ba"]))
+
+            if max_adj <= 1:
+                continue
+
+            target = max(lanes_ab, max_adj)
+            changed = False
+            if target > lanes_ba:
+                links.at[idx, "lanes_ba"] = target
+                links.at[idx, "capacity_ba"] = np.nan
+                changed = True
+            if target > lanes_ab:
+                links.at[idx, "lanes_ab"] = target
+                links.at[idx, "capacity_ab"] = np.nan
+                changed = True
+            if changed:
+                n_fixed += 1
+                n_this_round += 1
+                logger.debug(
+                    "Pinch fix: link %d lanes %d/%d→%d/%d (bidir equalise, pass %d)",
+                    int(links.at[idx, "link_id"]),
+                    lanes_ab, lanes_ba,
+                    int(links.at[idx, "lanes_ab"]),
+                    int(links.at[idx, "lanes_ba"]),
+                    _iteration + 1,
+                )
+        if n_this_round == 0:
+            break
+
+    if n_fixed:
+        logger.info(
+            "Lane pinch-point fix: adjusted %d trunk/motorway links", n_fixed,
+        )
+    return n_fixed
+
+
 def _apply_practical_speed_reduction(
     links: pd.DataFrame,
     project: Project,
@@ -470,6 +603,9 @@ def normalize_network_attributes(
     _resolve_directional("lanes_ab", "lanes_ba", default_lanes, 1, "estimated_lanes_ab", "estimated_lanes_ba")
     links["lanes_ab"] = links["lanes_ab"].clip(lower=1)
     links["lanes_ba"] = links["lanes_ba"].clip(lower=1)
+
+    # --- Lane pinch-point fix (before capacity derivation) ---
+    _fix_lane_pinch_points(links)
 
     # --- Practical free-flow speed reduction (HCM-inspired) ---
     pffs_defaults = _NORM_DEFS.get("practical_speed") or {}

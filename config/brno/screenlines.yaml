@@ -1,13 +1,67 @@
-# Manual screenline definitions for inner-city corridors.
+# Ruční opravy gateway screenlines (stejný název jako auto_gw_* = přepíše auto-generovaný záznam).
 #
-# Gateway screenlines (D1, D2, I/43, I/52, ...) and high-AADT CSD roads
-# (640, 42, ...) are auto-generated via calibration.auto_screenlines.
+# Pozorované hodnoty: CSD / gateway agregát z posledního běhu (outputs/…/zones + calibration).
+# Po rebuildu sítě zkontrolujte link_id vůči project/brno_aeq.
 #
-# Only corridors matched by OSM street *name* (not osm_ref_norm) need
-# manual definitions here, because auto-generation cannot create them.
-#
-# direction: 1 = a→b only, -1 = b→a only, 0 = both directions summed
-# type: "screenline" | "cordon" | "radial"
-# expected_links: optional sanity check — warns if resolved count differs
+# direction: 0 = součet obou směrů na obousměrném úseku
 
-screenlines: []
+screenlines:
+  # Šlapanice Nový Dvůr / sil. 386 (merge 384_NW|386_NW v gateway_diagnostics) — auto bralo mrtvé segmenty (111555).
+  - name: "auto_gw_386_NW"
+    description: "386 NW — jen úsek se skutečným tocením (sil. 386 → uzel brány)"
+    type: "radial"
+    links:
+      - { link_id: 111553, direction: 0 }
+    observed_aadt_all: 20469
+    observed_aadt_cars: 16784
+
+  # I/52 jih — auto už mělo správné linky (8600, 22128); explicitně pro stabilitu po mergi 52_S|7_S.
+  - name: "auto_gw_52_S"
+    description: "I/52 S — výstup ze silnice přes uzly brány"
+    type: "radial"
+    links:
+      - { link_id: 8600, direction: 0 }
+      - { link_id: 22128, direction: 0 }
+    observed_aadt_all: 44741
+    observed_aadt_cars: 36687
+
+  # Sil. 418 SE — auto bralo 2380 / 31132 (PCE=0); aktivní řez je 70123 ↔ 229318.
+  - name: "auto_gw_418_SE"
+    description: "418 SE — řez odkud skutečně teče provoz do brány"
+    type: "radial"
+    links:
+      - { link_id: 31131, direction: 0 }
+    observed_aadt_all: 2565
+    observed_aadt_cars: 2103
+
+  # --- Manuální interní CSD screenlines (koridor Obřany–Brněnská) -----------
+
+  # 380 Brněnská — CSD ukazuje 8k, model dává 20k (2.5× over).
+  # Hlavní přívodní koridor ze severu který se přelévá do Obřanské.
+  - name: "manual_380_brnenska"
+    description: "Sil. 380 Brněnská (link 2388, bidir secondary)"
+    type: "radial"
+    links:
+      - { link_id: 2388, direction: 0 }
+    observed_aadt_all: 8034
+    observed_aadt_cars: 6598
+
+  # 383 Selská — CSD ukazuje 7.6k, model dává 15k (2× over).
+  # Kontrolní bod na koridoru 383 jižně od rozbočky Obřanská/Selská.
+  - name: "manual_383_selska"
+    description: "Sil. 383 Selská (link 69886, bidir secondary)"
+    type: "radial"
+    links:
+      - { link_id: 69886, direction: 0 }
+    observed_aadt_all: 7647
+    observed_aadt_cars: 6598
+
+  # 383 Havlíčkova — CSD ukazuje 5.2k, model dává 10k (2× over).
+  # Větev 383 směrem do centra města.
+  - name: "manual_383_havlickova"
+    description: "Sil. 383 Havlíčkova (link 27742, bidir secondary)"
+    type: "radial"
+    links:
+      - { link_id: 27742, direction: 0 }
+    observed_aadt_all: 5156
+    observed_aadt_cars: 4228

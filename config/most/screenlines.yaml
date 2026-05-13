@@ -1,10 +1,11 @@
 # Screenline definitions for Most.
 #
-# This file can be left empty — screenlines are auto-generated from
-# gateway diagnostics and CSD data when calibration.auto_screenlines.enabled
-# is true in the city's sim.yaml.
-#
-# Add manual screenlines below to override or supplement auto-generated ones.
 # Manual entries take precedence over auto-generated ones with the same name.
 
-screenlines: []
+screenlines:
+  - name: "auto_gw_15_SE"
+    description: "Gateway 15 SE — manual override: use link 2593 (10277→15368) instead of dead-end link 2645"
+    type: "radial"
+    links:
+      - { link_id: 2593, direction: 0 }
+    observed_aadt_all: 9761.0

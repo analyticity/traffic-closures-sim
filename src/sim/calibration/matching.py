@@ -171,48 +171,55 @@ def _compute_match_confidence(
 ) -> float:
     """Return 0.0–1.0 confidence score for a count↔link match.
 
-    Combines volume-ratio plausibility, link-type compatibility,
-    CSD section count, and geometric match quality. A match with
-    confidence < *threshold* is flagged for exclusion.
+    Primarily based on **geometric match quality** (is this the right
+    link for the count station?).  Volume-ratio plausibility is only
+    used as a secondary signal when geometric quality is ambiguous
+    (match_quality < 0.65); for well-matched points the model/obs
+    ratio is a calibration concern, not a matching concern.
     """
-    score = 1.0
-
     if obs <= 0 or vol < 0:
         return 0.0
+
+    geo_score = max(match_quality, 0.0)
+
+    # For geometrically confident matches, trust the spatial match
+    # and let calibration handle volume discrepancies.
+    _GEO_TRUST_THRESHOLD = 0.65
+    if geo_score >= _GEO_TRUST_THRESHOLD:
+        return float(np.clip(geo_score, 0.0, 1.0))
+
+    # Below the trust threshold, volume-ratio checks help disambiguate
+    # whether the spatial match is genuinely the right link.
+    score = 1.0
 
     ratio = vol / max(obs, 1.0)
     inv_ratio = obs / max(vol, 1.0) if vol > 0 else 0.0
 
-    # Zero/near-zero model volume with high observed → certainly wrong link
     if vol <= 0 and obs >= 5000:
         return 0.0
     if obs >= 2000 and vol < obs * 0.01:
-        return 0.0
+        score *= 0.15
 
-    # Major-road reverse mismatch (obs << model)
     is_major_strict = link_type in _MAJOR_ROAD_TYPES_STRICT
     is_link = link_type.endswith("_link")
 
     if is_major_strict and vol > 15000 and inv_ratio < 0.30:
-        score *= 0.1
-    if is_major_strict and vol > 5000 and ratio > 4.0:
         score *= 0.15
+    if is_major_strict and vol > 5000 and ratio > 4.0:
+        score *= 0.20
     if is_link and obs > 2000 and vol > 0 and ratio < 0.20:
-        score *= 0.1
+        score *= 0.15
 
-    # Moderate ratio deviations penalise gradually
     if vol > 0 and obs > 0:
         if ratio > 2.5:
-            score *= max(0.2, 1.0 - (ratio - 2.5) / 5.0)
+            score *= max(0.3, 1.0 - (ratio - 2.5) / 5.0)
         elif ratio < 0.4:
-            score *= max(0.2, ratio / 0.4)
+            score *= max(0.3, ratio / 0.4)
 
-    # CSD low-confidence: few sections + large overestimation
     if n_sections < 3 and vol > 0 and obs > 0 and ratio > 2.0:
-        score *= 0.2
+        score *= 0.3
 
-    # Geometric match quality
-    score *= max(match_quality, 0.0)
+    score *= geo_score
 
     return float(np.clip(score, 0.0, 1.0))
 
@@ -248,7 +255,7 @@ def _apply_exclusion_scoring(
         else pd.Series(1.0, index=joined.index)
     )
 
-    threshold = max(match_quality_min, 0.3) if phase == "pre_corridor" else 0.3
+    threshold = match_quality_min
 
     confidences = np.array([
         _compute_match_confidence(v, o, lt, ns, q, threshold=threshold)
@@ -484,8 +491,12 @@ def match_counts_to_links(
         joined = _aggregate_corridor_volumes(joined, links_sel, buffer_m)
 
     corr_col = "_corridor_volume" if "_corridor_volume" in joined.columns else None
+    # Post-corridor must use the same confidence gate as pre-corridor; passing
+    # 0.0 here effectively disabled exclusion after corridor aggregation.
     if not skip_exclusion and corr_col:
-        joined = _apply_exclusion_scoring(joined, corr_col, 0.0, phase="post_corridor")
+        joined = _apply_exclusion_scoring(
+            joined, corr_col, match_quality_min, phase="post_corridor",
+        )
 
     for col in ("_count_bearing", "_link_bearing"):
         if col in joined.columns:

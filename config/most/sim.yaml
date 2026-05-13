@@ -39,9 +39,34 @@ demand:
       total_daily_trips: 15000
 
 calibration:
-  count_source: "csd_split"
-  auto_screenlines:
-    enabled: true
+  match_quality_min: 0.20
+  gateway_calibration:
+    damping: 0.20
+    min_factor: 0.65
+    max_factor: 1.40
+  odme:
+    max_outer_iterations: 40
+    stall_patience: 16
+    entropy_step_size: 0.15
+    convergence_tol: 0.001
+    max_iter_change_pct: 10.0
+    assign_max_iter: 120
+    assign_rgap_target: 0.005
+    stages:
+      - name: "stabilize"
+        max_iterations: 20
+        max_deviation: 5.0
+        global_residual_damping: 0.12
+        max_iter_change_pct: 12.0
+        gateway_calibration:
+          enabled: true
+          damping: 0.12
+      - name: "refine"
+        max_iterations: 25
+        max_deviation: 3.5
+        global_residual_damping: 0.18
+        max_iter_change_pct: 8.0
+  screenlines_path: "config/most/screenlines.yaml"
 
 datasets:
   enabled: true

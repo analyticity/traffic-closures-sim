@@ -2,10 +2,23 @@ project_path: "project/olomouc_aeq"
 
 osm:
   place_name: "Olomouc, Czechia"
-  buffer_km: 2  # wider buffer to capture motorway on/off-ramps near boundary (D35, D46)
 
 network:
   normalization_config: "config/olomouc/network_normalization.yaml"
+
+# Include secondary gateways (e.g. 446_NW, 448_W) in supernetwork routing and
+# external_gateway_lookup. Default eligible_gateway_types omit secondary, so
+# auto-discovered secondary corridors were dropped from build-supernetwork.
+supernetwork:
+  eligible_gateway_types:
+    - motorway
+    - motorway_link
+    - trunk
+    - trunk_link
+    - primary
+    - primary_link
+    - secondary
+    - secondary_link
 
 zoning:
   sources:
@@ -19,65 +32,30 @@ zoning:
 demand:
   segments:
     external_local:
-      # Explicit total (frozen from prior CSD auto estimate in od_summary; avoids opaque "auto")
-      total_daily_trips: 147466
+      # Lower than prior 147466: compact city footprint + okres zoning over-weights corridor seed.
+      total_daily_trips: 80000
   sldb:
     external_processing:
       through_traffic_scale: 0.30
 
 calibration:
-  rgap_target: 0.002
-  strict_convergence: false
-  count_source: "csd_split"
-  match_buffer_m: 120.0
-  match_quality_min: 0.25
-  method: "entropy_odme"
   gateway_calibration:
-    enabled: true
     damping: 0.18
     min_factor: 0.70
     max_factor: 1.40
-  supply_tuning:
-    enabled: true
-    road_classes: ["motorway", "trunk", "primary", "secondary", "tertiary"]
-    speed_factor_range: [0.85, 0.90, 0.95, 1.0, 1.05, 1.10, 1.15]
-    capacity_factor_range: [0.70, 0.85, 1.0, 1.15, 1.30, 1.50]
-    inner_max_iterations: 3
   odme:
     max_outer_iterations: 35
-    stall_patience: 14
     entropy_step_size: 0.22
     convergence_tol: 0.0008
-    max_deviation: 4.0
-    max_iter_change_pct: 12.0
-    assign_max_iter: 80
-    assign_rgap_target: 0.008
     stages:
       - name: "stabilize"
         max_iterations: 18
-        max_deviation: 5.0
-        global_residual_damping: 0.15
-        max_iter_change_pct: 15.0
-        gateway_calibration:
-          enabled: true
-          damping: 0.15
       - name: "refine"
         max_iterations: 28
-        max_deviation: 3.5
-        global_residual_damping: 0.20
-        max_iter_change_pct: 10.0
-  validation:
-    match_buffer_m: 120.0
-    match_quality_min: 0.25
-  csd_split:
-    strategy: "corridor"
-    calib_share: 0.65
-    random_seed: 42
   screenlines_path: "config/olomouc/screenlines.yaml"
+  # Reduce CSD-derived auto screenlines vs. defaults (csd_min_aadt 5000); keeps gateway radials.
+  # See docs/olomouc_calibration_diagnostics.md and src/sim/calibration/screenlines.py.
   auto_screenlines:
-    enabled: true
-    gateway_screenlines: true
-    csd_screenlines: true
     csd_min_aadt: 5000
 
 datasets:

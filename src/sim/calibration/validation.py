@@ -71,16 +71,65 @@ def _base_divided_highway_link_type(link_type: Any) -> Optional[str]:
     return None
 
 
+def _observed_total_for_merged_carriageway(
+    modeled: List[float],
+    observed: List[float],
+) -> float:
+    """Pick corridor-level observed total for twin parallel motorway/trunk links.
+
+    Count providers may attach either (a) a **directional half** to each
+    carriageway link — observations should be **summed** — or (b) the **full**
+    corridor AADT on **each** link — summing would double-count; in that case
+    we keep a single representative (max).
+
+    Heuristic: if assignment loads almost all volume on one arc
+    (``max(modeled)/sum(modeled)`` high) *and* ``sum(observed)`` is far above
+    the modeled corridor total, treat observations as duplicated full counts.
+    Otherwise sum partial link observations.
+    """
+    sm_m = float(sum(max(0.0, float(x)) for x in modeled))
+    if sm_m <= 1e-6:
+        nonzero = [float(o) for o in observed if float(o) > 0.0]
+        return float(sum(nonzero)) if nonzero else 0.0
+
+    mx_m = max(max(0.0, float(x)) for x in modeled)
+    share_top = mx_m / sm_m
+
+    nonzero = [float(o) for o in observed if float(o) > 0.0]
+    if not nonzero:
+        return 0.0
+    if len(nonzero) == 1:
+        return float(nonzero[0])
+
+    mx_o = max(nonzero)
+    mn_o = min(nonzero)
+    sum_o = float(sum(nonzero))
+
+    # Clearly asymmetric partial counts — always sum.
+    if mn_o < 0.72 * mx_o:
+        return sum_o
+
+    # Duplicated full-corridor AADT on each parallel link inflates sum(obs)
+    # vs assigned corridor (sum(modeled)).
+    if share_top >= 0.82 and sum_o > max(1.12 * sm_m, 1.0):
+        return float(mx_o)
+    return sum_o
+
+
 def merge_divided_highway_screenline_per_link(
     per_link: List[Dict[str, Any]],
     links_gdf: Optional[gpd.GeoDataFrame],
 ) -> List[Dict[str, Any]]:
-    """Merge twin one-way motorway/trunk links sharing ``osm_id`` for screenline rows.
+    """Merge twin motorway/trunk links sharing ``osm_id`` for screenline rows.
 
     Equilibrium can load all PCE on one directed arc of a divided carriageway
     while CSD / pent observations are corridor-level. Summing modeled volumes
-    for the pair and de-duplicating near-duplicate observed totals keeps
-    screenline ratios and GEH comparable to observations (read-only).
+    for the pair and collapsing duplicate observed totals keeps screenline
+    ratios and GEH comparable to observations (read-only).
+
+    Both **one-way** (``direction != 0``) twins and **bidirectional** pairs of
+    parallel carriageways (same ``osm_id``, ``direction == 0``) are merged when
+    the network attributes identify them as motorway/trunk mainline links.
     """
     if not per_link or links_gdf is None or len(per_link) < 2:
         return per_link
@@ -121,9 +170,6 @@ def merge_divided_highway_screenline_per_link(
             if not s:
                 continue
             osm_key = s
-        dirn = int(pd.to_numeric(row.get("direction"), errors="coerce") or 0)
-        if dirn == 0:
-            continue
         if _base_divided_highway_link_type(row.get("link_type")) is None:
             continue
         by_osm[osm_key].append(i)
@@ -158,17 +204,7 @@ def merge_divided_highway_screenline_per_link(
         models = [float(per_link[j].get("modeled", 0) or 0) for j in grp]
         obss = [float(per_link[j].get("observed", 0) or 0) for j in grp]
         sm = float(sum(models))
-        nonzero = [o for o in obss if o > 0]
-        if len(nonzero) >= 2:
-            mx, mn = max(nonzero), min(nonzero)
-            if mx > 0 and mn >= 0.75 * mx:
-                so = float(mx)
-            else:
-                so = float(sum(nonzero))
-        elif len(nonzero) == 1:
-            so = float(nonzero[0])
-        else:
-            so = 0.0
+        so = _observed_total_for_merged_carriageway(models, obss)
         lids = [int(per_link[j].get("link_id", 0) or 0) for j in grp]
         lead = lids[0] if lids else int(pl.get("link_id", 0) or 0)
         osm_merged = group_osm.get(grp, "")

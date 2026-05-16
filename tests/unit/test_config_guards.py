@@ -1,4 +1,4 @@
-"""Unit tests for P1 audit guards.
+"""Unit tests for configuration guards.
 
 Tests cover: VDF parameter fallback, blocked centroid flows config,
 step dependency DAG prerequisite checks, and staleness warnings.
@@ -16,7 +16,7 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# P1-C: VDF parameter fallback
+# VDF parameter fallback
 # ---------------------------------------------------------------------------
 class TestVdfFallback:
     def test_per_link_with_link_type_returns_column_names(self):
@@ -62,7 +62,7 @@ class TestVdfFallback:
 
 
 # ---------------------------------------------------------------------------
-# P1-B: Blocked centroid flows config guard
+# Blocked centroid flows config guard
 # ---------------------------------------------------------------------------
 class TestBlockedCentroidFlowsConfig:
     def test_default_is_true(self):
@@ -126,7 +126,7 @@ class TestBlockedCentroidFlowsConfig:
 
 
 # ---------------------------------------------------------------------------
-# P1-A: Step dependency DAG
+# Step dependency DAG
 # ---------------------------------------------------------------------------
 class TestStepPrerequisites:
     """Test _check_step_prerequisites and _resolve_cfg_path from run.py."""
@@ -273,7 +273,7 @@ class TestStepPrerequisitesDAGCoverage:
 
 
 # ---------------------------------------------------------------------------
-# P1-A: Boundary SCC repair config
+# Boundary SCC repair config
 # ---------------------------------------------------------------------------
 class TestBoundarySccRepairConfig:
     def test_default_is_auto(self):
@@ -303,7 +303,7 @@ class TestBoundarySccRepairConfig:
 
 
 # ---------------------------------------------------------------------------
-# P1-B: Connector strict mode
+# Connector strict mode
 # ---------------------------------------------------------------------------
 class TestConnectorStrictConfig:
     def test_connector_strict_default_false(self):
@@ -316,7 +316,7 @@ class TestConnectorStrictConfig:
 
 
 # ---------------------------------------------------------------------------
-# P1-C: Supply audit estimated coverage
+# Supply audit estimated coverage
 # ---------------------------------------------------------------------------
 class TestSupplyAuditCoverage:
     def test_compute_estimated_coverage_structure(self, tmp_path):
@@ -353,7 +353,7 @@ class TestSupplyAuditCoverage:
 
 
 # ---------------------------------------------------------------------------
-# P1-D: Observation density
+# Observation density
 # ---------------------------------------------------------------------------
 class TestObservationDensityDefaults:
     def test_min_obs_per_zone_default(self):
@@ -362,7 +362,7 @@ class TestObservationDensityDefaults:
 
 
 # ---------------------------------------------------------------------------
-# P2-A: Holdout adequacy
+# Holdout adequacy
 # ---------------------------------------------------------------------------
 class TestHoldoutAdequacy:
     def test_classify_adequate(self):
@@ -438,7 +438,7 @@ class TestHoldoutAdequacy:
 
 
 # ---------------------------------------------------------------------------
-# P2-B: Sensitivity defaults
+# Sensitivity defaults
 # ---------------------------------------------------------------------------
 class TestSensitivityDefaults:
     def test_sensitivity_defaults_exist(self):

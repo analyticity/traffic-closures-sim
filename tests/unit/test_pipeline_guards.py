@@ -1,4 +1,4 @@
-"""Unit tests for P0 audit guards.
+"""Unit tests for pipeline guards.
 
 Tests cover: algorithm allowlist, strict convergence, impedance mode
 enforcement, supply audit prerequisite, and validation holdout logic.
@@ -14,7 +14,7 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# P0-2: Algorithm allowlist
+# Algorithm allowlist
 # ---------------------------------------------------------------------------
 class TestAlgorithmValidation:
     def test_bfw_accepted(self):
@@ -59,7 +59,7 @@ class TestAlgorithmValidation:
 
 
 # ---------------------------------------------------------------------------
-# P0-1: Impedance mode enforcement
+# Impedance mode enforcement
 # ---------------------------------------------------------------------------
 class TestImpedanceModeValidation:
     def test_auto_is_deprecated(self):
@@ -101,7 +101,7 @@ class TestSkimMetadata:
 
 
 # ---------------------------------------------------------------------------
-# P0-3: Supply audit prerequisite
+# Supply audit prerequisite
 # ---------------------------------------------------------------------------
 class TestSupplyAuditGuard:
     def test_no_audit_raises(self, tmp_path):
@@ -160,7 +160,7 @@ class TestAssignmentConvergenceCheck:
 
 
 # ---------------------------------------------------------------------------
-# P0-4: Validation holdout benchmarks
+# Validation holdout benchmarks
 # ---------------------------------------------------------------------------
 class TestValidationBenchmarksHoldout:
     @staticmethod
@@ -235,7 +235,7 @@ class TestValidationBenchmarksHoldout:
 # ---------------------------------------------------------------------------
 # Config defaults
 # ---------------------------------------------------------------------------
-class TestP0Defaults:
+class TestPipelineDefaults:
     def test_allow_aon_default_false(self):
         from sim.defaults import SIM_DEFAULTS
         assert SIM_DEFAULTS["calibration"]["allow_aon"] is False
@@ -282,7 +282,7 @@ class TestP0Defaults:
 
 
 # ---------------------------------------------------------------------------
-# P0-A: Unconverged skims raise by default
+# Unconverged skims raise by default
 # ---------------------------------------------------------------------------
 class TestSkimConvergenceEnforcement:
     def test_unconverged_raises_by_default(self, tmp_path):
@@ -347,7 +347,7 @@ class TestSkimConvergenceEnforcement:
 
 
 # ---------------------------------------------------------------------------
-# P0-B: Segment-based distribution config
+# Segment-based distribution config
 # ---------------------------------------------------------------------------
 class TestSegmentDistributionConfig:
     def test_segment_core_name(self):
@@ -365,7 +365,7 @@ class TestSegmentDistributionConfig:
 
 
 # ---------------------------------------------------------------------------
-# P0-C: Beta guard
+# Gravity beta guard
 # ---------------------------------------------------------------------------
 class TestGravityBetaGuard:
     def test_near_zero_beta_detected(self):
@@ -381,7 +381,7 @@ class TestGravityBetaGuard:
 
 
 # ---------------------------------------------------------------------------
-# P0-D: Screenline deduplication
+# Screenline deduplication
 # ---------------------------------------------------------------------------
 class TestScreenlineDedup:
     def test_within_screenline_dedup(self):

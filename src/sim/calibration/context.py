@@ -303,7 +303,7 @@ class _CalibrationContext:
         if not self.matrix_path.exists():
             raise FileNotFoundError(f"OD matrix not found: {self.matrix_path}")
 
-        # P0-3: Verify supply-side readiness before ODME
+        # Verify supply-side readiness before ODME
         require_supply_audit = bool(calib_cfg.get("require_supply_audit", True))
         self._supply_audit = _check_supply_audit(
             self.output_dir, require=require_supply_audit,
@@ -314,7 +314,7 @@ class _CalibrationContext:
                 if (self.output_dir / n).exists()
             ))
 
-        # P0-3: Verify base-year assignment converged
+        # Verify base-year assignment converged
         self._assignment_convergence = _check_assignment_convergence(self.output_dir)
 
         # Backup / restore seed matrix — versioned by content hash

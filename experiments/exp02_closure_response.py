@@ -186,6 +186,14 @@ def main() -> None:
 
         closed_ids = {int(sl["link_id"]) for sl in scenario_links}
 
+        # Skip closures whose links already carry no traffic in baseline.
+        base_vol_on_closed = baseline_merged.loc[
+            baseline_merged["link_id"].isin(closed_ids), VOL_COL
+        ].sum() if VOL_COL in baseline_merged.columns else 1.0
+        if base_vol_on_closed <= 0:
+            logger.info("Skipping %s — links already have 0 baseline volume (closure already active)", label)
+            continue
+
         try:
             scenario_df = run_scenario_assignment(cfg, scenario_links)
         except Exception as e:

@@ -1,4 +1,5 @@
 """Gateway screenline evaluation (car + corridor, pentlogram ref supplement)."""
+import pytest
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
@@ -67,6 +68,37 @@ def test_gateway_ref_from_name_without_attr_filter():
     assert _gateway_ref_from_screenline(sl) == "52"
     sl2 = ScreenlineDef(name="auto_gw_D2_S", attr_filter={"osm_ref_norm": "D2"})
     assert _gateway_ref_from_screenline(sl2) == "D2"
+
+
+def test_gateway_explicit_links_not_replaced_by_distant_pentlogram():
+    """Boundary links with flow must not be swapped for a zero-flow pentlogram match."""
+    vol_df = pd.DataFrame({
+        "link_id": [85741, 85742, 50909],
+        "PCE_tot": [23300.0, 26041.0, 0.0],
+    })
+    matched = gpd.GeoDataFrame({
+        "link_id": [50909],
+        "osm_ref": ["D1"],
+        "observed_car": [41483.0],
+        "observed_motor_total": [41483.0],
+        "geometry": [Point(0, 0)],
+    }, crs="EPSG:4326")
+    sl = ScreenlineDef(
+        name="auto_gw_D1_W",
+        links=[(85741, 0), (85742, 0)],
+        has_explicit_links=True,
+        attr_filter={"osm_ref_norm": "D1"},
+        observed_aadt_all=47721.0,
+        observed_aadt_cars=40000.0,
+    )
+    r = evaluate_screenline(
+        sl, vol_df, matched, "PCE_tot", "observed_motor_total", cfg=_cfg_gateway_eval(),
+    )
+    assert r.modeled_total == pytest.approx(49341.0, rel=0.01)
+    assert r.observed_total == 40000.0  # car_only gateway target
+    assert r.obs_source == "csd_config"
+    assert r.per_link[0]["link_id"] in (85741, 85742)
+    assert r.per_link[0]["link_id"] != 50909
 
 
 def test_gateway_i52_supplement_from_videnka_ref():

@@ -182,6 +182,61 @@ def _normalize_road_ref(ref: str) -> str:
         return r.lstrip("0") or r
 
 
+def _csd_lookup_key(ref_part: str) -> str:
+    """Normalize a road-ref token to a key in ``csd_mean_by_road``."""
+    ref_norm = str(ref_part or "").strip().upper().replace(" ", "")
+    try:
+        return str(int(ref_norm))
+    except ValueError:
+        return ref_norm.lstrip("0") or ref_norm
+
+
+def _csd_observed_from_matched_ref(
+    ref: str,
+    csd_mean_by_road: Dict[str, Dict[str, float]],
+) -> Tuple[float, float]:
+    """Resolve CSD AADT for a gateway ``matched_ref`` (may be composite, e.g. ``D1;50``).
+
+  When several roads are listed, use the component with the highest CSD volume
+  (primary corridor at the crossing), not their sum — summing would double-count
+  parallel refs on the same gateway links.
+    """
+    if not ref or not csd_mean_by_road:
+        return 0.0, 0.0
+
+    parts = [p.strip() for p in str(ref).split(";") if p.strip()]
+    if not parts:
+        return 0.0, 0.0
+
+    by_numeric: Dict[str, Dict[str, float]] = {}
+    for part in parts:
+        key = _csd_lookup_key(part)
+        hit = csd_mean_by_road.get(key)
+        if not hit:
+            continue
+        num_key = re.sub(r"^[A-Za-z]+", "", key) or key
+        prev = by_numeric.get(num_key)
+        if prev is None or hit["sv"] > prev["sv"]:
+            by_numeric[num_key] = hit
+
+    if not by_numeric:
+        return 0.0, 0.0
+    if len(by_numeric) == 1:
+        hit = next(iter(by_numeric.values()))
+        return float(hit["sv"]), float(hit["o"])
+
+    best_key, best_hit = max(by_numeric.items(), key=lambda kv: kv[1]["sv"])
+    logger.info(
+        "Gateway matched_ref '%s': composite CSD — using road '%s' "
+        "(sv=%.0f, skipped %d other ref(s))",
+        ref,
+        best_key,
+        best_hit["sv"],
+        len(by_numeric) - 1,
+    )
+    return float(best_hit["sv"]), float(best_hit["o"])
+
+
 def resolve_gateway_screenline_eval_cfg(
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -280,6 +335,33 @@ def screenline_excluded_from_benchmark(
         ratio_below=rel["ratio_below"],
         ratio_above=rel["ratio_above"],
     )
+
+
+def filter_screenline_results_for_benchmark(
+    sl_results: Dict[str, Any],
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Screenlines that count toward max-dev / pass-fail (obs > 0, inside ratio band)."""
+    out: Dict[str, Any] = {}
+    for name, sr in sl_results.items():
+        d = dict(sr) if isinstance(sr, dict) else sr.to_dict()
+        if screenline_excluded_from_benchmark(name, d, cfg):
+            continue
+        if float(d.get("observed_total") or 0) <= 0:
+            continue
+        out[name] = d
+    return out
+
+
+def max_screenline_pct_deviation(
+    sl_results: Dict[str, Any],
+    cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Largest |ratio−1|×100 over benchmark-eligible screenlines only."""
+    best = 0.0
+    for sr in filter_screenline_results_for_benchmark(sl_results, cfg).values():
+        best = max(best, screenline_ratio_error_pct(sr.get("ratio")))
+    return best
 
 
 def annotate_screenline_benchmark_exclusion(
@@ -874,7 +956,23 @@ def _gateway_pentlogram_from_ref(
     if candidates.empty:
         return None
 
-    best_idx = obs_vals.loc[candidates.index].idxmax()
+    mod_col = None
+    for col in ("_corridor_volume", vol_col):
+        if col in candidates.columns:
+            mod_col = col
+            break
+    if mod_col is not None:
+        mod_vals = pd.to_numeric(candidates[mod_col], errors="coerce").fillna(0.0)
+        with_mod = mod_vals > 0
+        if with_mod.any():
+            candidates = candidates.loc[with_mod]
+            obs_vals = obs_vals.loc[candidates.index]
+            mod_vals = mod_vals.loc[candidates.index]
+            best_idx = mod_vals.idxmax()
+        else:
+            best_idx = obs_vals.loc[candidates.index].idxmax()
+    else:
+        best_idx = obs_vals.loc[candidates.index].idxmax()
     row = candidates.loc[best_idx]
     link_id = int(row["link_id"])
     direction = 0
@@ -884,6 +982,8 @@ def _gateway_pentlogram_from_ref(
         vol_df, matched_counts, link_id, direction, vol_col,
         use_corridor=use_corridor, _vol_idx=vol_idx, _obs_idx=obs_idx,
     )
+    if modeled <= 0:
+        return None
     observed = float(row[obs_col])
     return {
         "link_id": link_id,
@@ -907,7 +1007,32 @@ def _finalize_gateway_per_link(
             return merge_divided_highway_screenline_per_link(per_link, links_gdf)
         return per_link
 
+    explicit_ids = {lid for lid, _ in sl.links} if sl.has_explicit_links else set()
+    on_boundary_only = bool(
+        explicit_ids
+        and all(int(pl.get("link_id", 0)) in explicit_ids for pl in per_link)
+    )
+    if on_boundary_only and per_link:
+        total_mod = sum(float(pl.get("modeled", 0) or 0) for pl in per_link)
+        total_obs = sum(float(pl.get("observed", 0) or 0) for pl in per_link)
+        if total_mod > 0 and total_obs <= 0:
+            lead = max(per_link, key=lambda pl: float(pl.get("modeled", 0) or 0))
+            collapsed = dict(lead)
+            collapsed["modeled"] = round(total_mod, 0)
+            collapsed["gateway_collapsed"] = True
+            return [collapsed]
+
     if use_corridor and per_link:
+        # WKT-resolved screenlines capture independent carriageways — sum them.
+        if not sl.has_explicit_links and sl.geometry_wkt:
+            total_mod = sum(float(pl.get("modeled", 0) or 0) for pl in per_link)
+            total_obs = sum(float(pl.get("observed", 0) or 0) for pl in per_link)
+            lead = max(per_link, key=lambda pl: float(pl.get("modeled", 0) or 0))
+            collapsed = dict(lead)
+            collapsed["modeled"] = round(total_mod, 0)
+            collapsed["observed"] = round(total_obs, 0)
+            collapsed["gateway_collapsed"] = True
+            return [collapsed]
         with_obs = [pl for pl in per_link if float(pl.get("observed", 0) or 0) > 0]
         pool = with_obs if with_obs else per_link
         lead = max(
@@ -968,10 +1093,16 @@ def evaluate_screenline(
         })
 
     pent_from_ref: Optional[Dict[str, Any]] = None
+    has_config_aadt = bool(
+        (sl.observed_aadt_all and sl.observed_aadt_all > 0)
+        or (sl.observed_aadt_cars and sl.observed_aadt_cars > 0)
+    )
+    has_modeled_flow = sum(float(pl.get("modeled", 0) or 0) for pl in per_link) > 0
     if (
         is_gateway
         and gw_eval.get("supplement_from_ref_match")
         and sum(float(pl.get("observed", 0) or 0) for pl in per_link) <= 0
+        and not (has_config_aadt and has_modeled_flow and not sl.has_explicit_links)
     ):
         pent_from_ref = _gateway_pentlogram_from_ref(
             sl, matched_counts, vol_df, vol_col, eff_obs_col,
@@ -1424,19 +1555,10 @@ def auto_generate_screenlines(
                 # --- CSD observed AADT ------------------------------------
                 obs_all = 0.0
                 obs_cars = 0.0
-                ref_norm = ""
-                if ref:
-                    ref_norm = ref.upper().replace(" ", "")
-                    try:
-                        ref_norm = str(int(ref_norm))
-                    except ValueError:
-                        ref_norm = ref_norm.lstrip("0") or ref_norm
-
-                    if csd_mean_by_road:
-                        csd_hit = csd_mean_by_road.get(ref_norm)
-                        if csd_hit:
-                            obs_all = csd_hit["sv"]
-                            obs_cars = csd_hit["o"]
+                if ref and csd_mean_by_road:
+                    obs_all, obs_cars = _csd_observed_from_matched_ref(
+                        ref, csd_mean_by_road,
+                    )
 
                 # --- build fallback WKT for resolution when no network ----
                 odx = row.get("outward_dx", 0)

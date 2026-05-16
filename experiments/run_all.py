@@ -67,6 +67,21 @@ def _run_one(module_name: str, config_path: str) -> Dict[str, Any]:
         sys.argv = saved_argv
         record["elapsed_s"] = round(time.time() - t0, 1)
 
+    # Detect experiments that handled missing data internally (wrote status=skipped).
+    if record["status"] == "ok":
+        city = city_from_config(config_path)
+        summary_path = EXPERIMENTS_OUTPUT / city / module_name / "summary.json"
+        if summary_path.exists():
+            try:
+                with open(summary_path) as _f:
+                    exp_summary = json.load(_f)
+                if isinstance(exp_summary, dict) and exp_summary.get("status") == "skipped":
+                    record["status"] = "skipped"
+                    record["reason"] = exp_summary.get("reason", "internal skip")
+                    logger.warning("SKIP %s (internal): %s", module_name, record["reason"])
+            except (json.JSONDecodeError, OSError):
+                pass
+
     return record
 
 

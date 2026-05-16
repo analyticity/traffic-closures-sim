@@ -38,6 +38,7 @@ from sim.calibration.matching import (
 )
 from sim.calibration.metrics import (
     compute_stats,
+    compute_stats_from_matched,
     compute_geh,
     _compute_class_residuals,
     _supplement_class_ratios_from_screenlines,
@@ -566,6 +567,7 @@ class _CalibrationContext:
         self.run = CalibrationRun()
         self.best_Z: float = float("inf")
         self.best_demand: Optional[np.ndarray] = None
+        self.best_vol_df: Optional[pd.DataFrame] = None
         self.best_iteration: int = 0
         self.history: List[Dict[str, Any]] = []
 
@@ -641,7 +643,7 @@ class _CalibrationContext:
             aggregate_corridor=self.agg_corridor,
             vol_col=vol_col,
             match_quality_min=self.match_quality_min,
-            skip_exclusion=(iteration > 1),
+            skip_quality_exclusion=(iteration > 1),
             exclude_objectids=self.exclude_objectids,
             exclude_csd_roads=self.exclude_csd_roads,
             exclude_ratio_below=self.exclude_ratio_below,
@@ -671,11 +673,12 @@ class _CalibrationContext:
                 "_corridor_volume" if "_corridor_volume" in matched.columns else vol_col,
                 self.obs_col, self.output_dir,
             )
+        from sim.calibration.matching import filter_matched_counts_for_benchmark
+
         compare_col = "_corridor_volume" if "_corridor_volume" in matched.columns else vol_col
         valid = matched.dropna(subset=[compare_col, self.obs_col])
         valid = valid[valid[self.obs_col] > 0].copy()
-        if "_excluded" in valid.columns:
-            valid = valid[~valid["_excluded"]].copy()
+        valid = filter_matched_counts_for_benchmark(valid)
         return matched, valid, compare_col
 
     def compute_objective_and_stats(self, valid: pd.DataFrame, compare_col: str, weight_method="inverse_sqrt"):
@@ -688,14 +691,18 @@ class _CalibrationContext:
         obs_all = valid[self.obs_col].values.astype(np.float64)
         w_all = _compute_count_weights(obs_all, method=weight_method)
         Z = _odme_objective(mod_all, obs_all, w_all)
-        stats = compute_stats(mod_all, obs_all, daily_capacity_factor=self.daily_cap_factor)
+        stats = compute_stats_from_matched(
+            valid, compare_col, self.obs_col,
+            daily_capacity_factor=self.daily_cap_factor,
+        )
         return Z, stats
 
-    def update_best_state(self, Z: float, iteration: int) -> None:
-        """Track best Z and save demand snapshot if improved."""
+    def update_best_state(self, Z: float, iteration: int, vol_df: Optional[pd.DataFrame] = None) -> None:
+        """Track best Z and save demand + assignment snapshot if improved."""
         if Z < self.best_Z:
             self.best_Z = Z
             self.best_demand = self.mat.matrix[self.core_name][:, :].copy()
+            self.best_vol_df = vol_df.copy() if vol_df is not None else None
             self.best_iteration = iteration
 
     def evaluate_and_log_screenlines(self, vol_df: pd.DataFrame, matched: gpd.GeoDataFrame, vol_col: Optional[str]):
@@ -708,11 +715,11 @@ class _CalibrationContext:
         from sim.calibration.screenlines import (
             annotate_screenline_benchmark_exclusion,
             evaluate_all_screenlines,
-            screenline_ratio_error_pct,
+            filter_screenline_results_for_benchmark,
+            max_screenline_pct_deviation,
         )
 
         sl_results: Dict[str, Any] = {}
-        max_sl_pct_dev = 0.0
         if self.screenlines and vol_col:
             sl_res = evaluate_all_screenlines(
                 self.screenlines, vol_df, matched, vol_col, self.obs_col,
@@ -733,20 +740,20 @@ class _CalibrationContext:
                         float(sr.get("modeled_total") or 0.0),
                         float(sr.get("observed_total") or 0.0),
                     )
-                    continue
-                if sr.get("observed_total", 0) > 0 and np.isfinite(sr.get("ratio")):
-                    dev = screenline_ratio_error_pct(sr.get("ratio"))
-                    max_sl_pct_dev = max(max_sl_pct_dev, dev)
-                    logger.info(
-                        f"  SL '{sn}': mod={sr['modeled_total']:,.0f} "
-                        f"obs={sr['observed_total']:,.0f} ratio={sr['ratio']:.2f} "
-                        f"GEH={sr['geh']:.1f}"
-                    )
+            for sn, sr in filter_screenline_results_for_benchmark(
+                sl_results, self.cfg,
+            ).items():
+                logger.info(
+                    f"  SL '{sn}': mod={sr['modeled_total']:,.0f} "
+                    f"obs={sr['observed_total']:,.0f} ratio={sr['ratio']:.2f} "
+                    f"GEH={sr['geh']:.1f}"
+                )
             if excluded:
                 logger.info(
                     "  Screenlines excluded from comparison: %s",
                     ", ".join(excluded),
                 )
+        max_sl_pct_dev = max_screenline_pct_deviation(sl_results, self.cfg)
         return sl_results, max_sl_pct_dev
 
     def mark_stalled(self, reason: str) -> None:
@@ -910,16 +917,27 @@ class _CalibrationContext:
             logger.exception("restore_best_and_close failed")
 
     def finalize_best_state(self) -> Optional[pd.DataFrame]:
-        """Run a final assignment on the restored best-demand matrix.
+        """Return assignment volumes consistent with the best-demand matrix.
+
+        If we have a cached vol_df from the best ODME iteration (warm-state),
+        return it directly — avoids a cold-start re-assignment that can diverge
+        significantly on individual links.  Falls back to a fresh assignment
+        only when the cached snapshot is unavailable (e.g. legacy code path).
 
         Must be called *after* ``restore_best_and_close()`` so that the
-        on-disk matrix already contains the best demand.  Returns the
-        vol_df from this final assignment so the caller can persist
-        artifacts that are consistent with the best OD matrix.
+        on-disk matrix already contains the best demand.
         """
         if self.best_demand is None:
             self.run.stop_reason = self.run.stop_reason or "no_improvement"
             return None
+
+        if self.best_vol_df is not None:
+            logger.info(
+                f"  Using cached assignment from iteration {self.best_iteration} "
+                f"(no cold-start re-assignment needed)"
+            )
+            self._transition(CalibrationState.FINALIZE_SUCCESS)
+            return self.best_vol_df
 
         mat = AequilibraeMatrix()
         mat.load(str(self.matrix_path))

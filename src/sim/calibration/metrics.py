@@ -16,6 +16,30 @@ from sim._metrics import compute_geh  # re-export for backward compat
 logger = logging.getLogger(__name__)
 
 
+def compute_stats_from_matched(
+    valid: pd.DataFrame,
+    modeled_col: str,
+    observed_col: str,
+    *,
+    daily_capacity_factor: float = 1.0,
+) -> Dict[str, Any]:
+    """Compute link-fit stats on non-excluded matched count rows only."""
+    from sim.calibration.matching import filter_matched_counts_for_benchmark
+
+    if valid.empty:
+        return {"n": 0}
+    usable = filter_matched_counts_for_benchmark(valid)
+    usable = usable.dropna(subset=[modeled_col, observed_col])
+    usable = usable[pd.to_numeric(usable[observed_col], errors="coerce").fillna(0) > 0]
+    if usable.empty:
+        return {"n": 0}
+    return compute_stats(
+        usable[modeled_col].values.astype(float),
+        usable[observed_col].values.astype(float),
+        daily_capacity_factor=daily_capacity_factor,
+    )
+
+
 def compute_stats(
     modeled: np.ndarray,
     observed: np.ndarray,

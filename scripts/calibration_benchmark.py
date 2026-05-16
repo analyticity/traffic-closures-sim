@@ -301,13 +301,14 @@ def _collect_metrics(
         if seed_total > 0 else 0.0
     )
 
-    # Screenline summary
+    # Screenline summary (only non-excluded screenlines)
     sl = report.get("screenlines", {})
     sl_ratios = [
         sr.get("ratio", 1.0)
         for sr in sl.values()
         if sr.get("observed_total", 0) > 0
         and sr.get("ratio") is not None
+        and not sr.get("excluded_from_benchmark", False)
     ]
     sl_max_dev = max((abs(r - 1.0) * 100 for r in sl_ratios), default=0.0)
     sl_mean_ratio = sum(sl_ratios) / max(len(sl_ratios), 1) if sl_ratios else 0.0

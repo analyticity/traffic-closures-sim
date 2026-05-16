@@ -1,7 +1,7 @@
 # Screenlines pro Brno — doplňují auto-generované řezy (viz load_screenlines_with_auto).
 # Manuální položky se stejným `name` jako auto_* přepíší auto definici.
 #
-# Tři lokální řezy: WGS84 kolmice + filter (bez link_id — stabilnější po reimportu OSM).
+# Lokální řezy: WGS84 kolmice + filter (bez link_id — stabilnější po reimportu OSM).
 
 screenlines:
   - name: "manual_brno_antonin_prochazky_tertiary"
@@ -24,33 +24,47 @@ screenlines:
     expected_links: 1
     observed_aadt_all: 3945.0
 
-  - name: "manual_brno_selska_secondary"
-    description: "Selská — II/374 secondary; pozorované 6 598 voz/den"
+  # Přepis auto_gw_D2_S: řez uvnitř sítě přes obě jízdní pásy D2.
+  # Lat 49.125 protíná link 492 (JB směr) i link 59257 (SB směr).
+  - name: "auto_gw_D2_S"
+    description: "D2 south gateway — manual override; both carriageways"
     type: radial
-    geometry_wkt: "LINESTRING (16.6445737487 49.2151409293, 16.6433418579 49.2152021936)"
+    geometry_wkt: "LINESTRING (16.637 49.125, 16.648 49.125)"
     filter:
-      link_type: secondary
-      osm_ref_norm: "374"
-    expected_links: 1
-    observed_aadt_all: 6598.0
+      link_type: motorway
+      osm_ref_norm: "D2"
+    expected_links: 2
+    observed_aadt_all: 32864.0
+
+  # Přepis auto_gw_I52_S: řez přes obě jízdní pásy I/52 uvnitř sítě.
+  # Lat 49.120 protíná link 8601 (SB) i link 22126 (JB), celkem ~29k.
+  - name: "auto_gw_I52_S"
+    description: "I/52 south gateway — manual override; both carriageways"
+    type: radial
+    geometry_wkt: "LINESTRING (16.600 49.120, 16.610 49.120)"
+    filter:
+      link_type: trunk
+      osm_ref_norm: "52"
+    expected_links: 2
+    observed_aadt_all: 25588.0
 
   # Přepis auto_csd_*: CSD průměr sv z validace; řez kolmo k nejvytíženějšímu segmentu v síti.
   - name: "auto_csd_640"
-    description: "II/640 secondary — CSD mean sv ≈29 301 voz/den (validace); ruční kolmice místo auto (široké párování)"
+    description: "II/640 trunk (normalized) — CSD mean sv ≈29 301 voz/den"
     type: radial
     geometry_wkt: "LINESTRING (16.5945026812 49.2058647109, 16.5934291776 49.2053044372)"
     filter:
-      link_type: secondary
+      link_type: trunk
       osm_ref_norm: "640"
     expected_links: 1
     observed_aadt_all: 29301.0
 
   - name: "auto_csd_50"
-    description: "I/50 trunk — CSD mean sv ≈27 624 voz/den (validace); ruční kolmice (auto over-agg)"
+    description: "I/50 trunk — CSD mean sv ≈27 624 voz/den; full cross-section (both carriageways)"
     type: radial
     geometry_wkt: "LINESTRING (16.6538768078 49.1891762232, 16.6531206684 49.1884258629)"
     filter:
       link_type: trunk
       osm_ref_norm: "50"
-    expected_links: 1
+    expected_links: 2
     observed_aadt_all: 27624.0

@@ -611,6 +611,32 @@ class TestMatchCsdToLinks:
         result = match_csd_to_links(csd, links)
         assert result.empty
 
+    def test_ratio_band_excludes_from_holdout_summary(self):
+        """Roads outside mod/obs ratio band must not affect holdout R² / RMSE."""
+        csd = pd.DataFrame({
+            "sil": ["GOOD1", "GOOD2", "BAD"],
+            "sv": [20000.0, 21000.0, 20000.0],
+            "o": [18000.0, 19000.0, 18000.0],
+            "tv": [2000.0, 2000.0, 2000.0],
+            "delka": [5.0, 5.0, 5.0],
+        })
+        links = gpd.GeoDataFrame([
+            {"link_id": 1, "osm_ref": "GOOD1", "link_type": "trunk", "distance": 5000,
+             "total_vehicles_tot": 20000, "geometry": LineString([(0, 0), (1, 0)])},
+            {"link_id": 2, "osm_ref": "GOOD2", "link_type": "trunk", "distance": 5000,
+             "total_vehicles_tot": 21000, "geometry": LineString([(0, 2), (1, 2)])},
+            {"link_id": 3, "osm_ref": "BAD", "link_type": "trunk", "distance": 5000,
+             "total_vehicles_tot": 1000, "geometry": LineString([(0, 1), (1, 1)])},
+        ], geometry="geometry", crs="EPSG:5514")
+        result = match_csd_to_links(
+            csd, links, ratio_below=0.2, ratio_above=5.0,
+        )
+        bad = result[result["road"] == "BAD"].iloc[0]
+        assert bool(bad["ratio_outside_band"])
+        summary = result.attrs.get("summary", {})
+        assert summary.get("n_roads") == 2
+        assert summary.get("n_ratio_excluded") == 1
+
 
 # ---------------------------------------------------------------------------
 # _classify_csd_road (used internally by the split)

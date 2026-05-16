@@ -13,6 +13,10 @@ experiment_profiles:
         set_link_type: trunk
         min_speed: 80
         comment: "Zabovreska corridor (II/640) — 50k AADT, misclassified as secondary in OSM"
+      - match: {osm_ref_norm: "41", link_type: "primary"}
+        set_link_type: trunk
+        min_speed: 60
+        comment: "I/41 urban trunk — OSM tags as primary, CSD classifies as trunk"
       - match: {osm_ref_norm: "52", link_type: "secondary"}
         set_link_type: primary
         min_speed: 60

@@ -25,7 +25,7 @@ zoning:
       admin_level: "9"
   external_gateways:
     enabled: true
-    whitelist: ["D1", "D2", "I/43", "I/52", "I/50"]
+    whitelist: ["D1", "D2", "I/43", "I/52"]
     auto_discover:
       enabled: false
 
@@ -39,30 +39,27 @@ demand:
 
 calibration:
   gateway_calibration:
-    damping: 0.26
-    min_factor: 0.55
-    max_factor: 1.45
+    damping: 0.18
+    min_factor: 0.70
+    max_factor: 1.30
+  auto_screenlines:
+    gateway_count_target: "motor_total"
   odme:
     max_outer_iterations: 32
-    entropy_step_size: 0.22
+    entropy_step_size: 0.18
     convergence_tol: 0.0008
     assign_max_iter: 80
-    # Tertiary: cap upward class correction (counts say "too low", network already over-assigns).
-    # Trunk: floor — model under-shoots vs CSD on motorways/trunk roads.
     class_residual_ratio_caps:
       tertiary: 1.05
-    class_residual_ratio_floors:
-      trunk: 1.05
     stages:
       - name: "stabilize"
         max_iterations: 15
       - name: "refine"
         max_iterations: 25
   screenlines_path: "config/brno/screenlines.yaml"
-  auto_screenlines:
-    # Auto screenlines outside model/obs ratio band — exclude from SL max dev (wrong link / zero flow).
-    exclude_auto_ratio_below: 0.20
-    exclude_auto_ratio_above: 5.0
+  matching:
+    require_csd_road_ref_match: true
+    csd_validation_exclude_sil: ["23"]
 
 datasets:
   enabled: true

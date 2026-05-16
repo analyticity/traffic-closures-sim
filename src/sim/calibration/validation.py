@@ -33,7 +33,12 @@ from sim.calibration.matching import (
     match_quality_report,
     resolve_matching_exclusions,
 )
-from sim.calibration.metrics import compute_extended_link_metrics, compute_geh, compute_stats
+from sim.calibration.metrics import (
+    compute_extended_link_metrics,
+    compute_geh,
+    compute_stats,
+    compute_stats_from_matched,
+)
 from sim.calibration.observed import (
     _MIN_VOL_FOR_CSD_LW,
     _classify_csd_road,
@@ -471,6 +476,8 @@ def match_csd_to_links(
     csd_full: Optional[pd.DataFrame] = None,
     place_filter_tokens: Optional[List[str]] = None,
     exclude_sil: Optional[Iterable[str]] = None,
+    ratio_below: float = 0.20,
+    ratio_above: float = 5.0,
 ) -> pd.DataFrame:
     """Per-road matching via ``osm_ref`` ↔ CSD ``sil``.
 
@@ -506,7 +513,14 @@ def match_csd_to_links(
     no row in the returned frame and they do not enter the holdout summary.
     Values are normalized the same way as ``auto_csd_*`` keys (see
     :func:`sim.calibration.observed.normalize_csd_sil_key`).
+
+    *ratio_below* / *ratio_above*: same mod/obs band as count matching and
+    screenlines (default 0.2–5.0). Roads outside the band are kept in the
+    per-road table for diagnostics but excluded from holdout R² / slope /
+    %RMSE / bias / mean GEH summary.
     """
+    from sim.calibration.screenlines import screenline_benchmark_unreliable
+
     csd = csd.copy()
     if "sil" not in csd.columns or "osm_ref" not in links_gdf.columns:
         return pd.DataFrame()
@@ -625,6 +639,15 @@ def match_csd_to_links(
         if csd_mean_sv <= 0:
             continue
 
+        mod_obs_ratio = model_lw_mean / csd_mean_sv if csd_mean_sv > 0 else None
+        ratio_outside = screenline_benchmark_unreliable(
+            model_lw_mean,
+            csd_mean_sv,
+            mod_obs_ratio,
+            ratio_below=ratio_below,
+            ratio_above=ratio_above,
+        )
+
         geh = float(compute_geh(np.array([model_lw_mean]), np.array([csd_mean_sv]))[0])
 
         model_road_km = float(car_links["distance"].sum()) / 1000.0 if "distance" in car_links.columns else 0.0
@@ -661,6 +684,8 @@ def match_csd_to_links(
             "csd_mean_sv": round(csd_mean_sv, 0),
             "csd_mean_o": round(csd_mean_o, 0),
             "model_lw_mean": round(model_lw_mean, 0),
+            "mod_obs_ratio": round(mod_obs_ratio, 4) if mod_obs_ratio is not None else None,
+            "ratio_outside_band": ratio_outside,
             "geh": round(geh, 1),
             "model_road_km": round(model_road_km, 1),
             "csd_subset_km": round(csd_subset_km, 3),
@@ -686,16 +711,21 @@ def match_csd_to_links(
         result["zero_flow"] = False
     n_zero_flow = int(result["zero_flow"].astype(bool).sum())
 
+    if "ratio_outside_band" not in result.columns:
+        result["ratio_outside_band"] = False
+
     reliable = (
         ~result["partial_coverage"].astype(bool)
         & ~result["over_aggregated"].astype(bool)
         & ~result["zero_flow"].astype(bool)
         & ~result["minimal_coverage"].astype(bool)
+        & ~result["ratio_outside_band"].astype(bool)
     )
     sub = result[reliable]
     n_partial = int(result["partial_coverage"].astype(bool).sum())
     n_over_agg = int(result["over_aggregated"].astype(bool).sum())
     n_minimal = int(result["minimal_coverage"].astype(bool).sum())
+    n_ratio = int(result["ratio_outside_band"].astype(bool).sum())
 
     obs = sub["csd_mean_sv"].values.astype(float)
     mod = sub["model_lw_mean"].values.astype(float)
@@ -719,6 +749,9 @@ def match_csd_to_links(
                 "n_minimal_excluded": n_minimal,
                 "n_over_aggregated_excluded": n_over_agg,
                 "n_zero_flow_excluded": n_zero_flow,
+                "n_ratio_excluded": n_ratio,
+                "ratio_below": ratio_below,
+                "ratio_above": ratio_above,
                 "r2": round(r2, 3),
                 "slope": round(slope, 4),
                 "bias_pct": round(bias, 1),
@@ -816,7 +849,9 @@ def compute_validation_benchmarks(
 
     from sim.calibration.screenlines import (
         annotate_screenline_benchmark_exclusion,
+        filter_screenline_results_for_benchmark,
         is_auto_screenline_name,
+        max_screenline_pct_deviation,
         resolve_auto_screenline_reliability_cfg,
         screenline_ratio_error_pct,
     )
@@ -827,20 +862,14 @@ def compute_validation_benchmarks(
     excluded_auto_sl = [n for n in excluded_sl if is_auto_screenline_name(n)]
     sl_rel = resolve_auto_screenline_reliability_cfg(cfg)
 
-    sl_max_error_all = 0.0
+    sl_benchmark = filter_screenline_results_for_benchmark(sl_annotated, cfg)
+    sl_max_error_all = max_screenline_pct_deviation(sl_annotated, cfg)
     sl_max_error_manual = 0.0
     sl_max_error_auto = 0.0
     n_manual_sl = 0
-    n_compared = 0
-    for sl_name, sr in sl_annotated.items():
-        if sr.get("excluded_from_benchmark"):
-            continue
-        obs = float(sr.get("observed_total", 0) or 0)
-        if not obs or obs <= 0:
-            continue
-        n_compared += 1
+    n_compared = len(sl_benchmark)
+    for sl_name, sr in sl_benchmark.items():
         err = screenline_ratio_error_pct(sr.get("ratio"))
-        sl_max_error_all = max(sl_max_error_all, err)
         if is_auto_screenline_name(sl_name):
             sl_max_error_auto = max(sl_max_error_auto, err)
         else:
@@ -1091,10 +1120,8 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
                 if compare_vc and compare_vc in matched.columns:
                     valid = matched.dropna(subset=[compare_vc, obs_col])
                     valid = valid[valid[obs_col] > 0]
-                    if "_excluded" in valid.columns:
-                        valid = valid[~valid["_excluded"]].copy()
-                    pent_stats = compute_stats(
-                        valid[compare_vc].values, valid[obs_col].values,
+                    pent_stats = compute_stats_from_matched(
+                        valid, compare_vc, obs_col,
                         daily_capacity_factor=daily_cap_factor,
                     )
                     report["calibration_reference"] = {"matched": int(len(valid)), **pent_stats}
@@ -1122,10 +1149,8 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
             if compare_vc and compare_vc in matched.columns:
                 valid = matched.dropna(subset=[compare_vc, obs_col])
                 valid = valid[valid[obs_col] > 0]
-                if "_excluded" in valid.columns:
-                    valid = valid[~valid["_excluded"]].copy()
-                pent_stats = compute_stats(
-                    valid[compare_vc].values, valid[obs_col].values,
+                pent_stats = compute_stats_from_matched(
+                    valid, compare_vc, obs_col,
                     daily_capacity_factor=daily_cap_factor,
                 )
                 report["pentlogram"] = {"matched": int(len(valid)), **pent_stats}
@@ -1180,6 +1205,8 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
             csd_full=csd_full,
             place_filter_tokens=ptoks or None,
             exclude_sil=exclude_sil,
+            ratio_below=_sl_rel["ratio_below"],
+            ratio_above=_sl_rel["ratio_above"],
         )
         if not csd_match_df.empty:
             report["csd_link_matching"] = csd_match_df.to_dict(orient="records")
@@ -1199,6 +1226,8 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
                     cov_tag = "  [PARTIAL]"
                 elif r.get("over_aggregated", False):
                     cov_tag = "  [OVER-AGG]"
+                elif r.get("ratio_outside_band", False):
+                    cov_tag = "  [RATIO]"
                 logger.info(
                     f"    {r['road']:>8s} ({r['road_class']:>10s})  "
                     f"csd_sv={r['csd_mean_sv']:>8.0f}  model={r['model_lw_mean']:>8.0f}  "
@@ -1217,6 +1246,9 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
                     excl_parts.append(f"{n_minimal} minimal-coverage")
                 if n_over:
                     excl_parts.append(f"{n_over} over-aggregated")
+                n_ratio = summary.get("n_ratio_excluded", 0)
+                if n_ratio:
+                    excl_parts.append(f"{n_ratio} ratio-outside-band")
                 excl_note = f" ({', '.join(excl_parts)} excluded)" if excl_parts else ""
                 logger.info(f"  Summary ({summary['n_roads']} roads{excl_note}): "
                       f"R²={summary['r2']:.3f}  slope={summary.get('slope', 'N/A')}  "
@@ -1634,10 +1666,8 @@ def run_match_diagnostics(config_path: str | Path = "config/brno/sim.yaml") -> N
     if compare_col and compare_col in matched.columns:
         valid = matched.dropna(subset=[compare_col, obs_col])
         valid = valid[valid[obs_col] > 0]
-        if "_excluded" in valid.columns:
-            valid = valid[~valid["_excluded"]].copy()
-        stats = compute_stats(
-            valid[compare_col].values, valid[obs_col].values,
+        stats = compute_stats_from_matched(
+            valid, compare_col, obs_col,
             daily_capacity_factor=daily_cap_factor,
         )
         logger.info(f"  Matched: {len(valid)}  R²={stats.get('r2')}  slope={stats.get('slope')}  "

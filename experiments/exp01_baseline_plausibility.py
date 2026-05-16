@@ -52,7 +52,7 @@ _LINK_TYPE_VOLUME_ORDER = [
 
 def _resolve_obs_mod_columns(diag: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
     obs_candidates = ["observed", "observed_total", "observed_motor_total"]
-    mod_candidates = ["modeled", "mod", "modeled_total", "lw_mean", "model_lw_mean"]
+    mod_candidates = ["modeled", "mod", "modeled_total", "_corridor_volume", "lw_mean", "model_lw_mean"]
     obs_col = next((c for c in obs_candidates if c in diag.columns), None)
     mod_col = next((c for c in mod_candidates if c in diag.columns), None)
     return obs_col, mod_col

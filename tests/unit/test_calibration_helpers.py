@@ -519,8 +519,8 @@ class TestDedupCrossScreenlineLinks:
 # match_counts_to_links - skip_exclusion
 # ---------------------------------------------------------------------------
 class TestSkipExclusion:
-    def test_exclusion_locked_with_skip(self):
-        """With skip_exclusion=True, no new _excluded flags should be set."""
+    def test_quality_exclusion_skipped_but_ratio_still_applies(self):
+        """skip_quality_exclusion skips confidence gates; ratio band always runs."""
         import geopandas as gpd
         from shapely.geometry import Point, LineString
         from sim.calibration.matching import match_counts_to_links
@@ -545,19 +545,23 @@ class TestSkipExclusion:
         result_with = match_counts_to_links(
             counts, links, buffer_m=2000.0,
             vol_col="vol_ab", match_quality_min=0.5,
-            skip_exclusion=False,
+            skip_quality_exclusion=False,
+            exclude_ratio_below=0.2,
+            exclude_ratio_above=5.0,
         )
         n_excluded_normal = int(result_with["_excluded"].sum()) if "_excluded" in result_with.columns else 0
 
         result_skip = match_counts_to_links(
             counts, links, buffer_m=2000.0,
             vol_col="vol_ab", match_quality_min=0.5,
-            skip_exclusion=True,
+            skip_quality_exclusion=True,
+            exclude_ratio_below=0.2,
+            exclude_ratio_above=5.0,
         )
         n_excluded_skip = int(result_skip["_excluded"].sum()) if "_excluded" in result_skip.columns else 0
 
-        assert n_excluded_normal > 0, "Normal run should exclude zero-vol trunk posts"
-        assert n_excluded_skip == 0, "skip_exclusion=True should not set any _excluded flags"
+        assert n_excluded_normal > 0, "Full exclusion should flag zero-vol trunk posts"
+        assert n_excluded_skip == 0, "skip_quality_exclusion skips confidence, not ratio band"
 
 
 # ---------------------------------------------------------------------------

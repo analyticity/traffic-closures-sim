@@ -265,7 +265,7 @@ def run_odme_calibration(
             Z_current, stats = ctx.compute_objective_and_stats(
                 valid, compare_col, weight_method
             )
-            ctx.update_best_state(Z_current, outer_it)
+            ctx.update_best_state(Z_current, outer_it, vol_df=vol_df)
 
             if outer_it > 1 and Z_current > prev_Z:
                 effective_global_damping = max(effective_global_damping * 0.7, 0.05)
@@ -317,11 +317,13 @@ def run_odme_calibration(
                 vol_df, matched, vol_col
             )
 
+            from sim.calibration.screenlines import screenline_excluded_from_benchmark
             n_active_screenlines = sum(
                 1
-                for sn in (sl_results or {})
-                if _sr_val(sl_results.get(sn, {}), "observed_total") > 0
-                and _sr_val(sl_results.get(sn, {}), "modeled_total") > 0
+                for sn, sr in (sl_results or {}).items()
+                if _sr_val(sr, "observed_total") > 0
+                and _sr_val(sr, "modeled_total") > 0
+                and not screenline_excluded_from_benchmark(sn, sr)
             )
 
             iter_record = {
@@ -404,6 +406,7 @@ def run_odme_calibration(
                         for sn in sl_matrices
                         if _sr_val(sl_results.get(sn, {}), "observed_total") > 0
                         and _sr_val(sl_results.get(sn, {}), "modeled_total") > 0
+                        and not screenline_excluded_from_benchmark(sn, sl_results.get(sn, {}))
                     )
                     sl_damping = 1.0 / max(np.sqrt(n_sl_active), 1.0)
                     corrections = _spiess_update_step(

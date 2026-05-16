@@ -26,6 +26,7 @@ from sim.calibration.state import CalibrationState
 from sim.calibration.matching import match_counts_to_links, match_quality_report
 from sim.calibration.metrics import (
     compute_stats,
+    compute_stats_from_matched,
     compute_extended_link_metrics,
     compute_class_volume_breakdown,
     _coarse_road_class,
@@ -502,7 +503,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
             stats: Dict[str, Any]
             if not valid.empty and compare_col and compare_col in valid.columns:
                 Z_current, stats = ctx.compute_objective_and_stats(valid, compare_col, weight_method)
-                ctx.update_best_state(Z_current, it)
+                ctx.update_best_state(Z_current, it, vol_df=vol_df)
             else:
                 stats = {"n": 0}
 
@@ -593,8 +594,13 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                             exc_info=True,
                         )
 
+            from sim.calibration.screenlines import (
+                annotate_screenline_benchmark_exclusion,
+                filter_screenline_results_for_benchmark,
+                max_screenline_pct_deviation,
+            )
+
             sl_results = {}
-            max_sl_pct_dev: float = 0.0
             if screenlines and vol_col:
                 sl_res = evaluate_all_screenlines(
                     screenlines, vol_df, matched, vol_col, obs_col, links_gdf,
@@ -602,16 +608,21 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                 )
                 for sn, sr in sl_res.items():
                     sl_results[sn] = sr.to_dict()
-                    if sr.observed_total > 0 and np.isfinite(sr.ratio):
-                        dev = abs(sr.ratio - 1.0) * 100.0
-                        max_sl_pct_dev = max(max_sl_pct_dev, dev)
-                        if it == 1 or it == max_iterations:
-                            logger.info(
-                                f"  Screenline '{sn}': mod={sr.modeled_total:,.0f} "
-                                f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f} GEH={sr.geh:.1f}"
-                            )
-                if sl_results:
-                    logger.info(f"  Screenline max %deviation: {max_sl_pct_dev:.1f}%")
+                sl_results, _sl_excluded = annotate_screenline_benchmark_exclusion(
+                    sl_results, cfg,
+                )
+                if it == 1 or it == max_iterations:
+                    for sn, sr in filter_screenline_results_for_benchmark(
+                        sl_results, cfg,
+                    ).items():
+                        logger.info(
+                            f"  Screenline '{sn}': mod={sr['modeled_total']:,.0f} "
+                            f"obs={sr['observed_total']:,.0f} ratio={sr['ratio']:.2f} "
+                            f"GEH={sr['geh']:.1f}"
+                        )
+            max_sl_pct_dev = max_screenline_pct_deviation(sl_results, cfg)
+            if sl_results and (it == 1 or it == max_iterations):
+                logger.info(f"  Screenline max %deviation: {max_sl_pct_dev:.1f}%")
 
             iter_record: Dict[str, Any] = {
                 "iteration": it,
@@ -742,10 +753,12 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                 demand = data[:, :].copy().astype(np.float64)
 
                 if sl_matrices and sl_results:
+                    from sim.calibration.screenlines import screenline_excluded_from_benchmark as _sl_excl
                     n_sl_active = sum(
                         1 for sn in sl_matrices
                         if _sr_val(sl_results.get(sn, {}), "observed_total") > 0
                         and _sr_val(sl_results.get(sn, {}), "modeled_total") > 0
+                        and not _sl_excl(sn, sl_results.get(sn, {}))
                     )
                     sl_eff_damping = damping / max(np.sqrt(n_sl_active), 1.0)
                     corrections_pairs = _spiess_update_step(
@@ -872,12 +885,10 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
 
                     vp = m_p.dropna(subset=[vc_p, obs_period_col])
                     vp = vp[vp[obs_period_col] > 0].copy()
-                    if "_excluded" in vp.columns:
-                        vp = vp[~vp["_excluded"]].copy()
                     if len(vp) > 0:
                         p_dcf = daily_cap_factor if period == "daily" else 1.0
-                        ps = compute_stats(
-                            vp[vc_p].values, vp[obs_period_col].values,
+                        ps = compute_stats_from_matched(
+                            vp, vc_p, obs_period_col,
                             daily_capacity_factor=p_dcf,
                         )
                         period_stats[period] = ps

@@ -84,6 +84,13 @@ def _apply_ratio_exclusions(
     return joined
 
 
+def filter_matched_counts_for_benchmark(joined: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Drop rows flagged ``_excluded`` before R² / RMSE / bias / GEH aggregates."""
+    if joined.empty or "_excluded" not in joined.columns:
+        return joined
+    return joined[~joined["_excluded"]].copy()
+
+
 def _apply_manual_exclusions(
     joined: gpd.GeoDataFrame,
     exclude_objectids: Iterable[int],
@@ -422,6 +429,7 @@ def match_counts_to_links(
     vol_col: Optional[str] = None,
     match_quality_min: float = 0.50,
     skip_exclusion: bool = False,
+    skip_quality_exclusion: Optional[bool] = None,
     exclude_objectids: Optional[Iterable[int]] = None,
     exclude_csd_roads: Optional[Iterable[str]] = None,
     exclude_ratio_below: Optional[float] = None,
@@ -619,7 +627,11 @@ def match_counts_to_links(
 
     joined["_matched"] = joined["link_id"].notna() if "link_id" in joined.columns else False
 
-    if not skip_exclusion:
+    # Confidence / zero-flow scoring is expensive; ODME may skip it after iter 1.
+    # Ratio and manual exclusions always run so benchmark metrics stay stable.
+    _skip_quality = skip_quality_exclusion if skip_quality_exclusion is not None else skip_exclusion
+
+    if not _skip_quality:
         joined = _apply_exclusion_scoring(joined, vol_col, match_quality_min)
 
     if aggregate_corridor:
@@ -628,7 +640,7 @@ def match_counts_to_links(
     corr_col = "_corridor_volume" if "_corridor_volume" in joined.columns else None
     # Post-corridor must use the same confidence gate as pre-corridor; passing
     # 0.0 here effectively disabled exclusion after corridor aggregation.
-    if not skip_exclusion and corr_col:
+    if not _skip_quality and corr_col:
         joined = _apply_exclusion_scoring(
             joined, corr_col, match_quality_min, phase="post_corridor",
         )
@@ -645,8 +657,7 @@ def match_counts_to_links(
     )
 
     if (
-        not skip_exclusion
-        and exclude_ratio_below is not None
+        exclude_ratio_below is not None
         and exclude_ratio_above is not None
         and corr_col
     ):

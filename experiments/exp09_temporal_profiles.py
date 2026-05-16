@@ -50,7 +50,12 @@ def main() -> None:
     cache = _cache_dir(cfg)
     jams_path = cache / "jams.parquet"
     if not jams_path.exists():
-        print(f"[{NAME}] jams.parquet not found — run fetch-data first.")
+        reason = f"jams.parquet not found at {jams_path}. Run fetch-data first."
+        save_json(
+            {"status": "skipped", "reason": reason, "experiment": NAME},
+            out_dir / "summary.json",
+        )
+        print(f"[{NAME}] {reason}")
         return
 
     jams = pd.read_parquet(jams_path)

@@ -125,8 +125,8 @@ class TestComputeValidationBenchmarks:
 
     def test_screenline_max_error(self):
         sl = {
-            "SL1": {"ratio": 1.20, "observed_total": 1000},
-            "SL2": {"ratio": 0.85, "observed_total": 2000},
+            "SL1": {"ratio": 1.20, "modeled_total": 1200, "observed_total": 1000},
+            "SL2": {"ratio": 0.85, "modeled_total": 1700, "observed_total": 2000},
         }
         result = compute_validation_benchmarks(
             self._good_stats(), sl, [],

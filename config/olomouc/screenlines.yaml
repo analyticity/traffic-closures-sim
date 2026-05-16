@@ -31,4 +31,4 @@ screenlines:
       link_type: motorway
       osm_ref_norm: "D35"
     expected_links: 2
-    observed_aadt_all: 32417.0
+    observed_aadt_all: 32417.0 

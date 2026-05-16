@@ -240,6 +240,8 @@ scritp.py
 *.tex
 *.pdf
 excel_materials/
+DP_Kaňkovský/
+DP_Kankovsky/
 
 # Experiment temp configs (must stay under repo root for path resolution)
 .tmp_metric_principle_configs/

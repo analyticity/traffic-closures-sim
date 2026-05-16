@@ -24,6 +24,29 @@ screenlines:
     expected_links: 1
     observed_aadt_all: 3945.0
 
+  # Přepis auto_gw_D1_W / D1_E: řez kolmo na D1 u hranice AOI (oba jízdní směry).
+  # Bez override může auto_gw_D1_W sáhnout na vzdálený pentlogram/CSD profil
+  # (modelovaný tok ~4× vyšší než pozorovaný).
+  - name: "auto_gw_D1_W"
+    description: "D1 west gateway — manual override; both carriageways at AOI boundary"
+    type: radial
+    geometry_wkt: "LINESTRING (16.442 49.189056, 16.454 49.189056)"
+    filter:
+      link_type: motorway
+      osm_ref_norm: "D1"
+    expected_links: 2
+    observed_aadt_all: 47721.0
+
+  - name: "auto_gw_D1_E"
+    description: "D1 east gateway — manual override; both carriageways at AOI boundary"
+    type: radial
+    geometry_wkt: "LINESTRING (16.718 49.184924, 16.738 49.184924)"
+    filter:
+      link_type: motorway
+      osm_ref_norm: "D1"
+    expected_links: 2
+    observed_aadt_all: 47721.0
+
   # Přepis auto_gw_D2_S: řez uvnitř sítě přes obě jízdní pásy D2.
   # Lat 49.125 protíná link 492 (JB směr) i link 59257 (SB směr).
   - name: "auto_gw_D2_S"
@@ -47,6 +70,18 @@ screenlines:
       osm_ref_norm: "52"
     expected_links: 2
     observed_aadt_all: 25588.0
+
+  # Přepis auto_gw_I43_N: trunk I/43 at AOI north boundary (snap 192 m — override locks geometry).
+  # Pentlogram motor_total 26 468 voz/den (car_only 22 064). Matches ODME count_target = motor_total.
+  - name: "auto_gw_I43_N"
+    description: "I/43 north gateway — manual override; both carriageways at AOI boundary"
+    type: radial
+    geometry_wkt: "LINESTRING (16.555 49.291, 16.575 49.291)"
+    filter:
+      link_type: trunk
+      osm_ref_norm: "43"
+    expected_links: 2
+    observed_aadt_all: 26468.0
 
   # Přepis auto_csd_*: CSD průměr sv z validace; řez kolmo k nejvytíženějšímu segmentu v síti.
   - name: "auto_csd_640"

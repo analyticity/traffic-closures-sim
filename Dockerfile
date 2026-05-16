@@ -34,9 +34,9 @@ COPY data/sources/ /app/data/sources/
 
 RUN python run.py --config "config/${CITY}/sim.yaml" check \
     && python run.py --config "config/${CITY}/sim.yaml" build-network \
+    && python run.py --config "config/${CITY}/sim.yaml" fetch-data \
     && python run.py --config "config/${CITY}/sim.yaml" normalize-network \
     && python run.py --config "config/${CITY}/sim.yaml" build-zones \
-    && python run.py --config "config/${CITY}/sim.yaml" fetch-data \
     && python run.py --config "config/${CITY}/sim.yaml" build-supernetwork \
     && python run.py --config "config/${CITY}/sim.yaml" build-demand \
     && python run.py --config "config/${CITY}/sim.yaml" assign-warm-skims \

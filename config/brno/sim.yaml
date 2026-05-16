@@ -33,6 +33,8 @@ demand:
   segments:
     external_local:
       total_daily_trips: 130000
+  distribution:
+    min_gravity_beta: 0.000001
   sldb:
     external_processing:
       through_traffic_scale: 0.30
@@ -41,7 +43,7 @@ calibration:
   gateway_calibration:
     damping: 0.18
     min_factor: 0.70
-    max_factor: 1.30
+    max_factor: 1.40
   auto_screenlines:
     gateway_count_target: "motor_total"
   odme:

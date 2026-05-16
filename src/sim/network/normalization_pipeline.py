@@ -27,6 +27,7 @@ from sim.network.connectivity import (
 )
 from sim.network.db import project_db
 from sim.network.export import export_stable_network
+from sim.datasets.paths import resolved_csd2025_validation_parquet_path
 from sim.network.normalization import normalize_network_attributes
 
 logger = logging.getLogger(__name__)
@@ -49,9 +50,7 @@ def normalize_and_export_network(
     datasets_cfg = cfg.get("datasets") or {}
     csd_path = None
     if datasets_cfg.get("enabled", False):
-        csd_src = (datasets_cfg.get("sources") or {}).get("validation_csd2025_v2") or {}
-        csd_file = csd_src.get("path", "data/sources/rsd/csd2025/v2_csd2025.parquet")
-        csd_candidate = Path(csd_file)
+        csd_candidate = resolved_csd2025_validation_parquet_path(cfg)
         if csd_candidate.exists():
             csd_path = csd_candidate
 

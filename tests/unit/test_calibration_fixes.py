@@ -1,4 +1,4 @@
-"""Tests for the three calibration/validation fixes:
+"""Tests for calibration/validation fixes:
 
 1. Global capacity defaults raised for secondary/tertiary
 2. Code fix: experiment profile lanes/capacity merged into defaults

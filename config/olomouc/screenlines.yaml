@@ -1,34 +1,32 @@
-# Screenlines pro Olomouc.
+# Screenlines for Olomouc.
 #
-# Položky s názvy auto_* mají přednost před auto-generovanými definicemi —
-# viz load_screenlines_with_auto() ve src/sim/calibration/screenlines.py.
+# Entries named auto_* take precedence over auto-generated definitions —
+# see load_screenlines_with_auto() in src/sim/calibration/screenlines.py.
 #
-# Manuální screenlines doplňují auto-generované tam, kde chybí
-# CSD kontrolní bod uvnitř modelu.
+# Manual screenlines supplement auto-generated ones where no
+# CSD count post exists inside the model.
 #
-# D35 NW: baseline měl u auto_gw_D35_NW modeled_total 0 (špatně vybrané
-# boundary linky / topologie). Ruční řez + filtr motorway+D35 mapuje řez na
-# skutečné jízdní pásy (46270 / 46272).
+# D35 NW: baseline had auto_gw_D35_NW modeled_total 0 (wrong boundary links /
+# topology). Manual cut + motorway+D35 filter maps the cut to actual carriageways (46270 / 46272).
 #
-# D35 obecně: v generátoru bran byl pro ref „D35“ aktivní numerický fallback na
-# ref „35“, takže východní brána D35_E párovala CSD objem dálnice na **I/35
-# (trunk)** u konektorů — to ODME nemůže „napravit“ jednou screenlinou na NW.
-# Od opravy v src/sim/calibration/screenlines.py se u D## numerický fallback
-# vypíná, explicitní trunk linky se zahodí a kolmice se bere přes nejbližší
-# úsek motorway s daným ref (D35_E tedy cílí na dálnici, ne na I/35).
+# D35 generally: gateway generator used numeric fallback ref "35" for "D35", so eastern
+# gateway D35_E paired motorway CSD volume onto **I/35 (trunk)** at connectors — ODME
+# cannot fix that with a single NW screenline. After the fix in screenlines.py, D## numeric
+# fallback is disabled, explicit trunk links are dropped, and the cut uses the nearest
+# motorway segment with that ref (D35_E targets the motorway, not I/35).
 #
-# Vypnuté brány v config/olomouc/sim.yaml →
+# Disabled gateways in config/olomouc/sim.yaml →
 #   calibration.auto_screenlines.exclude_gateway_names
-# - 437_E: snap na obytnou síť, řez na secondary spurs I/437 (1902/1904)
-# - D46_SW_2: duplicitní řez I/46 SW, modeled ~2× oproti CSD (~75 % chyba)
+# - 437_E: snap to residential network, cut on secondary spurs I/437 (1902/1904)
+# - D46_SW_2: duplicate I/46 SW cut, modeled ~2× vs CSD (~75% error)
 
 screenlines:
   - name: "auto_gw_D35_NW"
-    description: "Gateway D35 NW — baseline: modeled_total 0 vs obs. 32417 voz/den (CSD); řez WGS84 + ref D35 motorway"
+    description: "Gateway D35 NW — baseline: modeled_total 0 vs obs. 32,417 veh/day (CSD); WGS84 cut + ref D35 motorway"
     type: "radial"
     geometry_wkt: "LINESTRING (17.1738651603 49.6261996357, 17.1715981993 49.6229182982)"
     filter:
       link_type: motorway
       osm_ref_norm: "D35"
     expected_links: 2
-    observed_aadt_all: 32417.0 
+    observed_aadt_all: 32417.0

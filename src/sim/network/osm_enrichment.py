@@ -356,7 +356,6 @@ def fill_missing_refs_from_named_corridors(
 
 
 # ---------------------------------------------------------------------------
-# Main enrichment entry point
 # ---------------------------------------------------------------------------
 
 def enrich_links_from_osm(

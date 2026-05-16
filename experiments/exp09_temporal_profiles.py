@@ -30,11 +30,11 @@ logger = logging.getLogger(__name__)
 NAME = "exp09_temporal_profiles"
 
 TIME_BANDS = {
-    "ráno (6–9)":   (6, 9),
-    "dopoledne (9–12)": (9, 12),
-    "odpoledne (12–15)": (12, 15),
-    "odpolední špička (15–18)": (15, 18),
-    "večer (18–22)": (18, 22),
+    "morning (6-9)":   (6, 9),
+    "late morning (9-12)": (9, 12),
+    "afternoon (12-15)": (12, 15),
+    "PM peak (15-18)": (15, 18),
+    "evening (18-22)": (18, 22),
 }
 
 PEAK_HOURS = {7, 8, 15, 16}
@@ -101,12 +101,12 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(10, 5))
     colors = ["coral" if h in PEAK_HOURS else "steelblue" for h in range(24)]
     ax.bar(range(24), hourly.values, color=colors, edgecolor="white")
-    ax.set_xlabel("Hodina dne")
-    ax.set_ylabel("Počet zácp (Waze)")
-    ax.set_title("Hodinový profil zácp (pracovní dny)")
+    ax.set_xlabel("Hour of day")
+    ax.set_ylabel("Jam count (Waze)")
+    ax.set_title("Hourly jam profile (weekdays)")
     ax.set_xticks(range(24))
     from matplotlib.patches import Patch
-    ax.legend(handles=[Patch(color="coral", label="Špička"), Patch(color="steelblue", label="Mimo špičku")])
+    ax.legend(handles=[Patch(color="coral", label="Peak"), Patch(color="steelblue", label="Off-peak")])
     save_figure(fig, out_dir / "hourly_profile.png")
     plt.close(fig)
 
@@ -186,21 +186,21 @@ def main() -> None:
 
     if len(peak_valid) >= 5:
         ax1.scatter(peak_valid["vc"], peak_valid["jam_count_peak"], alpha=0.3, s=8, edgecolors="none")
-        ax1.set_title(f"Špička (7–9, 15–17)  ρ = {rho_peak:.3f}")
+        ax1.set_title(f"Peak (7-9, 15-17)  ρ = {rho_peak:.3f}")
     else:
-        ax1.set_title("Špička — nedostatek dat")
-    ax1.set_xlabel("Modelový V/C")
-    ax1.set_ylabel("Počet zácp (Waze)")
+        ax1.set_title("Peak — insufficient data")
+    ax1.set_xlabel("Modeled V/C")
+    ax1.set_ylabel("Jam count (Waze)")
 
     if len(offpeak_valid) >= 5:
         ax2.scatter(offpeak_valid["vc"], offpeak_valid["jam_count_offpeak"], alpha=0.3, s=8, edgecolors="none")
-        ax2.set_title(f"Mimo špičku  ρ = {rho_offpeak:.3f}")
+        ax2.set_title(f"Off-peak  ρ = {rho_offpeak:.3f}")
     else:
-        ax2.set_title("Mimo špičku — nedostatek dat")
-    ax2.set_xlabel("Modelový V/C")
-    ax2.set_ylabel("Počet zácp (Waze)")
+        ax2.set_title("Off-peak — insufficient data")
+    ax2.set_xlabel("Modeled V/C")
+    ax2.set_ylabel("Jam count (Waze)")
 
-    fig.suptitle("V/C korelace: špička vs. mimo špičku", fontsize=13)
+    fig.suptitle("V/C correlation: peak vs off-peak", fontsize=13)
     fig.tight_layout()
     save_figure(fig, out_dir / "peak_vs_offpeak.png")
     plt.close(fig)
@@ -215,8 +215,8 @@ def main() -> None:
     ax.bar(x, rhos, color=colors, edgecolor="white")
     ax.set_xticks(x)
     ax.set_xticklabels(band_df["time_band"], rotation=30, ha="right")
-    ax.set_ylabel("Spearman ρ (V/C vs. počet zácp)")
-    ax.set_title("Korelace V/C s frekvencí zácp podle časového pásma")
+    ax.set_ylabel("Spearman ρ (V/C vs jam count)")
+    ax.set_title("V/C vs jam frequency by time band")
     ax.axhline(0, color="black", lw=0.5)
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
@@ -236,9 +236,9 @@ def main() -> None:
             sub = jams_wd[jams_wd["link_type"] == lt]
             hourly_lt = sub.groupby("hour").size().reindex(range(24), fill_value=0)
             ax.plot(range(24), hourly_lt.values, marker="o", markersize=3, label=str(lt))
-        ax.set_xlabel("Hodina dne")
-        ax.set_ylabel("Počet zácp")
-        ax.set_title("Hodinové profily zácp podle třídy komunikace")
+        ax.set_xlabel("Hour of day")
+        ax.set_ylabel("Jam count")
+        ax.set_title("Hourly jam profiles by road class")
         ax.set_xticks(range(24))
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)

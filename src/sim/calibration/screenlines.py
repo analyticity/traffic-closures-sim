@@ -44,7 +44,7 @@ def _dalnice_gateway_cut_wkt(
     """Return a WGS84 WKT cut across the nearest motorway segment for a D## *ref*.
 
     Gateway anchor nodes often sit on a parallel I/## trunk while CSD counts
-    refer to the real dálnice.  The default boundary-perpendicular line then
+    refer to the real motorway.  The default boundary-perpendicular line then
     misses ``motorway`` links entirely; this builds a short cut through the
     closest matching motorway geometry to the boundary point.
     """
@@ -1288,7 +1288,7 @@ def auto_generate_screenlines(
                                 # like "D55" (motorway) and "55" (trunk I/55) are
                                 # the same corridor but different classifications.
                                 #
-                                # Do **not** apply this fallback for D## dálnice:
+                                # Do **not** apply this fallback for D## motorways:
                                 # gateway anchors often sit on parallel I/## trunk
                                 # spurs while CSD counts refer to the motorway.
                                 if adj.empty and (not _is_czech_dalnice_ref(ref)):
@@ -1397,7 +1397,7 @@ def auto_generate_screenlines(
                     if not keep_single:
                         explicit_links = []
 
-                # Dalnice gateways must not keep explicit links on parallel I/##
+                # Motorway gateways must not keep explicit links on parallel I/##
                 # trunk connectors: CSD / gateway AADT refers to the motorway.
                 if explicit_links and links_gdf is not None and _is_czech_dalnice_ref(ref):
                     _lid_idx = links_gdf.set_index("link_id", drop=False)
@@ -1692,7 +1692,6 @@ def auto_generate_screenlines(
                         for cj in range(ci + 1, len(clusters)):
                             if not clusters[cj]:
                                 continue
-                            # Check if any pair across clusters is within threshold
                             should_merge = False
                             for a in clusters[ci]:
                                 for b in clusters[cj]:

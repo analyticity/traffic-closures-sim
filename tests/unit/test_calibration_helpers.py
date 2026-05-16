@@ -374,7 +374,7 @@ class TestEntropyUpdateStep:
 
 
 # ---------------------------------------------------------------------------
-# compute_validation_benchmarks — config-driven thresholds
+# compute_validation_benchmarks - config-driven thresholds
 # ---------------------------------------------------------------------------
 class TestValidationBenchmarksConfigDriven:
     def test_default_geh_threshold_85(self):
@@ -516,7 +516,7 @@ class TestDedupCrossScreenlineLinks:
 
 
 # ---------------------------------------------------------------------------
-# match_counts_to_links — skip_exclusion
+# match_counts_to_links - skip_exclusion
 # ---------------------------------------------------------------------------
 class TestSkipExclusion:
     def test_exclusion_locked_with_skip(self):
@@ -618,13 +618,11 @@ class TestBenchmarkSaveRestore:
         import sys
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
 
-        # Create a fake matrix file
         demand_dir = tmp_path / "data" / "brno" / "demand"
         demand_dir.mkdir(parents=True)
         matrix_file = demand_dir / "od_matrix.aem"
         matrix_file.write_bytes(b"fake-aem-content")
 
-        # Create a minimal config
         import yaml
         cfg_dir = tmp_path / "config" / "brno"
         cfg_dir.mkdir(parents=True)

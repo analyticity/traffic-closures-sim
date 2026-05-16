@@ -8,5 +8,5 @@ csd_region_filter:
   column: kk
   contains: "042"
 
-# Most is not a statutory city with municipal parts (městské části).
+# Most is not a statutory city with municipal districts.
 municipal_parts_to_cadastral: {}

@@ -72,7 +72,6 @@ class TestImpedanceModeValidation:
 
     def test_euclidean_requires_opt_in(self):
         """'euclidean' without allow_euclidean_fallback should raise."""
-        # Verify the config default
         from sim.defaults import SIM_DEFAULTS
         dist_cfg = SIM_DEFAULTS["demand"]["distribution"]
         assert dist_cfg["impedance"] == "skim"
@@ -342,7 +341,6 @@ class TestSkimConvergenceEnforcement:
             "skim_method": "final",
         }
         (tmp_path / "skims_meta.json").write_text(json.dumps(meta))
-        # Must not raise
         _validate_skim_convergence(tmp_path)
 
 

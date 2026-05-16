@@ -109,7 +109,7 @@ def main() -> None:
 
     summary: Dict[str, Any] = {
         "experiment": NAME,
-        "note": "Denní model — metriky plausibility, ne průmyslové GEH prahy.",
+        "note": "Daily model — plausibility metrics, not industrial GEH thresholds.",
         "validation_report_keys": list(vr.keys())[:20] if isinstance(vr, dict) else [],
     }
 
@@ -127,9 +127,9 @@ def main() -> None:
 
         fig, ax = plt.subplots(figsize=(10, 5))
         by_type.plot(kind="bar", ax=ax, color="steelblue")
-        ax.set_ylabel(f"Průměrný {vol_col} (voz/den na hraně)")
+        ax.set_ylabel(f"Mean {vol_col} (veh/day per link)")
         ax.set_xlabel("link_type (OSM)")
-        ax.set_title("Model — průměrný denní objem podle typu komunikace")
+        ax.set_title("Model — mean daily volume by road class")
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right")
         fig.tight_layout()
         save_figure(fig, out_dir / "volume_by_class.png")
@@ -156,7 +156,7 @@ def main() -> None:
             ax.scatter(obs_v, mod_v, alpha=0.55, s=28, edgecolors="none")
             lim = max(float(obs_v.max()), float(mod_v.max())) * 1.05
             ax.plot([0, lim], [0, lim], "k--", lw=0.8, label="y = x")
-            ax.plot([0, lim], [0, 0.5 * lim], "g:", lw=0.9, alpha=0.75, label="0.5× / 2× pásmo")
+            ax.plot([0, lim], [0, 0.5 * lim], "g:", lw=0.9, alpha=0.75, label="0.5× / 2× band")
             ax.plot([0, lim], [0, 2.0 * lim], "g:", lw=0.9, alpha=0.75)
             if stats.get("slope") and np.isfinite(stats["slope"]):
                 xs = np.array([0.0, lim])
@@ -165,10 +165,10 @@ def main() -> None:
                     stats["slope"] * xs + float(stats.get("intercept") or 0),
                     "r-",
                     lw=0.9,
-                    label=f"regrese: y = {stats['slope']:.2f}x + {stats.get('intercept', 0):.0f}",
+                    label=f"regression: y = {stats['slope']:.2f}x + {stats.get('intercept', 0):.0f}",
                 )
-            ax.set_xlabel(f"Pozorované ({obs_col})")
-            ax.set_ylabel(f"Modelované ({mod_col})")
+            ax.set_xlabel(f"Observed ({obs_col})")
+            ax.set_ylabel(f"Modeled ({mod_col})")
             ax.set_title(
                 f"Baseline plausibility  (n={stats.get('n', len(obs_v))},  "
                 f"factor-of-2: {summary['factor_of_2'].get('pct_in_factor_of_2')}%)"
@@ -187,10 +187,10 @@ def main() -> None:
             ax.axvline(0.5, color="orange", ls="--", lw=1)
             ax.axvline(2.0, color="orange", ls="--", lw=1)
             ax.axvline(1.0, color="black", ls="-", lw=0.8)
-            ax.set_xlabel("model / pozorované")
-            ax.set_ylabel("Počet stanic")
+            ax.set_xlabel("model / observed")
+            ax.set_ylabel("Count stations")
             ax.set_title(
-                f"Poměr model/pozorované  (median={summary['factor_of_2'].get('median_ratio')})"
+                f"Model/observed ratio  (median={summary['factor_of_2'].get('median_ratio')})"
             )
             save_figure(fig, out_dir / "factor_of_2.png")
             plt.close(fig)

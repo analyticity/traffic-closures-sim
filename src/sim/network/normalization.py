@@ -429,7 +429,6 @@ def ensure_link_types_registered(project: Project, link_types: set[str]) -> None
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
 # ---------------------------------------------------------------------------
 
 def normalize_network_attributes(

@@ -18,15 +18,18 @@ Developed as part of a diploma thesis at Brno University of Technology, Faculty 
 │   ├── distribution/         #   Gravity model & IPF
 │   ├── assignment/           #   User-equilibrium traffic assignment
 │   ├── calibration/          #   ODME calibration, validation, supply audit
-│   └── scenarios/            #   Scenario engine & delta analysis
+│   ├── diagnostics/          #   Parallel-corridor & bias diagnostics
+│   ├── scenarios/            #   Scenario engine & delta analysis
+│   └── sensitivity.py        #   Multi-parameter sensitivity analysis
 ├── frontend/                 # React/TypeScript map & report UI (Vite + Leaflet)
 ├── config/                   # Per-city YAML configurations
 │   ├── brno/                 #   Brno (default)
 │   ├── most/                 #   Most
-│   └── olomouc/              #   Olomouc
-├── experiments/              # Experiment drivers (exp01–exp11)
+│   ├── olomouc/              #   Olomouc
+│   └── experiments.yaml      #   Shared experiment settings
+├── experiments/              # Experiment drivers (exp01–exp03, exp05–exp11)
 ├── tests/                    # Unit & integration tests
-├── scripts/                  # Utility scripts (config generator, audit, etc.)
+├── scripts/                  # Utility scripts (config generator, benchmarks, etc.)
 ├── scenarios/                # Example scenario YAML definitions
 ├── Dockerfile                # Multi-stage Docker build (pipeline + serve)
 ├── docker-compose.yml        # Pre-built city images
@@ -158,15 +161,17 @@ The **minimum speed clamp** is only `normalization.thresholds.min_speed_kmh` (on
 | 11 | `assign` | Full user-equilibrium traffic assignment (biconjugate Frank-Wolfe) |
 | 12 | `audit-supply` | Supply-side diagnostics (prerequisite for ODME) |
 | 13 | `calibrate` | Spiess gradient ODME against observed link counts |
-| 14 | `tune-supply` | Optional outer-loop supply parameter optimization |
-| 15 | `validate` | Independent validation on holdout CSD sections |
-| 16 | `learn-profile` | Extract temporal day-type factors from CSD |
-| 17 | `strip-closures` | Restore pre-closure network for scenario analysis |
-| 18 | `serve` | Start read-only FastAPI server |
+| 14 | `calibrate-odme` | Explicit alias for Spiess ODME (same as `calibrate` with `method: odme`) |
+| 15 | `tune-supply` | Optional outer-loop supply parameter optimization |
+| 16 | `validate` | Independent validation on holdout CSD sections |
+| 17 | `sensitivity` | Multi-parameter sensitivity analysis |
+| 18 | `learn-profile` | Extract temporal day-type factors from CSD |
+| 19 | `strip-closures` | Restore pre-closure network for scenario analysis |
+| 20 | `serve` | Start read-only FastAPI server |
 
 ## Multi-City Support
 
-Each city has its own directory under `config/` with a minimal `sim.yaml` (~40 lines) containing only city-specific values (OSM place name, zoning sources, gateway whitelists). All methodology defaults are built into the code.
+Each city has its own directory under `config/` with a `sim.yaml` containing city-specific values (OSM place name, zoning sources, gateway whitelists, calibration tuning). Each city directory also includes `network_normalization.yaml`, `screenlines.yaml`, and `locale.yaml`. All methodology defaults are built into the code.
 
 Add a new city interactively:
 
@@ -200,7 +205,7 @@ docker run --network host simulation-brno
 
 ## Experiments
 
-Experiment drivers (`experiments/exp01`–`exp11`) cover baseline validation, congestion patterns, closure scenarios, geometry matching, event-link validation, accident correlation, sensitivity analysis, temporal profiles, quality-score filtering, and **model vs Waze free-flow speeds** (`exp11_waze_speeds`, needs PostgreSQL jams from `fetch-data`).
+Experiment drivers (`experiments/exp01`–`exp03`, `exp05`–`exp11`) cover baseline validation, congestion patterns, closure scenarios, geometry matching, event-link validation, accident correlation, sensitivity analysis, temporal profiles, quality-score filtering, and **model vs Waze free-flow speeds** (`exp11_waze_speeds`, needs PostgreSQL jams from `fetch-data`). A `package_experiment_results.py` utility collects outputs into a single archive.
 
 Run all experiments for a city:
 

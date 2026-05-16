@@ -173,9 +173,9 @@ def main() -> None:
 
         fig, ax = plt.subplots(figsize=(7, 5))
         df.boxplot(column="accident_count", by="vc_quartile", ax=ax, showfliers=False)
-        ax.set_xlabel("V/C kvartil")
-        ax.set_ylabel("Počet nehod")
-        ax.set_title("Distribuce nehod podle V/C kvartilů")
+        ax.set_xlabel("V/C quartile")
+        ax.set_ylabel("Accident count")
+        ax.set_title("Accident distribution by V/C quartile")
         fig.suptitle("")
         save_figure(fig, out_dir / "boxplot.png")
         plt.close(fig)
@@ -186,9 +186,9 @@ def main() -> None:
     if len(has_acc) >= 5:
         fig, ax = plt.subplots(figsize=(7, 6))
         ax.scatter(has_acc["vc"], has_acc["accident_count"], alpha=0.3, s=10, edgecolors="none")
-        ax.set_xlabel("V/C poměr")
-        ax.set_ylabel("Počet nehod")
-        ax.set_title(f"V/C vs nehody  (ρ = {rho:.3f},  n = {len(has_acc)})")
+        ax.set_xlabel("V/C ratio")
+        ax.set_ylabel("Accident count")
+        ax.set_title(f"V/C vs accidents  (ρ = {rho:.3f},  n = {len(has_acc)})")
         save_figure(fig, out_dir / "correlation.png")
         plt.close(fig)
 

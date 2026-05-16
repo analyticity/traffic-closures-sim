@@ -118,9 +118,9 @@ def main() -> None:
 
         fig, ax = plt.subplots(figsize=(8, 5))
         df.boxplot(column="jam_count", by="vc_quartile", ax=ax, showfliers=False)
-        ax.set_xlabel("Kvartil modelového V/C")
-        ax.set_ylabel("Počet hlášených zácp (Waze)")
-        ax.set_title("Zácpy podle kvartilu V/C")
+        ax.set_xlabel("Modeled V/C quartile")
+        ax.set_ylabel("Reported jams (Waze)")
+        ax.set_title("Jams by V/C quartile")
         fig.suptitle("")
         fig.tight_layout()
         save_figure(fig, out_dir / "quartile_boxplot.png")
@@ -129,11 +129,11 @@ def main() -> None:
     # --- Overlap bar ---
     fig, ax = plt.subplots(figsize=(5, 4))
     ax.bar(
-        ["Průnik"],
+        ["Overlap"],
         [summary["top_overlap"]["pct_of_top_vc_also_top_jam"]],
         color="steelblue",
     )
-    ax.set_ylabel("% top V/C také v top jam")
+    ax.set_ylabel("% top V/C also in top jam")
     ax.set_ylim(0, 100)
     ax.set_title(
         f"Top {int(VC_TOP_FRAC*100)}% V/C vs top {int(JAM_TOP_FRAC*100)}% jam "
@@ -147,8 +147,8 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.scatter(df["vc"], df["jam_count"], alpha=0.25, s=10, edgecolors="none")
     ax.set_xlabel("Model V/C")
-    ax.set_ylabel("Počet zácp (Waze)")
-    ax.set_title(f"V/C vs zácpy (globální ρ = {rho:.3f})")
+    ax.set_ylabel("Jam count (Waze)")
+    ax.set_title(f"V/C vs jams (global ρ = {rho:.3f})")
     save_figure(fig, out_dir / "correlation.png")
     plt.close(fig)
 

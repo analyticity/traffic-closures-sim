@@ -1383,7 +1383,7 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
             "No holdout split active. Verdict based on calibration data."
         )
 
-    # 4b) Period-based metrics (AM/IP/PM) from temporal profile
+    # 4d) Period-based metrics (AM/IP/PM) from temporal profile
     period_metrics: Dict[str, Any] = {}
     try:
         from sim.demand.temporal import load_profile, get_demand_period_shares
@@ -1392,7 +1392,7 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
         period_shares = get_demand_period_shares(profile)
 
         if vol_col and vol_col in links_gdf.columns:
-            logger.info("\n4b) Period-based synthetic validation (AM/IP/PM) ...")
+            logger.info("\n4d) Period-based synthetic validation (AM/IP/PM) ...")
             for period in ("am", "ip", "pm"):
                 share = period_shares.get(period, 0.0)
                 if share <= 0:
@@ -1471,7 +1471,6 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
     overall = "PASS" if benchmarks["overall_pass"] else "FAIL"
     verdict_src = benchmarks.get("verdict_source", "calibration")
 
-    # Summary table
     if model_time_period == "daily":
         dt = daily_conv or {}
         r2_tgt = float(dt.get("r2_target", 0.80))

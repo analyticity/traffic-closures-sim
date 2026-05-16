@@ -245,7 +245,6 @@ def run_supply_tuning(config_path: str | Path = "config/brno/sim.yaml") -> None:
     for rc in road_classes:
         logger.info("\n  --- Tuning %s ---", rc)
 
-        # Speed factor
         best_sf = best_params.speed_factors.get(rc, 1.0)
         for sf in speed_range:
             if sf == best_sf:
@@ -262,7 +261,6 @@ def run_supply_tuning(config_path: str | Path = "config/brno/sim.yaml") -> None:
                 best_sf = sf
         best_params.speed_factors[rc] = best_sf
 
-        # Capacity factor
         best_cf = best_params.capacity_factors.get(rc, 1.0)
         for cf in cap_range:
             if cf == best_cf:
@@ -279,7 +277,6 @@ def run_supply_tuning(config_path: str | Path = "config/brno/sim.yaml") -> None:
                 best_cf = cf
         best_params.capacity_factors[rc] = best_cf
 
-    # Apply best params and run final full calibration
     calib_cfg["max_iterations"] = orig_max_iter
     logger.info(
         "\n  Best params: speed=%s, capacity=%s, obj=%.2f",

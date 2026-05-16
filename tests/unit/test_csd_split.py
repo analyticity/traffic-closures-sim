@@ -89,7 +89,7 @@ def _make_links_with_volumes() -> gpd.GeoDataFrame:
 
 
 # ---------------------------------------------------------------------------
-# split_csd_for_calibration — alternating (default)
+# split_csd_for_calibration - alternating (default)
 # ---------------------------------------------------------------------------
 
 class TestSplitAlternating:
@@ -145,7 +145,7 @@ class TestSplitAlternating:
 
 
 # ---------------------------------------------------------------------------
-# split_csd_for_calibration — stratified
+# split_csd_for_calibration - stratified
 # ---------------------------------------------------------------------------
 
 class TestSplitStratified:
@@ -182,7 +182,7 @@ class TestSplitStratified:
 
 
 # ---------------------------------------------------------------------------
-# split_csd_for_calibration — spatial
+# split_csd_for_calibration - spatial
 # ---------------------------------------------------------------------------
 
 class TestSplitSpatial:
@@ -220,7 +220,7 @@ class TestSplitSpatial:
 
 
 # ---------------------------------------------------------------------------
-# split_csd_for_calibration — corridor
+# split_csd_for_calibration - corridor
 # ---------------------------------------------------------------------------
 
 class TestSplitCorridor:
@@ -286,7 +286,7 @@ class TestSplitCorridor:
 
 
 # ---------------------------------------------------------------------------
-# split_csd_for_calibration — error handling / edge cases
+# split_csd_for_calibration - error handling / edge cases
 # ---------------------------------------------------------------------------
 
 class TestSplitErrors:

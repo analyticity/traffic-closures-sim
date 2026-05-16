@@ -1,7 +1,7 @@
 project_path: "project/brno_aeq"
 
-# Externí brány a supernetwork jen pro dálnice (motorway) a rychlostní silnice (trunk).
-# Konkrétní koridory přes hranici AOI: viz poslední gateway_diagnostics.csv v outputs/brno/…
+# External gateways and supernetwork: motorways and trunk roads only.
+# Corridor details at AOI boundary: see latest gateway_diagnostics.csv in outputs/brno/…
 supernetwork:
   eligible_gateway_types:
     - motorway
@@ -47,8 +47,8 @@ calibration:
     entropy_step_size: 0.22
     convergence_tol: 0.0008
     assign_max_iter: 80
-    # Tertiary: cap upward class correction (count posts say „málo“, síť už přebytky).
-    # Trunk: floor — model podstřeluje oproti CSD na dálnicích/rychlostních.
+    # Tertiary: cap upward class correction (counts say "too low", network already over-assigns).
+    # Trunk: floor — model under-shoots vs CSD on motorways/trunk roads.
     class_residual_ratio_caps:
       tertiary: 1.05
     class_residual_ratio_floors:
@@ -60,7 +60,7 @@ calibration:
         max_iterations: 25
   screenlines_path: "config/brno/screenlines.yaml"
   auto_screenlines:
-    # Auto SL mimo poměr model/obs — nepočítat do SL max dev (špatný link / nulový tok).
+    # Auto screenlines outside model/obs ratio band — exclude from SL max dev (wrong link / zero flow).
     exclude_auto_ratio_below: 0.20
     exclude_auto_ratio_above: 5.0
 

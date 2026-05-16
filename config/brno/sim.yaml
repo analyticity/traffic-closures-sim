@@ -25,6 +25,9 @@ zoning:
       admin_level: "9"
   external_gateways:
     enabled: true
+    whitelist: ["D1", "D2", "I/43", "I/52", "I/50"]
+    auto_discover:
+      enabled: false
 
 demand:
   segments:

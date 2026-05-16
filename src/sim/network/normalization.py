@@ -608,9 +608,11 @@ def normalize_network_attributes(
     _fix_lane_pinch_points(links)
 
     # --- Practical free-flow speed reduction (HCM-inspired) ---
+    norm_block = network_cfg.get("normalization") or {}
+    pffs_yaml = norm_block.get("practical_speed") if isinstance(norm_block.get("practical_speed"), dict) else {}
     pffs_defaults = _NORM_DEFS.get("practical_speed") or {}
     pffs_profile = profile.get("practical_speed") or {}
-    pffs_cfg = {**pffs_defaults, **pffs_profile}
+    pffs_cfg = {**pffs_defaults, **pffs_yaml, **pffs_profile}
     _apply_practical_speed_reduction(links, project, pffs_cfg)
 
     # --- Capacity (AB/BA) ---

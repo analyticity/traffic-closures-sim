@@ -34,6 +34,7 @@ from sim.assignment.executor import (
 from sim.assignment.pipeline import (
     run_assignment,
     run_warm_skim_assignment,
+    warm_skims_regeneration_reason,
 )
 
 __all__ = [
@@ -55,4 +56,5 @@ __all__ = [
     # pipeline
     "run_assignment",
     "run_warm_skim_assignment",
+    "warm_skims_regeneration_reason",
 ]

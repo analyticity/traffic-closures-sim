@@ -5,67 +5,25 @@
 #
 # Manuální screenlines doplňují auto-generované tam, kde chybí
 # CSD kontrolní bod uvnitř modelu.
+#
+# D35 NW: baseline měl u auto_gw_D35_NW modeled_total 0 (špatně vybrané
+# boundary linky / topologie). Ruční řez + filtr motorway+D35 mapuje řez na
+# skutečné jízdní pásy (46270 / 46272).
+#
+# D35 obecně: v generátoru bran byl pro ref „D35“ aktivní numerický fallback na
+# ref „35“, takže východní brána D35_E párovala CSD objem dálnice na **I/35
+# (trunk)** u konektorů — to ODME nemůže „napravit“ jednou screenlinou na NW.
+# Od opravy v src/sim/calibration/screenlines.py se u D## numerický fallback
+# vypíná, explicitní trunk linky se zahodí a kolmice se bere přes nejbližší
+# úsek motorway s daným ref (D35_E tedy cílí na dálnici, ne na I/35).
 
 screenlines:
-  # D46_NE gateway — přepis auto_gw_D46_NE: auto-generovaný má obs=48041
-  # což je CHYBNÝ SOUČET CSD pro D46 (motorway, 38601) + I/46 (trunk, 9440).
-  # D46_NE je trunk gateway (ref=46), správná CSD je ~13732 (I/46 v Olomouckém kraji).
-  - name: "auto_gw_D46_NE"
-    description: "D46_NE — opravený observed: jen I/46 trunk CSD"
-    type: "radial"
-    links:
-      - { link_id: 12495, direction: 0 }
-      - { link_id: 32337, direction: 0 }
-    observed_aadt_all: 13732
-    observed_aadt_cars: 11528
-
-  # I/46 u Šternberka – CSD oddělená od gateway D46_NE.
-  # Kalibruje severní rameno I/46 (obs ~14k, model dává ~39k).
-  - name: "manual_I46_sternberk"
-    description: "I/46 Šternberk (link 371, bidir trunk)"
-    type: "radial"
-    links:
-      - { link_id: 371, direction: 0 }
-    observed_aadt_all: 13732
-    observed_aadt_cars: 11528
-
-  # I/46 Pavlovická – CSD pro vnitřní úsek I/46 v severní části Olomouce.
-  # Link 4060 je jednosměrný úsek; CSD čísla platí pro celý koridor.
-  - name: "manual_I46_pavlovicka"
-    description: "I/46 Pavlovická (link 4060, one-way trunk)"
-    type: "radial"
-    links:
-      - { link_id: 4060, direction: 0 }
-    observed_aadt_all: 7710
-    observed_aadt_cars: 6822
-
-  # Sil. 446 severozápad – CSD automat vybral link 15664 ale model ho přetěžuje.
-  # Manuální definice dává ODME přesnou observed kotvu.
-  - name: "manual_446_NW"
-    description: "Sil. 446 severozápad (link 15664, bidir secondary)"
-    type: "radial"
-    links:
-      - { link_id: 15664, direction: 0 }
-    observed_aadt_all: 5329
-    observed_aadt_cars: 4545
-
-  # D35_NW gateway — přepis auto_gw_D35_NW: auto-generované linky (46267, 46269)
-  # leží mezi gateway uzly a centroid konektory zóny 68, takže je provoz
-  # kompletně obchází přes zónu.  Linky 46268 a 46270 nesou skutečný tok.
   - name: "auto_gw_D35_NW"
-    description: "D35_NW — opravené linky: 46268+46270 místo 46267+46269"
+    description: "Gateway D35 NW — baseline: modeled_total 0 vs obs. 32417 voz/den (CSD); řez WGS84 + ref D35 motorway"
     type: "radial"
-    links:
-      - { link_id: 46268, direction: 0 }
-      - { link_id: 46270, direction: 0 }
-    observed_aadt_all: 28232
-    observed_aadt_cars: 23802
-
-  # Sil. 635 sever – CSD pro sekundární koridor vedoucí na severozápad.
-  - name: "manual_635_N"
-    description: "Sil. 635 sever (link 94, one-way secondary)"
-    type: "radial"
-    links:
-      - { link_id: 94, direction: 0 }
-    observed_aadt_all: 6238
-    observed_aadt_cars: 5395
+    geometry_wkt: "LINESTRING (17.1738651603 49.6261996357, 17.1715981993 49.6229182982)"
+    filter:
+      link_type: motorway
+      osm_ref_norm: "D35"
+    expected_links: 2
+    observed_aadt_all: 32417.0

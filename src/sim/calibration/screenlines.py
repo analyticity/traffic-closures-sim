@@ -8,6 +8,8 @@ Supports three specification methods:
 from __future__ import annotations
 
 import logging
+import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,9 +20,90 @@ import geopandas as gpd
 import yaml
 
 from sim._metrics import compute_geh
+from sim.calibration.observed import normalize_csd_sil_key
 from sim.calibration.validation import merge_divided_highway_screenline_per_link
 
 logger = logging.getLogger(__name__)
+
+
+def _is_czech_dalnice_ref(ref: str) -> bool:
+    """True if *ref* looks like a Czech motorway designation (D1, D35, …)."""
+    r = (ref or "").strip().upper().replace(" ", "")
+    return bool(re.match(r"^D\d+", r))
+
+
+def _dalnice_gateway_cut_wkt(
+    links_gdf: gpd.GeoDataFrame,
+    bx: float,
+    by: float,
+    ref: str,
+    metric_epsg: int,
+    *,
+    cut_half_len_m: float = 260.0,
+) -> Optional[str]:
+    """Return a WGS84 WKT cut across the nearest motorway segment for a D## *ref*.
+
+    Gateway anchor nodes often sit on a parallel I/## trunk while CSD counts
+    refer to the real dálnice.  The default boundary-perpendicular line then
+    misses ``motorway`` links entirely; this builds a short cut through the
+    closest matching motorway geometry to the boundary point.
+    """
+    import pyproj
+    from shapely.geometry import LineString, Point
+    from shapely.ops import nearest_points, transform as shapely_transform
+
+    if links_gdf is None or links_gdf.empty or links_gdf.crs is None:
+        return None
+    epsg = links_gdf.crs.to_epsg()
+    if epsg is None:
+        return None
+
+    lm = links_gdf if epsg == metric_epsg else links_gdf.to_crs(epsg=metric_epsg)
+    pt = Point(float(bx), float(by))
+
+    cand_idxs: List[int] = []
+    for idx in range(len(lm)):
+        row = lm.iloc[idx]
+        g = row.geometry
+        if g is None or g.is_empty:
+            continue
+        if str(row.get("link_type") or "") != "motorway":
+            continue
+        if not _match_attr_filter(row, {"osm_ref_norm": ref}):
+            continue
+        cand_idxs.append(idx)
+
+    if not cand_idxs:
+        return None
+
+    best_idx = min(cand_idxs, key=lambda i: float(lm.iloc[i].geometry.distance(pt)))
+    geom = lm.iloc[best_idx].geometry
+    nr = nearest_points(pt, geom)[1]
+
+    g_len = float(geom.length)
+    if not math.isfinite(g_len) or g_len <= 0:
+        return None
+    s = float(geom.project(nr))
+    ds = min(8.0, g_len / 4.0)
+    p0 = geom.interpolate(max(0.0, s - ds))
+    p1 = geom.interpolate(min(g_len, s + ds))
+    dx, dy = float(p1.x - p0.x), float(p1.y - p0.y)
+    hlen = math.hypot(dx, dy) or 1.0
+    px, py = -dy / hlen, dx / hlen
+    L = float(cut_half_len_m)
+    line_m = LineString([
+        (float(nr.x) - px * L, float(nr.y) - py * L),
+        (float(nr.x) + px * L, float(nr.y) + py * L),
+    ])
+
+    inv = pyproj.Transformer.from_crs(
+        f"EPSG:{metric_epsg}", "EPSG:4326", always_xy=True,
+    )
+    line_wgs = shapely_transform(inv.transform, line_m)
+    coords = ", ".join(
+        f"{float(x):.10f} {float(y):.10f}" for x, y in line_wgs.coords
+    )
+    return f"LINESTRING ({coords})"
 
 
 # --- Data structures ---
@@ -739,6 +822,12 @@ def auto_generate_screenlines(
     if not bool(auto_cfg.get("enabled", False)):
         return []
 
+    match_cfg = cfg.get("calibration", {}).get("matching") or {}
+    _raw_excl = match_cfg.get("csd_validation_exclude_sil") or []
+    exclude_sil_norm = {
+        normalize_csd_sil_key(x) for x in _raw_excl if str(x).strip() != ""
+    }
+
     crs_epsg = int(cfg.get("crs_epsg", 5514))
     zoning_out = Path(cfg.get("zoning", {}).get("output_dir", "outputs/baseline/zones"))
 
@@ -865,7 +954,11 @@ def auto_generate_screenlines(
                                 # retry with numeric-only refs. Czech road refs
                                 # like "D55" (motorway) and "55" (trunk I/55) are
                                 # the same corridor but different classifications.
-                                if adj.empty:
+                                #
+                                # Do **not** apply this fallback for D## dálnice:
+                                # gateway anchors often sit on parallel I/## trunk
+                                # spurs while CSD counts refer to the motorway.
+                                if adj.empty and (not _is_czech_dalnice_ref(ref)):
                                     import re as _re
                                     numeric_parts = {
                                         _re.sub(r"^[a-z]+", "", p)
@@ -971,6 +1064,30 @@ def auto_generate_screenlines(
                     if not keep_single:
                         explicit_links = []
 
+                # Dalnice gateways must not keep explicit links on parallel I/##
+                # trunk connectors: CSD / gateway AADT refers to the motorway.
+                if explicit_links and links_gdf is not None and _is_czech_dalnice_ref(ref):
+                    _lid_idx = links_gdf.set_index("link_id", drop=False)
+                    _bad_explicit = False
+                    for _lid, _ in explicit_links:
+                        if _lid not in _lid_idx.index:
+                            _bad_explicit = True
+                            break
+                        _lr = _lid_idx.loc[_lid]
+                        if str(_lr.get("link_type") or "") != "motorway":
+                            _bad_explicit = True
+                            break
+                        if not _match_attr_filter(_lr, {"osm_ref_norm": ref}):
+                            _bad_explicit = True
+                            break
+                    if _bad_explicit:
+                        logger.info(
+                            "Gateway '%s': explicit links do not sit on motorway "
+                            "for dalnice ref '%s' — using geometry cut instead",
+                            gw_name, ref,
+                        )
+                        explicit_links = []
+
                 # --- CSD observed AADT ------------------------------------
                 obs_all = 0.0
                 obs_cars = 0.0
@@ -1003,9 +1120,29 @@ def auto_generate_screenlines(
                 p2 = transformer.transform(bx + perp_dx, by + perp_dy)
                 wkt = f"LINESTRING({p1[0]:.6f} {p1[1]:.6f}, {p2[0]:.6f} {p2[1]:.6f})"
 
+                if links_gdf is not None and _is_czech_dalnice_ref(ref):
+                    alt_wkt = _dalnice_gateway_cut_wkt(
+                        links_gdf,
+                        bx,
+                        by,
+                        ref,
+                        crs_epsg,
+                    )
+                    if alt_wkt:
+                        wkt = alt_wkt
+                    else:
+                        logger.warning(
+                            "Gateway '%s': could not build motorway cut near "
+                            "boundary for dalnice ref '%s' — using perpendicular "
+                            "fallback (may miss modeled flow)",
+                            gw_name, ref,
+                        )
+
                 attr_filter: Dict[str, str] = {}
                 if ref:
                     attr_filter["osm_ref_norm"] = ref
+                    if _is_czech_dalnice_ref(ref):
+                        attr_filter["link_type"] = "motorway"
 
                 if explicit_links:
                     result.append(ScreenlineDef(
@@ -1365,6 +1502,7 @@ def auto_generate_screenlines(
             n_skipped_no_network = 0
             n_skipped_partial = 0
             n_skipped_gw_dup = 0
+            n_skipped_exclude_sil = 0
             for _, row in major.iterrows():
                 road = str(row["sil"]).strip()
 
@@ -1373,6 +1511,15 @@ def auto_generate_screenlines(
                     road_norm = str(int(road_norm))
                 except ValueError:
                     road_norm = road_norm.lstrip("0") or road_norm
+
+                if exclude_sil_norm and road_norm.lower() in exclude_sil_norm:
+                    n_skipped_exclude_sil += 1
+                    logger.debug(
+                        "CSD screenline auto_csd_%s skipped: sil listed in "
+                        "calibration.matching.csd_validation_exclude_sil",
+                        road_norm,
+                    )
+                    continue
 
                 name = f"auto_csd_{road_norm}"
 
@@ -1410,9 +1557,9 @@ def auto_generate_screenlines(
             logger.info(
                 "Auto-generated %d CSD screenlines (min AADT=%d, "
                 "skipped %d no-network, %d partial-coverage, "
-                "%d gateway-duplicate)",
+                "%d gateway-duplicate, %d exclude_sil)",
                 n_csd, int(csd_min_aadt), n_skipped_no_network,
-                n_skipped_partial, n_skipped_gw_dup,
+                n_skipped_partial, n_skipped_gw_dup, n_skipped_exclude_sil,
             )
 
     return result

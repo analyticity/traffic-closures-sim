@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import geopandas as gpd
 import numpy as np
@@ -249,25 +249,41 @@ def _compute_gateway_modeled_volumes(
     screenlines: list,
     vol_col: str,
     sl_gw_map: Optional[Dict[str, str]] = None,
+    *,
+    corridor_link_specs: Optional[Dict[str, List[Tuple[int, int]]]] = None,
 ) -> Dict[str, float]:
-    """Sum modeled volume on each screenline and map to gateway names."""
+    """Sum modeled volume on each screenline and map to gateway names.
+
+    Optional *corridor_link_specs* overrides modeled totals for selected gateways
+    by summing assignment volumes on explicit ``(link_id, direction)`` tuples
+    (direction ``0`` = screenline-style total column, ``1`` / ``-1`` = AB / BA).
+    """
     from sim.calibration.screenlines import _get_link_volume
 
     result: Dict[str, float] = {}
-    if not screenlines or not vol_col:
+    if not vol_col:
         return result
 
     if sl_gw_map is None:
         sl_gw_map = _build_screenline_gateway_map(screenlines)
 
-    for sl in screenlines:
-        gw = sl_gw_map.get(sl.name)
-        if not gw or not sl.links:
-            continue
+    if screenlines:
+        for sl in screenlines:
+            gw = sl_gw_map.get(sl.name)
+            if not gw or not sl.links:
+                continue
 
+            total = 0.0
+            for link_id, direction in sl.links:
+                total += _get_link_volume(vol_df, link_id, direction, vol_col)
+            result[gw] = total
+
+    for gw, pairs in (corridor_link_specs or {}).items():
+        if not pairs:
+            continue
         total = 0.0
-        for link_id, direction in sl.links:
-            total += _get_link_volume(vol_df, link_id, direction, vol_col)
-        result[gw] = total
+        for link_id, direction in pairs:
+            total += _get_link_volume(vol_df, int(link_id), int(direction), vol_col)
+        result[str(gw).strip()] = total
 
     return result

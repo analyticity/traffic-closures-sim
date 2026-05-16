@@ -30,7 +30,10 @@ from sim.zoning.diagnostics import (
 from sim.zoning.gateways import (
     auto_discover_boundary_roads,
     build_external_gateway_zones,
+    resolve_blacklist,
     resolve_whitelist,
+    road_blacklist_tokens,
+    spec_matches_road_blacklist,
     select_gateway_target_nodes,
 )
 from sim.zoning.map_export import export_map_png
@@ -42,15 +45,25 @@ logger = logging.getLogger(__name__)
 # Population helpers
 # ---------------------------------------------------------------------------
 
-def _employment_needs_remap(emp_path: Path) -> bool:
-    """Return True when zone_employment.parquet is stale (only zone_id=0)."""
+def _employment_needs_remap(emp_path: Path, zones_geojson: Optional[Path] = None) -> bool:
+    """Return True when zone_employment.parquet is missing, stale, or out of sync with zones."""
     try:
         df = pd.read_parquet(emp_path)
         if df.empty or "zone_id" not in df.columns:
             return True
-        return bool((df["zone_id"] == 0).all())
+        if bool((df["zone_id"] == 0).all()):
+            return True
+        if "match_engine_version" not in df.columns or int(df["match_engine_version"].min()) < 2:
+            return True
+        if zones_geojson is not None and zones_geojson.exists():
+            z = gpd.read_file(zones_geojson)
+            zids = {int(x) for x in z["zone_id"].astype(int).tolist()}
+            eids = {int(x) for x in df["zone_id"].astype(int).tolist()}
+            if zids != eids:
+                return True
     except Exception:
         return True
+    return False
 
 
 def _population_needs_remap(pop_path: Path) -> bool:
@@ -171,6 +184,8 @@ def build_zones_and_connectors(
 
         if bool(ext_cfg.get("enabled", False)):
             whitelist_specs = resolve_whitelist(ext_cfg)
+            blacklist_specs = resolve_blacklist(ext_cfg)
+            blacklist_tokens = road_blacklist_tokens(blacklist_specs)
 
             auto_cfg = ext_cfg.get("auto_discover") or {}
             whitelist_empty = len(whitelist_specs) == 0
@@ -202,6 +217,7 @@ def build_zones_and_connectors(
                     boundary_buffer_m=float(ext_cfg.get("boundary_buffer_m", 1000.0)) * 1.5,
                     min_link_types=all_auto_types,
                     min_lanes=int(auto_cfg.get("min_lanes", 1)),
+                    blacklist_tokens=blacklist_tokens or None,
                 )
                 max_auto = int(auto_cfg.get("max_gateways", default_max))
                 discovered = discovered[:max_auto]
@@ -215,6 +231,20 @@ def build_zones_and_connectors(
                         refs_str,
                     )
                     whitelist_specs.extend(discovered)
+
+            if blacklist_tokens:
+                before = len(whitelist_specs)
+                whitelist_specs = [
+                    s for s in whitelist_specs
+                    if not spec_matches_road_blacklist(s, blacklist_tokens)
+                ]
+                n_skipped = before - len(whitelist_specs)
+                if n_skipped:
+                    logger.info(
+                        "External gateways blacklist skipped %d road spec(s) (%d remaining)",
+                        n_skipped,
+                        len(whitelist_specs),
+                    )
 
             _default_allowed = (
                 all_auto_types
@@ -395,7 +425,7 @@ def build_zones_and_connectors(
         emp_path = Path(cfg.get("datasets", {}).get("cache_dir", "data/cache")) / "zone_employment.parquet"
         _emp_needs_regen = (
             not emp_path.exists()
-            or _employment_needs_remap(emp_path)
+            or _employment_needs_remap(emp_path, output_dir / "zones.geojson")
         )
         if _emp_needs_regen:
             reason = "missing" if not emp_path.exists() else "stale zone_id=0"

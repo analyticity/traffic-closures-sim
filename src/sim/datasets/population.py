@@ -23,6 +23,7 @@ from sim.datasets.utils import (
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CZ_SUFFIXES = [
+    "-mesto", "-ves",
     " u brna", " u prahy", " u mostu", " u olomouce", " u ostravy",
     " nad labem", " nad svitavou", " nad sazavou", " nad vltavou",
     " nad orlici", " nad moravou", " nad jihlavou", " nad luznici",
@@ -185,14 +186,24 @@ def preprocess_population_sldb2021(
         if matched:
             continue
 
-        close = difflib.get_close_matches(znorm, list(obec_norm.keys()), n=1, cutoff=0.7)
+        close = difflib.get_close_matches(znorm, list(obec_norm.keys()), n=1, cutoff=0.82)
         if close:
             original = obec_norm[close[0]]
-            result_rows.append({"zone_id": zid, "zone_name": zname, "population": obec_pop[original], "match": f"fuzzy:{original}"})
-        else:
-            all_pops = [v for v in {**mc_pop, **obec_pop}.values() if v > 0]
-            avg = int(sorted(all_pops)[len(all_pops) // 2]) if all_pops else 1000
-            result_rows.append({"zone_id": zid, "zone_name": zname, "population": avg, "match": "default_median"})
+            candidate_pop = obec_pop[original]
+            ratio = difflib.SequenceMatcher(None, znorm, close[0]).ratio()
+            if ratio < 0.95 and candidate_pop > 5000:
+                logger.warning(
+                    "Fuzzy match rejected for zone '%s' -> '%s' (pop=%d, ratio=%.3f): "
+                    "population too large for imprecise match",
+                    zname, original, candidate_pop, ratio,
+                )
+            else:
+                result_rows.append({"zone_id": zid, "zone_name": zname, "population": candidate_pop, "match": f"fuzzy:{original}"})
+                continue
+
+        all_pops = [v for v in {**mc_pop, **obec_pop}.values() if v > 0]
+        avg = int(sorted(all_pops)[len(all_pops) // 2]) if all_pops else 1000
+        result_rows.append({"zone_id": zid, "zone_name": zname, "population": avg, "match": "default_median"})
 
     result = coerce_object_columns_for_parquet(pd.DataFrame(result_rows))
     ensure_dir(out_parquet.parent)

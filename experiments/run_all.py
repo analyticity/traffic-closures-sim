@@ -38,6 +38,7 @@ ALL_EXPERIMENTS = [
     "exp08_sensitivity",
     "exp09_temporal_profiles",
     "exp10_quality_score_sensitivity",
+    "exp11_waze_speeds",
 ]
 
 

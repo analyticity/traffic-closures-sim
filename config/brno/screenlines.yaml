@@ -1,67 +1,56 @@
-# Ruční opravy gateway screenlines (stejný název jako auto_gw_* = přepíše auto-generovaný záznam).
+# Screenlines pro Brno — doplňují auto-generované řezy (viz load_screenlines_with_auto).
+# Manuální položky se stejným `name` jako auto_* přepíší auto definici.
 #
-# Pozorované hodnoty: CSD / gateway agregát z posledního běhu (outputs/…/zones + calibration).
-# Po rebuildu sítě zkontrolujte link_id vůči project/brno_aeq.
-#
-# direction: 0 = součet obou směrů na obousměrném úseku
+# Tři lokální řezy: WGS84 kolmice + filter (bez link_id — stabilnější po reimportu OSM).
 
 screenlines:
-  # Šlapanice Nový Dvůr / sil. 386 (merge 384_NW|386_NW v gateway_diagnostics) — auto bralo mrtvé segmenty (111555).
-  - name: "auto_gw_386_NW"
-    description: "386 NW — jen úsek se skutečným tocením (sil. 386 → uzel brány)"
-    type: "radial"
-    links:
-      - { link_id: 111553, direction: 0 }
-    observed_aadt_all: 20469
-    observed_aadt_cars: 16784
+  - name: "manual_brno_antonin_prochazky_tertiary"
+    description: "Antonína Procházky — III/15272 tertiary; pozorované 4 674 voz/den"
+    type: radial
+    geometry_wkt: "LINESTRING (16.5617027465 49.1940792124, 16.5611579466 49.1933528994)"
+    filter:
+      link_type: tertiary
+      osm_ref_norm: "15272"
+    expected_links: 1
+    observed_aadt_all: 4674.0
 
-  # I/52 jih — auto už mělo správné linky (8600, 22128); explicitně pro stabilitu po mergi 52_S|7_S.
-  - name: "auto_gw_52_S"
-    description: "I/52 S — výstup ze silnice přes uzly brány"
-    type: "radial"
-    links:
-      - { link_id: 8600, direction: 0 }
-      - { link_id: 22128, direction: 0 }
-    observed_aadt_all: 44741
-    observed_aadt_cars: 36687
+  - name: "manual_brno_tertiary_37915"
+    description: "III/37915 (dříve bez názvu v UI) — tertiary; pozorované 3 945 voz/den"
+    type: radial
+    geometry_wkt: "LINESTRING (16.6275069611 49.2426175081, 16.6263091449 49.2424176012)"
+    filter:
+      link_type: tertiary
+      osm_ref_norm: "37915"
+    expected_links: 1
+    observed_aadt_all: 3945.0
 
-  # Sil. 418 SE — auto bralo 2380 / 31132 (PCE=0); aktivní řez je 70123 ↔ 229318.
-  - name: "auto_gw_418_SE"
-    description: "418 SE — řez odkud skutečně teče provoz do brány"
-    type: "radial"
-    links:
-      - { link_id: 31131, direction: 0 }
-    observed_aadt_all: 2565
-    observed_aadt_cars: 2103
+  - name: "manual_brno_selska_secondary"
+    description: "Selská — II/374 secondary; pozorované 6 598 voz/den"
+    type: radial
+    geometry_wkt: "LINESTRING (16.6445737487 49.2151409293, 16.6433418579 49.2152021936)"
+    filter:
+      link_type: secondary
+      osm_ref_norm: "374"
+    expected_links: 1
+    observed_aadt_all: 6598.0
 
-  # --- Manuální interní CSD screenlines (koridor Obřany–Brněnská) -----------
+  # Přepis auto_csd_*: CSD průměr sv z validace; řez kolmo k nejvytíženějšímu segmentu v síti.
+  - name: "auto_csd_640"
+    description: "II/640 secondary — CSD mean sv ≈29 301 voz/den (validace); ruční kolmice místo auto (široké párování)"
+    type: radial
+    geometry_wkt: "LINESTRING (16.5945026812 49.2058647109, 16.5934291776 49.2053044372)"
+    filter:
+      link_type: secondary
+      osm_ref_norm: "640"
+    expected_links: 1
+    observed_aadt_all: 29301.0
 
-  # 380 Brněnská — CSD ukazuje 8k, model dává 20k (2.5× over).
-  # Hlavní přívodní koridor ze severu který se přelévá do Obřanské.
-  - name: "manual_380_brnenska"
-    description: "Sil. 380 Brněnská (link 2388, bidir secondary)"
-    type: "radial"
-    links:
-      - { link_id: 2388, direction: 0 }
-    observed_aadt_all: 8034
-    observed_aadt_cars: 6598
-
-  # 383 Selská — CSD ukazuje 7.6k, model dává 15k (2× over).
-  # Kontrolní bod na koridoru 383 jižně od rozbočky Obřanská/Selská.
-  - name: "manual_383_selska"
-    description: "Sil. 383 Selská (link 69886, bidir secondary)"
-    type: "radial"
-    links:
-      - { link_id: 69886, direction: 0 }
-    observed_aadt_all: 7647
-    observed_aadt_cars: 6598
-
-  # 383 Havlíčkova — CSD ukazuje 5.2k, model dává 10k (2× over).
-  # Větev 383 směrem do centra města.
-  - name: "manual_383_havlickova"
-    description: "Sil. 383 Havlíčkova (link 27742, bidir secondary)"
-    type: "radial"
-    links:
-      - { link_id: 27742, direction: 0 }
-    observed_aadt_all: 5156
-    observed_aadt_cars: 4228
+  - name: "auto_csd_50"
+    description: "I/50 trunk — CSD mean sv ≈27 624 voz/den (validace); ruční kolmice (auto over-agg)"
+    type: radial
+    geometry_wkt: "LINESTRING (16.6538768078 49.1891762232, 16.6531206684 49.1884258629)"
+    filter:
+      link_type: trunk
+      osm_ref_norm: "50"
+    expected_links: 1
+    observed_aadt_all: 27624.0

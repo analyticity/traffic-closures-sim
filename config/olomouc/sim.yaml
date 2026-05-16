@@ -27,7 +27,6 @@ zoning:
       admin_level: "9"
   external_gateways:
     enabled: true
-    whitelist: ["D35", "D46", "I/55", "I/46", "I/35", "I/150"]
 
 demand:
   segments:

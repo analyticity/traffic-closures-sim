@@ -24,7 +24,7 @@ Developed as part of a diploma thesis at Brno University of Technology, Faculty 
 │   ├── brno/                 #   Brno (default)
 │   ├── most/                 #   Most
 │   └── olomouc/              #   Olomouc
-├── experiments/              # Experiment drivers (exp01–exp10)
+├── experiments/              # Experiment drivers (exp01–exp11)
 ├── tests/                    # Unit & integration tests
 ├── scripts/                  # Utility scripts (config generator, audit, etc.)
 ├── scenarios/                # Example scenario YAML definitions
@@ -118,6 +118,28 @@ python run.py --config $CFG serve
 
 Steps can be run independently once their prerequisites exist. The runner validates prerequisites and warns about stale outputs before execution.
 
+### Free-flow speed: posted vs practical
+
+Free-flow in the SQLite / exported links is built in two conceptual layers:
+
+1. **Posted speed** — what you treat as the legal / nominal limit before urban friction.
+   Set `normalization.posted_speed.source` in `config/<city>/network_normalization.yaml`:
+
+   - `import_then_fill` (default): keep speeds from the OSM import, fill only missing values from `defaults.speed_by_link_type`.
+   - `osm_maxspeed_then_fill`: overwrite with the **median OSM `maxspeed`** joined at enrichment time (`osm_maxspeed_kmh` column; run `build-network` / enrichment after upgrading).
+   - `link_type_defaults_only`: replace posted speeds entirely from `defaults.speed_by_link_type` (single lookup table).
+
+2. **Practical adjustment** — optional second step on top of posted speeds.
+   `normalization.practical_speed.mode`:
+
+   - `hcm`: `posted * base_factor - intersection_penalty_per_km * ipkm` (optional `max_ipkm` cap).
+   - `factor`: single multiplier `posted * speed_factor` (no intersection density term).
+   - Disable with `enabled: false` or `mode: off`.
+
+The **minimum speed clamp** is only `normalization.thresholds.min_speed_kmh` (one global floor). `practical_speed.min_speed_kmh` is ignored if present.
+
+**Config hygiene:** keep baseline city speed tuning under `normalization.*`. Use `experiment_profiles` only for deliberate A/B scenarios — avoid duplicating `practical_speed` in both places unless you intend to override for a specific profile.
+
 ### Pipeline Steps
 
 | # | Step | Description |
@@ -178,12 +200,18 @@ docker run --network host simulation-brno
 
 ## Experiments
 
-Ten experiment drivers (`experiments/exp01`–`exp10`) cover baseline validation, free-flow speed comparison, congestion patterns, closure scenarios, geometry matching, event-link validation, accident correlation, sensitivity analysis, temporal profiles, and quality-score filtering.
+Experiment drivers (`experiments/exp01`–`exp11`) cover baseline validation, congestion patterns, closure scenarios, geometry matching, event-link validation, accident correlation, sensitivity analysis, temporal profiles, quality-score filtering, and **model vs Waze free-flow speeds** (`exp11_waze_speeds`, needs PostgreSQL jams from `fetch-data`).
 
 Run all experiments for a city:
 
 ```bash
 python experiments/run_all.py --config config/brno/sim.yaml
+```
+
+Waze speed comparison only (after `assign` and `fetch-data`):
+
+```bash
+python experiments/exp11_waze_speeds.py --config config/brno/sim.yaml
 ```
 
 ## Tests

@@ -17,6 +17,7 @@ from sim.calibration import (
     _classify_csd_road,
     load_csd_as_link_counts,
     match_csd_to_links,
+    place_tokens_from_osm_place_name,
     split_csd_for_calibration,
 )
 
@@ -437,6 +438,48 @@ class TestLoadCsdAsLinkCounts:
         assert result.empty
 
 
+class TestPlaceTokensFromOsmPlaceName:
+    def test_brno_czechia(self):
+        assert place_tokens_from_osm_place_name("Brno, Czechia") == ["brno"]
+
+    def test_empty(self):
+        assert place_tokens_from_osm_place_name("") == []
+
+
+class TestMatchCsdPlaceFilter:
+    def test_place_filter_narrows_d1_mean(self):
+        """With place tokens, only 'Brno' CSD rows contribute to the observed mean."""
+        csd = _make_csd()
+        links = _make_links_with_volumes()
+        r_all = match_csd_to_links(csd, links, place_filter_tokens=None)
+        r_brno = match_csd_to_links(csd, links, place_filter_tokens=["brno"])
+        d1_all = r_all[r_all["road"] == "D1"].iloc[0]
+        d1_brno = r_brno[r_brno["road"] == "D1"].iloc[0]
+        assert d1_brno["csd_sections"] < d1_all["csd_sections_all"]
+        assert d1_brno["csd_mean_sv"] != d1_all["csd_mean_sv"]
+
+
+class TestMatchCsdDelkaWeighting:
+    def test_delka_weighting_changes_mean(self):
+        csd = pd.DataFrame({
+            "sil": ["3792", "3792"],
+            "sv": [1000.0, 3000.0],
+            "o": [900.0, 2700.0],
+            "tv": [100.0, 300.0],
+            "delka": [9.0, 1.0],
+            "nazev_mesta": ["", ""],
+        })
+        links = gpd.GeoDataFrame([
+            {"link_id": 7, "osm_ref": "3792", "link_type": "tertiary",
+             "distance": 2000, "total_vehicles_tot": 1500,
+             "geometry": LineString([(0, 5), (1, 5)])},
+        ], geometry="geometry", crs="EPSG:5514")
+        r = match_csd_to_links(csd, links)
+        row = r[r["road"] == "3792"].iloc[0]
+        # (1000*9 + 3000*1) / 10 = 1200
+        assert row["csd_mean_sv"] == 1200.0
+
+
 # ---------------------------------------------------------------------------
 # match_csd_to_links
 # ---------------------------------------------------------------------------
@@ -506,6 +549,19 @@ class TestMatchCsdToLinks:
         if not result.empty:
             assert "geh" in result.columns
             assert (result["geh"] >= 0).all()
+
+    def test_exclude_sil_skips_roads(self):
+        """Configured ``sil`` values must not appear in per-road output."""
+        csd = _make_csd()
+        links = _make_links_with_volumes()
+        full = match_csd_to_links(csd, links)
+        filtered = match_csd_to_links(csd, links, exclude_sil=["43", "D1"])
+        assert not full.empty
+        assert "43" in set(full["road"].astype(str))
+        assert "D1" in set(full["road"].astype(str))
+        roads = set(filtered["road"].astype(str))
+        assert "43" not in roads
+        assert "D1" not in roads
 
     def test_no_volume_columns_returns_empty(self):
         """Links without any *_tot columns should return empty."""

@@ -1,9 +1,9 @@
-"""Boundary-gateway discovery, whitelist matching, merging, and external-zone creation."""
+"""Boundary-gateway discovery, whitelist/blacklist matching, merging, and external-zone creation."""
 from __future__ import annotations
 
 import logging
 import unicodedata
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import geopandas as gpd
 import numpy as np
@@ -60,9 +60,30 @@ def compass8(angle: float) -> str:
 # Whitelist resolution
 # ---------------------------------------------------------------------------
 
+def _normalize_gateway_ref_list(raw: Any) -> List[Any]:
+    """Coerce ``whitelist`` / ``blacklist`` YAML into a list of entries.
+
+    Accepts list/tuple, a single string/int ref, or a dict spec. A bare string
+    must **not** be iterated character-by-character (YAML ``blacklist: "437"``
+    would otherwise produce tokens ``4``, ``3``, ``7``).
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, str):
+        s = raw.strip()
+        return [s] if s else []
+    if isinstance(raw, (list, tuple)):
+        return list(raw)
+    if isinstance(raw, (int, float)):
+        return [raw]
+    return []
+
+
 def resolve_whitelist(ext_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Parse the ``external_gateways.whitelist`` config section into spec dicts."""
-    raw = ext_cfg.get("whitelist") or []
+    raw = _normalize_gateway_ref_list(ext_cfg.get("whitelist"))
     results: List[Dict[str, Any]] = []
     for item in raw:
         if isinstance(item, dict):
@@ -91,6 +112,72 @@ def resolve_whitelist(ext_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "slug": slug_token(s),
             })
     return results
+
+
+def road_ref_token_variants(raw_token: str, norm_token: str) -> set[str]:
+    """Expand a road ref into normalized tokens (incl. I/D ↔ numeric variants) for matching."""
+    vals: set[str] = set()
+    for v in (raw_token, norm_token):
+        t = norm_text(v)
+        if t:
+            vals.add(t)
+            if t.startswith("I") and len(t) > 1 and t[1:].isdigit():
+                num = t[1:]
+                vals.add(num)
+                vals.add("D" + num)
+            elif t.startswith("D") and len(t) > 1 and t[1:].isdigit():
+                num = t[1:]
+                vals.add(num)
+                vals.add("I" + num)
+    return vals
+
+
+def resolve_blacklist(ext_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Parse the ``external_gateways.blacklist`` config section into spec dicts (same shape as whitelist entries, without anchors)."""
+    raw = _normalize_gateway_ref_list(ext_cfg.get("blacklist"))
+    results: List[Dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            ref = str(item.get("ref", "")).strip()
+            if not ref:
+                continue
+            results.append({
+                "raw": ref,
+                "norm": norm_text(ref),
+                "slug": slug_token(ref),
+            })
+        else:
+            s = str(item).strip()
+            if not s:
+                continue
+            results.append({
+                "raw": s,
+                "norm": norm_text(s),
+                "slug": slug_token(s),
+            })
+    return results
+
+
+def road_blacklist_tokens(blacklist_specs: List[Dict[str, Any]]) -> set[str]:
+    """Union of all ref tokens derived from blacklist specs (for auto-discovery and spec filtering)."""
+    out: set[str] = set()
+    for b in blacklist_specs:
+        raw = str(b.get("raw", "")).strip()
+        norm = str(b.get("norm", "")).strip()
+        if not raw and not norm:
+            continue
+        if not norm:
+            norm = norm_text(raw)
+        out.update(road_ref_token_variants(raw, norm))
+    return out
+
+
+def spec_matches_road_blacklist(spec: Dict[str, Any], blacklist_tokens: set[str]) -> bool:
+    """True if a whitelist / auto-discovered spec should not create external gateways."""
+    if not blacklist_tokens:
+        return False
+    spec_tokens = road_ref_token_variants(str(spec.get("raw", "")), str(spec.get("norm", "")))
+    return bool(spec_tokens & blacklist_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +232,7 @@ def auto_discover_boundary_roads(
     boundary_buffer_m: float = 1000.0,
     min_link_types: Optional[List[str]] = None,
     min_lanes: int = 1,
+    blacklist_tokens: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Find named roads crossing the model boundary not already in the whitelist."""
     if min_link_types is None:
@@ -219,6 +307,8 @@ def auto_discover_boundary_roads(
     for road_norm, link_counts in per_road.items():
         if road_norm in existing_norms:
             continue
+        if blacklist_tokens and road_ref_token_variants(road_norm, road_norm) & blacklist_tokens:
+            continue
         if per_road_lanes[road_norm] < min_lanes:
             continue
         results.append({
@@ -258,21 +348,6 @@ def select_gateway_target_nodes(
 
     Returns ``(gateway_targets, gateway_meta, debug_corridors, debug_points)``.
     """
-    def _token_variants(raw_token: str, norm_token: str) -> set[str]:
-        vals = set()
-        for v in (raw_token, norm_token):
-            t = norm_text(v)
-            if t:
-                vals.add(t)
-                if t.startswith("I") and t[1:].isdigit():
-                    num = t[1:]
-                    vals.add(num)
-                    vals.add("D" + num)
-                elif t.startswith("D") and t[1:].isdigit():
-                    num = t[1:]
-                    vals.add(num)
-                    vals.add("I" + num)
-        return vals
 
     def _match_ref_variants(row: pd.Series, variants: set[str]) -> int:
         for col in ("osm_ref_norm", "osm_ref", "ref"):
@@ -371,7 +446,7 @@ def select_gateway_target_nodes(
         token_norm = spec["norm"]
         token_slug = spec["slug"]
 
-        ref_variants = _token_variants(token_raw, token_norm)
+        ref_variants = road_ref_token_variants(token_raw, token_norm)
 
         logger.info("Discover whitelist token %s", token_raw)
         logger.debug("ref variants: %s", sorted(ref_variants))

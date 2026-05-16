@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import geopandas as gpd
 import numpy as np
@@ -43,6 +44,7 @@ from sim.calibration.observed import (
     load_csd_as_link_counts,
     load_csd_unfiltered,
     load_pentlogram,
+    normalize_csd_sil_key,
     split_csd_for_calibration,
     validate_geometries_or_fail,
 )
@@ -57,6 +59,110 @@ logger = logging.getLogger(__name__)
 # one-way segments on secondary/tertiary refs sharing the same osm_ref.
 _DH_ROAD_CLASSES_FOR_CSD = frozenset({"motorway", "trunk"})
 _DH_MIN_ONEWAY_SHARE = 0.5
+
+# CSD per-road coverage: compare modeled link-km to CSD subset km used for the
+# observed aggregate.  ``partial_coverage`` / ``minimal_coverage`` gate the
+# holdout summary so apples-to-oranges road averages do not dominate R².
+_CSD_PARTIAL_COVERAGE_LT = 0.7
+_CSD_MINIMAL_COVERAGE_LT = 0.3
+_CSD_OVER_AGGREGATED_COVERAGE_GT = 2.0
+
+_CSD_PLACE_FILTER_STOPWORDS = frozenset({
+    "the", "and", "czechia", "czech", "republic", "republica", "of", "metro",
+    "region", "area", "kraj", "ceska", "česká", "city", "town", "village",
+    "okres", "district", "mesto", "město", "stat", "state", "country",
+    "republika",
+})
+
+
+def place_tokens_from_osm_place_name(place_name: str) -> List[str]:
+    """Lowercase tokens from ``osm.place_name`` for CSD text-based subsetting.
+
+    Used to keep only CSD sections whose ``nazev_mesta`` / ``zacatek_useku`` /
+    ``konec_useku`` / ``usek`` fields mention the modeled city, when CSD rows
+    lack coordinates.  Short words and geographic noise words are dropped.
+    """
+    s = str(place_name or "").strip().lower()
+    if not s:
+        return []
+    raw = re.findall(r"[a-záčďéěíňóřšťúůýž0-9]+", s, flags=re.IGNORECASE)
+    out: List[str] = []
+    for t in raw:
+        tl = str(t).lower()
+        if len(tl) < 3 or tl in _CSD_PLACE_FILTER_STOPWORDS:
+            continue
+        if tl not in out:
+            out.append(tl)
+    return out
+
+
+def _csd_row_place_text(row: pd.Series) -> str:
+    parts: List[str] = []
+    for col in ("nazev_mesta", "zacatek_useku", "konec_useku", "usek"):
+        if col not in row.index:
+            continue
+        v = row.get(col)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            continue
+        s = str(v).strip()
+        if s and s.lower() not in ("<na>", "nan", "none"):
+            parts.append(s)
+    return " ".join(parts).lower()
+
+
+def _filter_csd_rows_by_place_hints(
+    csd_sub: pd.DataFrame,
+    tokens: List[str],
+) -> pd.DataFrame:
+    """Keep CSD rows whose free-text fields match any *tokens*.
+
+    If filtering would remove every row, returns *csd_sub* unchanged so models
+    without usable place hints still produce a road-level aggregate.
+    """
+    if csd_sub.empty or not tokens:
+        return csd_sub
+    tok_set = [t.lower() for t in tokens if t]
+    if not tok_set:
+        return csd_sub
+
+    def _match(idx: Any) -> bool:
+        row = csd_sub.loc[idx]
+        blob = _csd_row_place_text(row)
+        return any(t in blob for t in tok_set)
+
+    mask = pd.Series([_match(i) for i in csd_sub.index], index=csd_sub.index, dtype=bool)
+    filt = csd_sub[mask]
+    if filt.empty:
+        return csd_sub
+    return filt
+
+
+def _csd_section_weights_km(csd_df: pd.DataFrame) -> pd.Series:
+    """Per-row weights (km) for length-weighted CSD section means.
+
+    Uses ``delka`` when present; otherwise each section counts as 1.0 km so
+    unweighted simple means match legacy behaviour in unit tests.
+    """
+    if csd_df.empty:
+        return pd.Series(dtype=float)
+    if "delka" in csd_df.columns:
+        w = pd.to_numeric(csd_df["delka"], errors="coerce").fillna(0.0).astype(float)
+        w = w.clip(lower=0.0)
+        w = w.mask(w <= 0.0, 1.0)
+        return w
+    return pd.Series(1.0, index=csd_df.index, dtype=float)
+
+
+def _length_weighted_csd_mean(csd_df: pd.DataFrame, col: str) -> float:
+    """Length-weighted mean of *col* using ``delka`` (or 1.0/row)."""
+    if csd_df.empty or col not in csd_df.columns:
+        return 0.0
+    vals = pd.to_numeric(csd_df[col], errors="coerce").fillna(0.0).astype(float)
+    w = _csd_section_weights_km(csd_df)
+    wsum = float(w.sum())
+    if wsum <= 0.0:
+        return float(vals.mean()) if len(vals) else 0.0
+    return float((vals * w).sum() / wsum)
 
 
 def _base_divided_highway_link_type(link_type: Any) -> Optional[str]:
@@ -360,13 +466,27 @@ def match_csd_to_links(
     links_gdf: gpd.GeoDataFrame,
     *,
     csd_full: Optional[pd.DataFrame] = None,
+    place_filter_tokens: Optional[List[str]] = None,
+    exclude_sil: Optional[Iterable[str]] = None,
 ) -> pd.DataFrame:
     """Per-road matching via ``osm_ref`` ↔ CSD ``sil``.
 
     For each CSD road number (e.g. D1, 52, 152), finds all model links
     whose ``osm_ref`` contains that road number (splitting composite
     refs like ``"D1;50"`` on ``";"``) and computes a length-weighted
-    mean model volume, compared against the CSD section-averaged AADT.
+    mean model volume, compared against a **length-weighted** CSD AADT
+    aggregate on a **geographically consistent** CSD subset.
+
+    CSD rows rarely carry coordinates; when *place_filter_tokens* is set
+    (typically from ``osm.place_name``), only sections whose
+    ``nazev_mesta`` / ``zacatek_useku`` / ``konec_useku`` / ``usek`` text
+    mentions a token are used for the observed mean.  If that would remove
+    every row for a road, the filter is relaxed back to all sections in the
+    validation slice for that road.
+
+    Section weights use ``delka`` (km) when present; otherwise each section
+    counts as 1.0 km so unit tests without ``delka`` behave like the legacy
+    simple mean.
 
     Links with near-zero volume (< 100 veh/day) are excluded from the
     length-weighted mean to avoid dilution by boundary artifacts, except for
@@ -374,13 +494,23 @@ def match_csd_to_links(
     one-way share >= 50%), where zero-flow carriageways are kept in the mean.
     Link types are filtered to be compatible with the CSD road class.
 
-    *csd_full* (optional): pre-split full CSD dataset used for accurate
-    road-length coverage estimation.  When provided, ``delka`` sums come
-    from the full dataset rather than the (potentially subsetted) *csd*.
+    *csd_full* (optional): pre-split full CSD dataset used for **full-road**
+    kilometrage diagnostics (``csd_road_km_full``).  The observed aggregate
+    and ``coverage_ratio`` denominator use ``csd_subset_km`` from the
+    sections feeding ``csd_mean_sv``.
+
+    *exclude_sil* (optional): CSD road numbers (``sil``) to skip entirely —
+    no row in the returned frame and they do not enter the holdout summary.
+    Values are normalized the same way as ``auto_csd_*`` keys (see
+    :func:`sim.calibration.observed.normalize_csd_sil_key`).
     """
     csd = csd.copy()
     if "sil" not in csd.columns or "osm_ref" not in links_gdf.columns:
         return pd.DataFrame()
+
+    exclude_norm = {
+        normalize_csd_sil_key(x) for x in (exclude_sil or []) if str(x).strip() != ""
+    }
 
     csd["sil"] = csd["sil"].astype(str)
     for col in ("o", "sv", "tv"):
@@ -389,6 +519,9 @@ def match_csd_to_links(
 
     csd["road_class"] = csd["sil"].apply(_classify_csd_road)
     csd_sil = csd["sil"].str.strip()
+
+    tokens = [t for t in (place_filter_tokens or []) if t]
+    csd_source = csd_full if csd_full is not None else csd
 
     vol_cols = sorted(
         c for c in links_gdf.columns
@@ -421,6 +554,8 @@ def match_csd_to_links(
     csd_roads = csd_sil.unique()
 
     for road in csd_roads:
+        if exclude_norm and normalize_csd_sil_key(road) in exclude_norm:
+            continue
         csd_sub = csd[csd_sil == road]
         if csd_sub.empty:
             continue
@@ -430,9 +565,13 @@ def match_csd_to_links(
             continue
         model_sub = links_work.loc[matching_indices.unique()]
 
-        csd_mean_sv = float(csd_sub["sv"].mean())
-        csd_mean_o = float(csd_sub["o"].mean())
-        n_csd = len(csd_sub)
+        csd_eff = _filter_csd_rows_by_place_hints(csd_sub, tokens)
+        n_csd_all = int(len(csd_sub))
+        n_csd_used = int(len(csd_eff))
+        place_subset = bool(tokens) and (n_csd_used < n_csd_all)
+
+        csd_mean_sv = _length_weighted_csd_mean(csd_eff, "sv")
+        csd_mean_o = _length_weighted_csd_mean(csd_eff, "o")
         road_class = csd_sub["road_class"].iloc[0]
 
         car_links = model_sub
@@ -486,14 +625,21 @@ def match_csd_to_links(
         geh = float(compute_geh(np.array([model_lw_mean]), np.array([csd_mean_sv]))[0])
 
         model_road_km = float(car_links["distance"].sum()) / 1000.0 if "distance" in car_links.columns else 0.0
-        csd_source = csd_full if csd_full is not None else csd_sub
-        if "delka" in csd_source.columns and "sil" in csd_source.columns:
-            csd_road_km = float(csd_source[csd_source["sil"].astype(str).str.strip() == road]["delka"].sum())
+
+        csd_subset_km = float(_csd_section_weights_km(csd_eff).sum())
+        if csd_subset_km <= 0.0:
+            csd_subset_km = float(max(n_csd_used, 1))
+
+        if "sil" in csd_source.columns:
+            full_sub = csd_source[csd_source["sil"].astype(str).str.strip() == road]
+            csd_road_km_full = float(_csd_section_weights_km(full_sub).sum())
         else:
-            csd_road_km = 0.0
-        coverage = model_road_km / csd_road_km if csd_road_km > 0 else 1.0
-        is_partial = coverage < 0.5
-        is_over_aggregated = coverage > 2.0
+            csd_road_km_full = 0.0
+
+        coverage = model_road_km / csd_subset_km if csd_subset_km > 0 else 1.0
+        is_partial = coverage < _CSD_PARTIAL_COVERAGE_LT
+        is_minimal = coverage < _CSD_MINIMAL_COVERAGE_LT
+        is_over_aggregated = coverage > _CSD_OVER_AGGREGATED_COVERAGE_GT
 
         all_zero = float(car_links[tot_col].sum()) == 0
         if all_zero:
@@ -506,19 +652,26 @@ def match_csd_to_links(
         matched_roads.append({
             "road": road,
             "road_class": road_class,
-            "csd_sections": n_csd,
+            "csd_sections": n_csd_used,
+            "csd_sections_all": n_csd_all,
             "model_links": n_model,
             "csd_mean_sv": round(csd_mean_sv, 0),
             "csd_mean_o": round(csd_mean_o, 0),
             "model_lw_mean": round(model_lw_mean, 0),
             "geh": round(geh, 1),
             "model_road_km": round(model_road_km, 1),
-            "csd_road_km": round(csd_road_km, 1),
+            "csd_subset_km": round(csd_subset_km, 3),
+            "csd_road_km_full": round(csd_road_km_full, 3),
+            # ``csd_road_km`` kept for backward compatibility: km basis for coverage.
+            "csd_road_km": round(csd_subset_km, 3),
             "coverage_ratio": round(coverage, 2),
             "partial_coverage": is_partial,
+            "minimal_coverage": is_minimal,
             "over_aggregated": is_over_aggregated,
             "zero_flow": all_zero,
             "divided_highway": is_divided,
+            "place_hint_subset": place_subset,
+            "place_filter_tokens": ",".join(tokens) if tokens else "",
         })
 
     if not matched_roads:
@@ -534,10 +687,12 @@ def match_csd_to_links(
         ~result["partial_coverage"].astype(bool)
         & ~result["over_aggregated"].astype(bool)
         & ~result["zero_flow"].astype(bool)
+        & ~result["minimal_coverage"].astype(bool)
     )
     sub = result[reliable]
     n_partial = int(result["partial_coverage"].astype(bool).sum())
     n_over_agg = int(result["over_aggregated"].astype(bool).sum())
+    n_minimal = int(result["minimal_coverage"].astype(bool).sum())
 
     obs = sub["csd_mean_sv"].values.astype(float)
     mod = sub["model_lw_mean"].values.astype(float)
@@ -558,6 +713,7 @@ def match_csd_to_links(
             result.attrs["summary"] = {
                 "n_roads": int(mask.sum()),
                 "n_partial_excluded": n_partial,
+                "n_minimal_excluded": n_minimal,
                 "n_over_aggregated_excluded": n_over_agg,
                 "n_zero_flow_excluded": n_zero_flow,
                 "r2": round(r2, 3),
@@ -969,7 +1125,17 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
             model_agg = aggregate_model_by_class(links_gdf, vol_col)
             report["csd_modeled"] = model_agg.to_dict(orient="records")
 
-        csd_match_df = match_csd_to_links(csd, links_gdf, csd_full=csd_full)
+        place_name = str(get_nested(cfg, ["osm", "place_name"], "") or "")
+        ptoks = place_tokens_from_osm_place_name(place_name)
+        match_cfg = calib_cfg.get("matching") or {}
+        exclude_sil = match_cfg.get("csd_validation_exclude_sil")
+        csd_match_df = match_csd_to_links(
+            csd,
+            links_gdf,
+            csd_full=csd_full,
+            place_filter_tokens=ptoks or None,
+            exclude_sil=exclude_sil,
+        )
         if not csd_match_df.empty:
             report["csd_link_matching"] = csd_match_df.to_dict(orient="records")
 
@@ -982,7 +1148,9 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
             logger.info(f"  Per-road comparison: {len(csd_match_df)} roads matched")
             for _, r in csd_match_df.iterrows():
                 cov_tag = ""
-                if r.get("partial_coverage", False):
+                if r.get("minimal_coverage", False):
+                    cov_tag = "  [MIN-COV]"
+                elif r.get("partial_coverage", False):
                     cov_tag = "  [PARTIAL]"
                 elif r.get("over_aggregated", False):
                     cov_tag = "  [OVER-AGG]"
@@ -997,8 +1165,11 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
                 excl_parts = []
                 n_partial = summary.get("n_partial_excluded", 0)
                 n_over = summary.get("n_over_aggregated_excluded", 0)
+                n_minimal = summary.get("n_minimal_excluded", 0)
                 if n_partial:
                     excl_parts.append(f"{n_partial} partial-coverage")
+                if n_minimal:
+                    excl_parts.append(f"{n_minimal} minimal-coverage")
                 if n_over:
                     excl_parts.append(f"{n_over} over-aggregated")
                 excl_note = f" ({', '.join(excl_parts)} excluded)" if excl_parts else ""

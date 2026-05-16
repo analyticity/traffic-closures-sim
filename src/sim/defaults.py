@@ -86,6 +86,9 @@ SIM_DEFAULTS: Dict[str, Any] = {
                 "min_lanes": 1,
                 "max_gateways": 30,
             },
+            # Road refs (e.g. "602" or {"ref": "D1"}) that must not get external gateways
+            # (whitelist entries and auto-discovery; same ref-matching rules as whitelist).
+            "blacklist": [],
             "export_lookup": True,
         },
     },
@@ -331,6 +334,9 @@ SIM_DEFAULTS: Dict[str, Any] = {
             "min_factor": 0.60,
             "max_factor": 1.45,
             "rebase_seed_bounds": True,
+            # Optional: list of {gateway_name, observed_aadt, link_ids, link_directions}
+            # to compare modeled sum on explicit links vs observed (see config/brno/sim.yaml).
+            "corridor_observed": [],
         },
 
         "supply_tuning": {
@@ -429,6 +435,9 @@ SIM_DEFAULTS: Dict[str, Any] = {
             "link_type_penalty": 0.6,
             "min_vol_for_csd_lw": 100,
             "synthetic_objectid_base": 8_000_000,
+            # CSD ``sil`` values to drop from per-road validation and from
+            # auto-generated ``auto_csd_*`` screenlines (e.g. boundary stubs).
+            "csd_validation_exclude_sil": [],
         },
 
         "benchmarks": {
@@ -592,10 +601,14 @@ NETWORK_NORM_DEFAULTS: Dict[str, Any] = {
         },
         "practical_speed": {
             "enabled": True,
+            "mode": "hcm",
+            "speed_factor": 0.92,
             "base_factor": 0.85,
             "intersection_penalty_per_km": 0.02,
             "min_intersection_degree": 3,
-            "min_speed_kmh": 5.0,
+        },
+        "posted_speed": {
+            "source": "import_then_fill",
         },
         "defaults": {
             "speed_by_link_type": {

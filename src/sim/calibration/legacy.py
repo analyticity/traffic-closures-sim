@@ -32,7 +32,7 @@ from sim.calibration.metrics import (
     _compute_class_residuals,
     _supplement_class_ratios_from_screenlines,
 )
-from sim.calibration.gateway import _apply_gateway_calibration
+from sim.calibration.gateway import _apply_gateway_calibration, _compute_gateway_modeled_volumes
 from sim.calibration.validation import _check_final_convergence
 from sim.calibration.odme import run_odme_calibration, _spiess_update_step
 from sim.io_project import load_config
@@ -148,6 +148,7 @@ def run_multistage_calibration(config_path: str | Path = "config/brno/sim.yaml")
                     gw_modeled = _compute_gateway_modeled_volumes(
                         vol_df_gw, ctx_tmp.screenlines, vol_col_gw,
                         sl_gw_map=ctx_tmp.sl_gw_map,
+                        corridor_link_specs=ctx_tmp.gw_corridor_link_specs or None,
                     )
                     pre_damping = float(gw_cal_cfg.get("pre_damping", 0.4))
                     gw_corrections = _apply_gateway_calibration(

@@ -1,11 +1,41 @@
 # Screenline definitions for Most.
 #
 # Manual entries take precedence over auto-generated ones with the same name.
+#
+# Prefer geometry_wkt (WGS84 cut-line) + filter over raw link_id — link_id se
+# mění při reimportu OSM, řez + osm_ref_norm/link_type drží stejný průřez.
 
 screenlines:
   - name: "auto_gw_15_SE"
-    description: "Gateway 15 SE — manual override: use link 2593 (10277→15368) instead of dead-end link 2645"
+    description: "Gateway 15 SE — D15 primary; řez WGS84 + ref 15 (místo link_id, stabilní po reimportu)"
     type: "radial"
-    links:
-      - { link_id: 2593, direction: 0 }
+    geometry_wkt: "LINESTRING (13.705029572832533 50.492395945735396, 13.70500939777942 50.49215679522372)"
+    filter:
+      link_type: primary
+      osm_ref_norm: "15"
+    expected_links: 1
     observed_aadt_all: 9761.0
+
+  # CSD / kontrolní řez — sil. II/2538 (tertiary), pozorované 1 132 voz/den.
+  # Řez kolmo k ose cesty v polovině úseku; filter váže na ref 2538 a typ.
+  - name: "manual_csd_ii2538_tertiary"
+    description: "II/2538 — tertiary koridor (obs 1132 voz/den); řez WGS84 + osm_ref_norm 2538"
+    type: "radial"
+    geometry_wkt: "LINESTRING (13.669451822656407 50.52375454110119, 13.669514609574696 50.52398618264085)"
+    filter:
+      link_type: tertiary
+      osm_ref_norm: "2538"
+    expected_links: 1
+    observed_aadt_all: 1132.0
+
+  # CSD — dvě jízdní řady I/13+I/27 (trunk), pozorované 5 734 voz/den (součet obou směrů).
+  # Krátký kolmý řez protíná obě paralelní trunk linky (jiné osm_id), ne link_id.
+  - name: "manual_csd_i13_i27_trunk_dual"
+    description: "I/13+I/27 — dvě trunk jízdní řady (obs 5734 voz/den); řez + ref 13;27"
+    type: "radial"
+    geometry_wkt: "LINESTRING (13.653390619379886 50.51193940938457, 13.653524393461035 50.5122079321866)"
+    filter:
+      link_type: trunk
+      osm_ref_norm: "13;27"
+    expected_links: 2
+    observed_aadt_all: 5734.0

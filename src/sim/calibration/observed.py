@@ -421,6 +421,21 @@ def aggregate_model_by_class(links: gpd.GeoDataFrame, vol_col: str) -> pd.DataFr
     ).reset_index()
 
 
+def normalize_csd_sil_key(road: Any) -> str:
+    """Normalize CSD ``sil`` / config road ids for comparisons.
+
+    Matches the logic used for ``auto_csd_*`` screenline names: purely numeric
+    refs become strings without leading zeros via ``int()``; otherwise the
+    uppercased token is left-stripped of zeros.
+    """
+    road_norm = str(road).strip().upper().replace(" ", "")
+    try:
+        road_norm = str(int(float(road_norm)))
+    except ValueError:
+        road_norm = road_norm.lstrip("0") or road_norm
+    return road_norm.lower()
+
+
 # --- CSD split for calibration / validation ---
 
 def split_csd_for_calibration(

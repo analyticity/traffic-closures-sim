@@ -59,7 +59,7 @@ from sim.network import normalize_and_export_network, strip_closures
 from sim.zoning import build_zones_and_connectors
 from sim.datasets import resolved_csd2025_validation_parquet_path, run_fetch_datasets
 from sim.demand import assert_build_demand_prerequisites, load_or_build_od_matrix
-from sim.assignment import run_assignment, run_warm_skim_assignment
+from sim.assignment import run_assignment, run_warm_skim_assignment, warm_skims_regeneration_reason
 from sim.calibration import (
     run_calibration,
     run_odme_calibration,
@@ -371,11 +371,21 @@ def main() -> None:
     elif step == "assign-warm-skims":
         _cfg = load_config(cfg)
         _skim_out = Path(_cfg.get("demand", {}).get("output_dir", "outputs/baseline/demand")) / "skims.aem"
-        if _skim_out.exists() and not os.environ.get("SIM_FORCE_SKIMS"):
+        _force_skims = bool(os.environ.get("SIM_FORCE_SKIMS"))
+        _regen_reason = warm_skims_regeneration_reason(_cfg, _skim_out)
+        if _skim_out.exists() and not _force_skims and _regen_reason is None:
             logging.getLogger(__name__).info(
-                "Skims already exist at %s (set SIM_FORCE_SKIMS=1 to regenerate)", _skim_out
+                "Skims already valid at %s (set SIM_FORCE_SKIMS=1 to force rebuild)", _skim_out
             )
         else:
+            if _force_skims:
+                logging.getLogger(__name__).info(
+                    "SIM_FORCE_SKIMS=1: rebuilding skims at %s", _skim_out
+                )
+            elif _regen_reason:
+                logging.getLogger(__name__).info(
+                    "Rebuilding skims (%s): %s", _skim_out, _regen_reason
+                )
             run_warm_skim_assignment(cfg, cfg=_cfg)
     elif step == "distribute":
         from sim.distribution import run_distribution

@@ -21,6 +21,77 @@ from sim.assignment.executor import _detect_volume_col, execute_assignment
 logger = logging.getLogger(__name__)
 
 
+def _aem_index_len(matrix_path: Path) -> int | None:
+    """Return zone count from an ``.aem`` index column, or ``None`` on failure."""
+    try:
+        mat = AequilibraeMatrix()
+        mat.load(str(matrix_path))
+        try:
+            return int(len(mat.index[:]))
+        finally:
+            mat.close()
+    except Exception:
+        logger.debug("Failed to read matrix index from %s", matrix_path, exc_info=True)
+        return None
+
+
+def _aem_first_core_leading_dim(matrix_path: Path) -> int | None:
+    """Return the first dimension of the first core (must match OD index for skims)."""
+    try:
+        mat = AequilibraeMatrix()
+        mat.load(str(matrix_path))
+        try:
+            core_names = list(mat.names) if hasattr(mat, "names") and mat.names else []
+            if not core_names:
+                return None
+            data = mat.matrix[core_names[0]][:, :]
+            return int(data.shape[0])
+        finally:
+            mat.close()
+    except Exception:
+        logger.debug("Failed to read skim leading dim from %s", matrix_path, exc_info=True)
+        return None
+
+
+def warm_skims_regeneration_reason(cfg: dict, skim_path: Path) -> str | None:
+    """Return why warm skims should be recomputed, or ``None`` if the file looks reusable.
+
+    Mirrors ``distribute`` skim validation (leading matrix dimension vs OD index)
+    plus simple mtime checks against the OD matrix and project database.
+
+    ``SIM_FORCE_SKIMS`` is handled by the caller; this function ignores it.
+    """
+    demand_cfg = cfg.get("demand") or {}
+    matrix_path = Path(demand_cfg.get("matrix_path", "data/demand/od_matrix.aem"))
+    project_db = Path(cfg["project_path"]) / "project_database.sqlite"
+
+    if not skim_path.exists():
+        return "skims.aem is missing"
+
+    od_n = _aem_index_len(matrix_path)
+    if od_n is None:
+        return f"cannot read OD matrix index ({matrix_path}) to validate skims"
+
+    skim_n = _aem_first_core_leading_dim(skim_path)
+    if skim_n is None:
+        return "skims.aem is unreadable or has no matrix cores"
+    if skim_n != od_n:
+        return f"skim matrix size ({skim_n}) does not match OD matrix zones ({od_n})"
+
+    try:
+        skim_mtime = skim_path.stat().st_mtime
+    except OSError as exc:
+        return f"cannot stat skims.aem ({exc})"
+
+    if matrix_path.exists() and skim_mtime < matrix_path.stat().st_mtime:
+        return "skims.aem is older than the OD matrix"
+
+    if project_db.exists() and skim_mtime < project_db.stat().st_mtime:
+        return "skims.aem is older than the project database"
+
+    return None
+
+
 def _run_assignment_pass(
     config_path: str | Path,
     *,

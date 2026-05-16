@@ -481,6 +481,7 @@ class _CalibrationContext:
         self.gw_rebase_seed_bounds = bool(gw_cal_cfg.get("rebase_seed_bounds", True))
         self.gw_zone_map: Dict[str, np.ndarray] = {}
         self.gw_observed: Dict[str, float] = {}
+        self.gw_corridor_link_specs: Dict[str, List[Tuple[int, int]]] = {}
 
         self.sl_gw_map: Dict[str, str] = {}
         if self.gw_cal_enabled:
@@ -495,6 +496,33 @@ class _CalibrationContext:
                     screenlines_list=self.screenlines,
                     gateway_zone_names=gw_names,
                 )
+                for entry in gw_cal_cfg.get("corridor_observed", []) or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    gw_key = str(entry.get("gateway_name", "")).strip()
+                    if not gw_key:
+                        continue
+                    if entry.get("observed_aadt") is None:
+                        continue
+                    self.gw_observed[gw_key] = float(entry["observed_aadt"])
+                    lids_raw = entry.get("link_ids") or []
+                    dir_raw = entry.get("link_directions") or entry.get("volume_direction_by_link_id") or {}
+                    dir_map = {str(k): int(v) for k, v in dict(dir_raw).items()}
+                    pairs: List[Tuple[int, int]] = []
+                    for lid in lids_raw:
+                        lid_int = int(lid)
+                        d = int(dir_map.get(str(lid_int), dir_map.get(lid_int, 0)))
+                        pairs.append((lid_int, d))
+                    if pairs:
+                        self.gw_corridor_link_specs[gw_key] = pairs
+                if self.gw_corridor_link_specs:
+                    logger.info(
+                        "  Gateway corridor_observed: %s",
+                        "; ".join(
+                            f"{g} obs={self.gw_observed.get(g):,.0f} links={pairs}"
+                            for g, pairs in sorted(self.gw_corridor_link_specs.items())
+                        ),
+                    )
                 if self.gw_zone_map and self.gw_observed:
                     active = set(self.gw_zone_map) & set(self.gw_observed)
                     logger.info(
@@ -771,6 +799,7 @@ class _CalibrationContext:
             return
         gw_modeled = _compute_gateway_modeled_volumes(
             vol_df, self.screenlines, vol_col, sl_gw_map=self.sl_gw_map,
+            corridor_link_specs=self.gw_corridor_link_specs or None,
         )
         gw_corrections = _apply_gateway_calibration(
             demand, self.gw_zone_map, self.gw_observed, gw_modeled,

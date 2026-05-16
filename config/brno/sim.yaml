@@ -1,11 +1,19 @@
 project_path: "project/brno_aeq"
 
+# Externí brány a supernetwork jen pro dálnice (motorway) a rychlostní silnice (trunk).
+# Konkrétní koridory přes hranici AOI: viz poslední gateway_diagnostics.csv v outputs/brno/…
+supernetwork:
+  eligible_gateway_types:
+    - motorway
+    - motorway_link
+    - trunk
+    - trunk_link
+
 osm:
   place_name: "Brno, Czechia"
 
 network:
   normalization_config: "config/brno/network_normalization.yaml"
-  csd_peak_hour_factor: 0.12
 
 zoning:
   sources:
@@ -22,10 +30,6 @@ demand:
   segments:
     external_local:
       total_daily_trips: 130000
-  distribution:
-    blend_alpha: 0.75
-    pa_trip_rate: 2.2
-    pa_car_share: 0.45
   sldb:
     external_processing:
       through_traffic_scale: 0.30
@@ -35,6 +39,17 @@ calibration:
     damping: 0.26
     min_factor: 0.55
     max_factor: 1.45
+    # Doplňkový cíl pro gateway kalibraci: I/50 (trunk) u východní brány D1 — pozorovaný provoz
+    # na krátkém koridoru (CSD) vs součet modelovaných objemů na vybraných linkách.
+    # Škáluje OD řádky/sloupce pro externí zónu D1_E (I/50 je se sloučením v D1_E).
+    # link_id z posledního měření v UI; směr 1 = AB u one-way trunk.
+    corridor_observed:
+      - gateway_name: D1_E
+        observed_aadt: 14172.0
+        link_ids: [29215, 51596]
+        link_directions:
+          "29215": 1
+          "51596": 1
   odme:
     max_outer_iterations: 32
     entropy_step_size: 0.22
@@ -46,6 +61,10 @@ calibration:
       - name: "refine"
         max_iterations: 25
   screenlines_path: "config/brno/screenlines.yaml"
+  # Vyloučení CSD ``sil`` z per-road validace a z auto ``auto_csd_*`` screenlines
+  # (okrajové úseky / špatně párovatelné na síť — viz měření v UI).
+  matching:
+    csd_validation_exclude_sil: ["23", "3846"]
 
 datasets:
   enabled: true
@@ -68,7 +87,7 @@ datasets:
         area_filter: { enabled: true, region_hint: "Jihomoravský kraj" }
 
 baseline_closures:
-  enabled: true
+  enabled: false
   matching:
     max_distance_m: 50
     require_road_ref_match: true

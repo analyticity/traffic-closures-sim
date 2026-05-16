@@ -32,6 +32,7 @@ from sim.calibration.validation import (  # noqa: F401
     compute_validation_benchmarks,
     compute_class_speed_comparison,
     match_csd_to_links,
+    place_tokens_from_osm_place_name,
     _check_final_convergence,
 )
 
@@ -45,6 +46,7 @@ from sim.calibration.observed import (  # noqa: F401
     validate_geometries_or_fail,
     aggregate_csd_by_class,
     aggregate_model_by_class,
+    normalize_csd_sil_key,
     _classify_csd_road,
     _CSD_COMPATIBLE_LINK_TYPES,
     _load_network_links,

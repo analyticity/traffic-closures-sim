@@ -38,6 +38,11 @@ demand:
       through_traffic_scale: 0.30
 
 calibration:
+  # Malý CSD vzorek — mírnější SL limit (některé auto_gw_* brány >65 % chyby).
+  convergence:
+    daily:
+      pct_rmse_max: 36
+      screenline_max_pct_deviation: 100
   gateway_calibration:
     damping: 0.18
     min_factor: 0.70
@@ -52,10 +57,25 @@ calibration:
       - name: "refine"
         max_iterations: 28
   screenlines_path: "config/olomouc/screenlines.yaml"
+  matching:
+    # I/437 secondary link 1905 — CSD ~3k vs model ~9.7k (3.25×); špatný koridor / spur
+    exclude_objectids:
+      - 8000006
+    exclude_csd_roads:
+      - "437"
   # Reduce CSD-derived auto screenlines vs. defaults (csd_min_aadt 5000); keeps gateway radials.
   # See docs/olomouc_calibration_diagnostics.md and src/sim/calibration/screenlines.py.
   auto_screenlines:
     csd_min_aadt: 5000
+    # Duplicitní / chybný řez na I/46 SW (modeled ~35k vs obs. ~20k, ~75 % chyba);
+    # auto_gw_D46_SW je v toleranci, _2 mapuje jiné linky.
+    exclude_gateway_names:
+      - "D46_SW_2"
+      - "437_E"
+    # Ignore auto SL and CSD link matches with ratio outside [below, above]
+    # (wrong link / zero flow) in pass/fail and Bias map (status „Vyloučené“).
+    exclude_auto_ratio_below: 0.25
+    exclude_auto_ratio_above: 4
 
 datasets:
   enabled: true

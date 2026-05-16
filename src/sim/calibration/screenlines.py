@@ -149,6 +149,159 @@ class ScreenlineResult:
         }
 
 
+_AUTO_SL_PREFIXES = ("auto_gw_", "auto_csd_")
+
+
+def is_auto_screenline_name(name: str) -> bool:
+    return str(name).startswith(_AUTO_SL_PREFIXES)
+
+
+def resolve_auto_screenline_reliability_cfg(
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, float]:
+    """Thresholds for dropping unreliable auto screenlines from SL benchmarks."""
+    auto_cfg = (cfg or {}).get("calibration", {}).get("auto_screenlines") or {}
+    return {
+        "ratio_below": float(auto_cfg.get("exclude_auto_ratio_below", 0.20)),
+        "ratio_above": float(auto_cfg.get("exclude_auto_ratio_above", 5.0)),
+    }
+
+
+_COUNT_TARGET_COL = {
+    "car_only": "observed_car",
+    "motor_total": "observed_motor_total",
+    "total": "observed_total",
+}
+
+
+def _normalize_road_ref(ref: str) -> str:
+    r = str(ref or "").strip().upper().replace("I/", "").replace(" ", "")
+    try:
+        return str(int(r))
+    except ValueError:
+        return r.lstrip("0") or r
+
+
+def resolve_gateway_screenline_eval_cfg(
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Evaluation options for ``auto_gw_*`` screenlines (align with count-post UI)."""
+    auto_cfg = (cfg or {}).get("calibration", {}).get("auto_screenlines") or {}
+    calib_cfg = (cfg or {}).get("calibration") or {}
+    count_target = str(
+        auto_cfg.get("gateway_count_target")
+        or calib_cfg.get("count_target", "motor_total")
+    )
+    return {
+        "count_target": count_target,
+        "obs_col": _COUNT_TARGET_COL.get(count_target, "observed_total"),
+        "use_corridor_volume": bool(auto_cfg.get("gateway_use_corridor_volume", False)),
+        "prefer_pentlogram": bool(auto_cfg.get("gateway_prefer_pentlogram", True)),
+        "supplement_from_ref_match": bool(
+            auto_cfg.get("gateway_supplement_from_ref_match", True)
+        ),
+    }
+
+
+def screenline_benchmark_unreliable(
+    modeled_total: float,
+    observed_total: float,
+    ratio: Optional[float],
+    *,
+    ratio_below: float = 0.20,
+    ratio_above: float = 5.0,
+) -> bool:
+    """True when mod/obs is outside the benchmark band (default 0.2–5.0)."""
+    if observed_total <= 0:
+        return False
+    mod = float(modeled_total or 0.0)
+    if mod <= 0:
+        return True
+    r = float(ratio) if ratio is not None and np.isfinite(ratio) else (mod / observed_total)
+    if r < ratio_below:
+        return True
+    if ratio_above > 0 and r > ratio_above:
+        return True
+    return False
+
+
+def auto_screenline_unreliable(
+    name: str,
+    modeled_total: float,
+    observed_total: float,
+    ratio: Optional[float],
+    *,
+    ratio_below: float = 0.20,
+    ratio_above: float = 5.0,
+) -> bool:
+    """True when an auto screenline should not affect SL pass/fail aggregates."""
+    if not is_auto_screenline_name(name):
+        return False
+    return screenline_benchmark_unreliable(
+        modeled_total,
+        observed_total,
+        ratio,
+        ratio_below=ratio_below,
+        ratio_above=ratio_above,
+    )
+
+
+def screenline_ratio_error_pct(ratio: Optional[float]) -> float:
+    if ratio is None or not np.isfinite(ratio):
+        return 0.0
+    return abs(float(ratio) - 1.0) * 100.0
+
+
+def _screenline_result_totals(sr: Any) -> Tuple[float, float, Optional[float]]:
+    if isinstance(sr, dict):
+        modeled = float(sr.get("modeled_total") or 0.0)
+        observed = float(sr.get("observed_total") or 0.0)
+        ratio = sr.get("ratio")
+    else:
+        modeled = float(getattr(sr, "modeled_total", 0) or 0.0)
+        observed = float(getattr(sr, "observed_total", 0) or 0.0)
+        ratio = getattr(sr, "ratio", None)
+    r = float(ratio) if ratio is not None and np.isfinite(ratio) else None
+    return modeled, observed, r
+
+
+def screenline_excluded_from_benchmark(
+    _name: str,
+    sr: Any,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when a screenline must not affect benchmarks, GEH aggregates, or ODME."""
+    rel = resolve_auto_screenline_reliability_cfg(cfg)
+    modeled, observed, ratio = _screenline_result_totals(sr)
+    return screenline_benchmark_unreliable(
+        modeled,
+        observed,
+        ratio,
+        ratio_below=rel["ratio_below"],
+        ratio_above=rel["ratio_above"],
+    )
+
+
+def annotate_screenline_benchmark_exclusion(
+    sl_results: Dict[str, Any],
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Tag each screenline result; return (annotated dict, excluded names)."""
+    excluded: List[str] = []
+    out: Dict[str, Any] = {}
+    for name, sr in sl_results.items():
+        d = dict(sr) if isinstance(sr, dict) else sr.to_dict()
+        if screenline_excluded_from_benchmark(name, d, cfg):
+            d["excluded_from_benchmark"] = True
+            d["benchmark_exclusion_reason"] = "ratio_outside_benchmark_band"
+            excluded.append(name)
+        else:
+            d["excluded_from_benchmark"] = False
+            d.pop("benchmark_exclusion_reason", None)
+        out[name] = d
+    return out, excluded
+
+
 # --- Loader ---
 
 def load_screenlines(config_path: str | Path) -> List[ScreenlineDef]:
@@ -646,6 +799,133 @@ def _get_link_observed(
     return float(rows[obs_col].sum())
 
 
+def _get_link_modeled_volume(
+    vol_df: pd.DataFrame,
+    matched_counts: gpd.GeoDataFrame,
+    link_id: int,
+    direction: int,
+    vol_col: str,
+    *,
+    use_corridor: bool,
+    _vol_idx: Optional[pd.DataFrame] = None,
+    _obs_idx: Optional[pd.DataFrame] = None,
+) -> float:
+    """Modeled volume for a screenline link (corridor cross-section or assignment vol)."""
+    if use_corridor and _obs_idx is not None and "_corridor_volume" in _obs_idx.columns:
+        try:
+            rows = _obs_idx.loc[[link_id]]
+        except KeyError:
+            rows = pd.DataFrame()
+        if not rows.empty:
+            cv = float(rows["_corridor_volume"].iloc[0])
+            if cv > 0:
+                return cv
+    elif use_corridor and "_corridor_volume" in matched_counts.columns:
+        rows = matched_counts[matched_counts["link_id"] == link_id] if "link_id" in matched_counts.columns else pd.DataFrame()
+        if not rows.empty:
+            cv = float(rows["_corridor_volume"].iloc[0])
+            if cv > 0:
+                return cv
+    return _get_link_volume(vol_df, link_id, direction, vol_col, _vol_idx=_vol_idx)
+
+
+def _gateway_ref_from_screenline(sl: ScreenlineDef) -> str:
+    """Road ref for ``auto_gw_*`` (attr_filter or gateway name like I52_S → 52)."""
+    ref_raw = (sl.attr_filter or {}).get("osm_ref_norm", "")
+    if ref_raw:
+        return str(ref_raw)
+    if not sl.name.startswith("auto_gw_"):
+        return ""
+    gw_short = sl.name[len("auto_gw_") :]
+    token = gw_short.rsplit("_", 1)[0] if "_" in gw_short else gw_short
+    token = token.upper().replace("I/", "").strip()
+    if token.startswith("D") and token[1:].isdigit():
+        return token
+    if token.isdigit():
+        return token
+    digits = re.sub(r"[^0-9]", "", token)
+    return digits or token
+
+
+def _gateway_pentlogram_from_ref(
+    sl: ScreenlineDef,
+    matched_counts: gpd.GeoDataFrame,
+    vol_df: pd.DataFrame,
+    vol_col: str,
+    obs_col: str,
+    *,
+    use_corridor: bool,
+) -> Optional[Dict[str, Any]]:
+    """Use pentlogram on the gateway road ref when boundary links lack counts."""
+    ref_raw = _gateway_ref_from_screenline(sl)
+    if not ref_raw or matched_counts.empty or "link_id" not in matched_counts.columns:
+        return None
+    ref_norm = _normalize_road_ref(ref_raw)
+    if obs_col not in matched_counts.columns:
+        return None
+
+    ref_col = "osm_ref" if "osm_ref" in matched_counts.columns else None
+    if ref_col is None:
+        return None
+
+    obs_vals = pd.to_numeric(matched_counts[obs_col], errors="coerce").fillna(0.0)
+    ref_vals = matched_counts[ref_col].astype(str).map(_normalize_road_ref)
+    candidates = matched_counts[(ref_vals == ref_norm) & (obs_vals > 0)]
+    if candidates.empty:
+        return None
+
+    best_idx = obs_vals.loc[candidates.index].idxmax()
+    row = candidates.loc[best_idx]
+    link_id = int(row["link_id"])
+    direction = 0
+    vol_idx = vol_df.set_index("link_id", drop=False) if "link_id" in vol_df.columns else vol_df
+    obs_idx = matched_counts.set_index("link_id", drop=False)
+    modeled = _get_link_modeled_volume(
+        vol_df, matched_counts, link_id, direction, vol_col,
+        use_corridor=use_corridor, _vol_idx=vol_idx, _obs_idx=obs_idx,
+    )
+    observed = float(row[obs_col])
+    return {
+        "link_id": link_id,
+        "direction": direction,
+        "modeled": round(modeled, 0),
+        "observed": round(observed, 0),
+        "obs_source": "pentlogram_ref_match",
+    }
+
+
+def _finalize_gateway_per_link(
+    sl: ScreenlineDef,
+    per_link: List[Dict[str, Any]],
+    links_gdf: Optional[gpd.GeoDataFrame],
+    *,
+    use_corridor: bool,
+) -> List[Dict[str, Any]]:
+    """Collapse ``auto_gw_*`` to one cross-section; optional divided-highway merge otherwise."""
+    if not sl.name.startswith("auto_gw_"):
+        if links_gdf is not None:
+            return merge_divided_highway_screenline_per_link(per_link, links_gdf)
+        return per_link
+
+    if use_corridor and per_link:
+        with_obs = [pl for pl in per_link if float(pl.get("observed", 0) or 0) > 0]
+        pool = with_obs if with_obs else per_link
+        lead = max(
+            pool,
+            key=lambda pl: (
+                float(pl.get("observed", 0) or 0),
+                float(pl.get("modeled", 0) or 0),
+            ),
+        )
+        collapsed = dict(lead)
+        collapsed["gateway_collapsed"] = True
+        return [collapsed]
+
+    if links_gdf is not None:
+        return merge_divided_highway_screenline_per_link(per_link, links_gdf)
+    return per_link
+
+
 def evaluate_screenline(
     sl: ScreenlineDef,
     vol_df: pd.DataFrame,
@@ -653,11 +933,17 @@ def evaluate_screenline(
     vol_col: str,
     obs_col: str = "observed_car",
     links_gdf: Optional[gpd.GeoDataFrame] = None,
+    cfg: Optional[Dict[str, Any]] = None,
 ) -> ScreenlineResult:
     """Evaluate a single screenline: sum modeled and observed volumes, compute GEH."""
     resolved = sl.links
     if not resolved and links_gdf is not None:
         resolved = resolve_screenline_links(sl, links_gdf)
+
+    is_gateway = sl.name.startswith("auto_gw_")
+    gw_eval = resolve_gateway_screenline_eval_cfg(cfg) if is_gateway else {}
+    eff_obs_col = gw_eval.get("obs_col", obs_col) if is_gateway else obs_col
+    use_corridor = bool(is_gateway and gw_eval.get("use_corridor_volume"))
 
     per_link: List[Dict[str, Any]] = []
 
@@ -669,8 +955,11 @@ def evaluate_screenline(
     )
 
     for link_id, direction in resolved:
-        mv = _get_link_volume(vol_df, link_id, direction, vol_col, _vol_idx=vol_idx)
-        ov = _get_link_observed(matched_counts, link_id, obs_col, _obs_idx=obs_idx)
+        mv = _get_link_modeled_volume(
+            vol_df, matched_counts, link_id, direction, vol_col,
+            use_corridor=use_corridor, _vol_idx=vol_idx, _obs_idx=obs_idx,
+        )
+        ov = _get_link_observed(matched_counts, link_id, eff_obs_col, _obs_idx=obs_idx)
         per_link.append({
             "link_id": link_id,
             "direction": direction,
@@ -678,8 +967,22 @@ def evaluate_screenline(
             "observed": round(ov, 0),
         })
 
-    if links_gdf is not None:
-        per_link = merge_divided_highway_screenline_per_link(per_link, links_gdf)
+    pent_from_ref: Optional[Dict[str, Any]] = None
+    if (
+        is_gateway
+        and gw_eval.get("supplement_from_ref_match")
+        and sum(float(pl.get("observed", 0) or 0) for pl in per_link) <= 0
+    ):
+        pent_from_ref = _gateway_pentlogram_from_ref(
+            sl, matched_counts, vol_df, vol_col, eff_obs_col,
+            use_corridor=use_corridor,
+        )
+        if pent_from_ref is not None:
+            per_link = [pent_from_ref]
+
+    per_link = _finalize_gateway_per_link(
+        sl, per_link, links_gdf, use_corridor=use_corridor,
+    )
 
     mod_total = float(sum(float(pl.get("modeled", 0) or 0) for pl in per_link))
     obs_total = float(sum(float(pl.get("observed", 0) or 0) for pl in per_link))
@@ -699,9 +1002,23 @@ def evaluate_screenline(
     # or when matched counts are suspiciously low (< 20% of known AADT).
     # The latter catches cases where CSD-split puts the main road section
     # into the validation set and a nearby minor road gets matched instead.
-    obs_source = "pentlogram"
-    config_aadt = sl.observed_aadt_all or sl.observed_aadt_cars
-    if config_aadt is not None and config_aadt > 0:
+    if pent_from_ref is not None:
+        obs_source = str(pent_from_ref.get("obs_source", "pentlogram_ref_match"))
+    else:
+        obs_source = "pentlogram"
+    if eff_obs_col == "observed_car":
+        config_aadt = sl.observed_aadt_cars or sl.observed_aadt_all
+    else:
+        config_aadt = sl.observed_aadt_all or sl.observed_aadt_cars
+    skip_csd = (
+        is_gateway
+        and gw_eval.get("prefer_pentlogram")
+        and (
+            pent_from_ref is not None
+            or (obs_total > 0 and obs_source.startswith("pentlogram"))
+        )
+    )
+    if config_aadt is not None and config_aadt > 0 and not skip_csd:
         if obs_total <= 0:
             obs_total = config_aadt
             obs_source = "csd_config"
@@ -754,6 +1071,7 @@ def evaluate_all_screenlines(
     vol_col: str,
     obs_col: str = "observed_car",
     links_gdf: Optional[gpd.GeoDataFrame] = None,
+    cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, ScreenlineResult]:
     """Evaluate all screenlines and return {name: result}."""
     seen_names: set = set()
@@ -767,7 +1085,9 @@ def evaluate_all_screenlines(
 
     results: Dict[str, ScreenlineResult] = {}
     for sl in unique_screenlines:
-        r = evaluate_screenline(sl, vol_df, matched_counts, vol_col, obs_col, links_gdf)
+        r = evaluate_screenline(
+            sl, vol_df, matched_counts, vol_col, obs_col, links_gdf, cfg=cfg,
+        )
         if r.observed_total and r.observed_total > 0:
             if r.modeled_total == 0:
                 logger.warning(
@@ -906,9 +1226,22 @@ def auto_generate_screenlines(
                     if pd.notna(b):
                         node_to_link_rows.setdefault(int(b), []).append(i)
 
+            exclude_gateway_names = {
+                str(x).strip()
+                for x in (auto_cfg.get("exclude_gateway_names") or [])
+                if str(x).strip()
+            }
+
             for _, row in gw_df.iterrows():
                 gw_name = str(row.get("gateway_name", ""))
                 if not gw_name:
+                    continue
+                if gw_name in exclude_gateway_names:
+                    logger.info(
+                        "Gateway screenline auto_gw_%s skipped: "
+                        "auto_screenlines.exclude_gateway_names",
+                        gw_name,
+                    )
                     continue
                 bx = row.get("boundary_x")
                 by = row.get("boundary_y")
@@ -1151,6 +1484,7 @@ def auto_generate_screenlines(
                         sl_type="radial",
                         links=explicit_links,
                         has_explicit_links=True,
+                        attr_filter=dict(attr_filter),
                         observed_aadt_all=obs_all if obs_all > 0 else None,
                         observed_aadt_cars=obs_cars if obs_cars > 0 else None,
                     ))

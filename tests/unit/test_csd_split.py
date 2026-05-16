@@ -437,6 +437,44 @@ class TestLoadCsdAsLinkCounts:
         result = load_csd_as_link_counts(csd, links)
         assert result.empty
 
+    def test_observed_override_and_anchor_link(self):
+        csd = pd.DataFrame({
+            "sil": ["50", "50"],
+            "sv": [20000, 18000],
+            "o": [15000, 14000],
+            "tv": [2000, 2000],
+            "nazev_mesta": ["", ""],
+        })
+        links = gpd.GeoDataFrame([
+            {"link_id": 100, "osm_ref": "50", "osm_ref_norm": "50", "link_type": "trunk",
+             "a_node": 1, "b_node": 2,
+             "geometry": LineString([(16.679, 49.184), (16.680, 49.184)])},
+            {"link_id": 200, "osm_ref": "50", "osm_ref_norm": "50", "link_type": "trunk",
+             "a_node": 2, "b_node": 3,
+             "geometry": LineString([(16.708, 49.182), (16.709, 49.182)])},
+        ], geometry="geometry", crs="EPSG:4326")
+        result = load_csd_as_link_counts(
+            csd, links,
+            observed_overrides={"50": {"observed_car": 8619, "observed_motor_total": 10110}},
+            anchor_selectors={
+                "50": {
+                    "cut": {
+                        "geometry_wkt": (
+                            "LINESTRING (16.7085000000 49.1823000000, "
+                            "16.7081000000 49.1827200000)"
+                        ),
+                        "pick": "nearest",
+                        "filter": {"link_type": "trunk", "osm_ref_norm": "50"},
+                    },
+                },
+            },
+            metric_epsg=5514,
+        )
+        row = result[result["csd_road"] == "50"].iloc[0]
+        assert int(row["link_id"]) == 200
+        assert row["observed_car"] == pytest.approx(8619)
+        assert row["observed_motor_total"] == pytest.approx(10110)
+
 
 class TestPlaceTokensFromOsmPlaceName:
     def test_brno_czechia(self):

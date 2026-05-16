@@ -17,6 +17,7 @@ from sim.calibration.context import _CalibrationContext, _sr_val
 from sim.calibration.metrics import (
     _compute_class_residuals,
     _supplement_class_ratios_from_screenlines,
+    _clamp_class_ratios,
 )
 from sim.calibration.validation import _check_final_convergence
 
@@ -38,12 +39,17 @@ def _spiess_update_step(
     gd_inner: int,
 ) -> List[Tuple[str, float]]:
     """Spiess relative-gradient multiplicative update across all screenlines."""
+    from sim.calibration.screenlines import screenline_excluded_from_benchmark
+
     corrections_applied: List[Tuple[str, float]] = []
     for gd_it in range(1, gd_inner + 1):
         corrections_applied = []
         for sl_name, sl_od_raw in sl_matrices.items():
-            obs_sl = _sr_val(sl_results.get(sl_name, {}), "observed_total")
-            mod_sl = _sr_val(sl_results.get(sl_name, {}), "modeled_total")
+            sr = sl_results.get(sl_name, {})
+            if screenline_excluded_from_benchmark(sl_name, sr):
+                continue
+            obs_sl = _sr_val(sr, "observed_total")
+            mod_sl = _sr_val(sr, "modeled_total")
             if obs_sl <= 0 or mod_sl <= 0:
                 continue
             ratio = obs_sl / mod_sl
@@ -80,10 +86,15 @@ def _entropy_update_step(
     clip_max: float = 2.0,
 ) -> int:
     """Single entropy-maximization multiplicative update across all screenlines."""
+    from sim.calibration.screenlines import screenline_excluded_from_benchmark
+
     n_applied = 0
     for sl_name, sl_od_raw in sl_matrices.items():
-        obs_sl = _sr_val(sl_results.get(sl_name, {}), "observed_total")
-        mod_sl = _sr_val(sl_results.get(sl_name, {}), "modeled_total")
+        sr = sl_results.get(sl_name, {})
+        if screenline_excluded_from_benchmark(sl_name, sr):
+            continue
+        obs_sl = _sr_val(sr, "observed_total")
+        mod_sl = _sr_val(sr, "modeled_total")
         if obs_sl <= 0 or mod_sl <= 0:
             continue
         ratio = obs_sl / mod_sl
@@ -335,6 +346,7 @@ def run_odme_calibration(
                 cr = _supplement_class_ratios_from_screenlines(
                     sl_results, ctx.links_gdf, cr
                 )
+                cr = _clamp_class_ratios(cr, odme_cfg)
                 if cr:
                     iter_record["class_ratios"] = {
                         k: round(v, 3) for k, v in cr.items()

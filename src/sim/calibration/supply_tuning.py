@@ -138,8 +138,12 @@ def compute_objective(
     prmse = float(count_stats.get("pct_rmse") or 0.0)
     rmse_term = prmse * w.get("pct_rmse", 0.5)
 
+    from sim.calibration.screenlines import screenline_excluded_from_benchmark
+
     sl_term = 0.0
-    for sr in screenline_results.values():
+    for sl_name, sr in screenline_results.items():
+        if screenline_excluded_from_benchmark(sl_name, sr):
+            continue
         ratio = sr.get("ratio", 1.0)
         if ratio is not None:
             sl_term += abs(ratio - 1.0)

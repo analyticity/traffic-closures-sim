@@ -423,6 +423,17 @@ SIM_DEFAULTS: Dict[str, Any] = {
             "csd_screenlines": True,
             "csd_min_aadt": 5000,
             "csd_agg_method": "length_weighted",
+            # Gateway names to skip for auto_gw_* (mis-anchored or non-corridor).
+            "exclude_gateway_names": [],
+            # Auto screenlines outside [below, above] modeled/observed ratio are
+            # ignored for max screenline deviation (wrong link / zero flow).
+            "exclude_auto_ratio_below": 0.20,
+            "exclude_auto_ratio_above": 5.0,
+            # Gateway screenlines: same basis as count-post UI (cars + corridor).
+            "gateway_count_target": "car_only",
+            "gateway_use_corridor_volume": True,
+            "gateway_prefer_pentlogram": True,
+            "gateway_supplement_from_ref_match": True,
         },
 
         "matching": {
@@ -438,6 +449,10 @@ SIM_DEFAULTS: Dict[str, Any] = {
             # CSD ``sil`` values to drop from per-road validation and from
             # auto-generated ``auto_csd_*`` screenlines (e.g. boundary stubs).
             "csd_validation_exclude_sil": [],
+            # Pentlogram / CSD count ``objectid`` values to skip in matching and ODME.
+            "exclude_objectids": [],
+            # CSD road numbers (``sil``) — stable for csd_split anchors (preferred over objectid).
+            "exclude_csd_roads": [],
         },
 
         "benchmarks": {

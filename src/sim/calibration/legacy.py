@@ -269,10 +269,15 @@ def run_multistage_calibration(config_path: str | Path = "config/brno/sim.yaml")
                 direction_aware=ctx_final.direction_aware,
                 vol_col=vol_col_f,
                 match_quality_min=ctx_final.match_quality_min,
+                exclude_objectids=ctx_final.exclude_objectids,
+                exclude_csd_roads=ctx_final.exclude_csd_roads,
+                exclude_ratio_below=ctx_final.exclude_ratio_below,
+                exclude_ratio_above=ctx_final.exclude_ratio_above,
             )
             sl_res_f = evaluate_all_screenlines(
                 ctx_final.screenlines, vol_df_f, matched_f,
                 vol_col_f, ctx_final.obs_col, ctx_final.links_gdf,
+                cfg=ctx_final.cfg,
             )
             sl_results_f = {sn: sr.to_dict() for sn, sr in sl_res_f.items()}
 
@@ -593,6 +598,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
             if screenlines and vol_col:
                 sl_res = evaluate_all_screenlines(
                     screenlines, vol_df, matched, vol_col, obs_col, links_gdf,
+                    cfg=cfg,
                 )
                 for sn, sr in sl_res.items():
                     sl_results[sn] = sr.to_dict()
@@ -854,6 +860,8 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                     m_p = match_counts_to_links(
                         ctx.pent, lv, buffer_m=buffer_m, vol_col=vc_p,
                         match_quality_min=mq_min,
+                        exclude_objectids=ctx.exclude_objectids,
+                        exclude_csd_roads=ctx.exclude_csd_roads,
                     )
 
                     obs_period_col = f"_obs_{period}"

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
@@ -13,6 +13,11 @@ from sim.supernetwork.config import SuperCfg
 from sim.supernetwork.routing import shortest_path_cost_batched
 
 
+def _boundary_sector(boundary_angle_deg: float) -> int:
+    """Compass octant (45°) from gateway ``boundary_angle`` on the model AOI."""
+    return int(((float(boundary_angle_deg) + 22.5) % 360.0) // 45) % 8
+
+
 def classify_relations(
     G: nx.DiGraph,
     commuting_pairs: pd.DataFrame,
@@ -21,6 +26,7 @@ def classify_relations(
     internal_zone_names: set[str],
     cfg_root: Dict[str, Any],
     cfg: SuperCfg,
+    gateway_boundary_angles: Optional[Dict[str, float]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     t0 = time.perf_counter()
     if "rank_in" not in gateway_lookup.columns:
@@ -138,6 +144,15 @@ def classify_relations(
             rec["rejection_reason"] = "same_gateway_not_allowed"
             rows.append(rec)
             continue
+
+        if cfg.reject_same_boundary_sector and gateway_boundary_angles:
+            ang_in = gateway_boundary_angles.get(gw_in)
+            ang_out = gateway_boundary_angles.get(gw_out)
+            if ang_in is not None and ang_out is not None:
+                if _boundary_sector(ang_in) == _boundary_sector(ang_out):
+                    rec["rejection_reason"] = "same_boundary_sector"
+                    rows.append(rec)
+                    continue
 
         pair_cost = pair_map.get((gw_in, gw_out), float("nan"))
         o_node = int(o_info["unit_graph_node"])

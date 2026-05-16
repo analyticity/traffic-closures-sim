@@ -42,32 +42,27 @@ calibration:
     damping: 0.26
     min_factor: 0.55
     max_factor: 1.45
-    # Doplňkový cíl pro gateway kalibraci: I/50 (trunk) u východní brány D1 — pozorovaný provoz
-    # na krátkém koridoru (CSD) vs součet modelovaných objemů na vybraných linkách.
-    # Škáluje OD řádky/sloupce pro externí zónu D1_E (I/50 je se sloučením v D1_E).
-    # link_id z posledního měření v UI; směr 1 = AB u one-way trunk.
-    corridor_observed:
-      - gateway_name: D1_E
-        observed_aadt: 14172.0
-        link_ids: [29215, 51596]
-        link_directions:
-          "29215": 1
-          "51596": 1
   odme:
     max_outer_iterations: 32
     entropy_step_size: 0.22
     convergence_tol: 0.0008
     assign_max_iter: 80
+    # Tertiary: cap upward class correction (count posts say „málo“, síť už přebytky).
+    # Trunk: floor — model podstřeluje oproti CSD na dálnicích/rychlostních.
+    class_residual_ratio_caps:
+      tertiary: 1.05
+    class_residual_ratio_floors:
+      trunk: 1.05
     stages:
       - name: "stabilize"
         max_iterations: 15
       - name: "refine"
         max_iterations: 25
   screenlines_path: "config/brno/screenlines.yaml"
-  # Vyloučení CSD ``sil`` z per-road validace a z auto ``auto_csd_*`` screenlines
-  # (okrajové úseky / špatně párovatelné na síť — viz měření v UI).
-  matching:
-    csd_validation_exclude_sil: ["23", "3846"]
+  auto_screenlines:
+    # Auto SL mimo poměr model/obs — nepočítat do SL max dev (špatný link / nulový tok).
+    exclude_auto_ratio_below: 0.20
+    exclude_auto_ratio_above: 5.0
 
 datasets:
   enabled: true

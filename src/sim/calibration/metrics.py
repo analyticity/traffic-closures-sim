@@ -151,15 +151,17 @@ def _supplement_class_ratios_from_screenlines(
     # Accumulate per-class obs/mod sums across screenlines
     class_obs: Dict[str, float] = {}
     class_mod: Dict[str, float] = {}
+    from sim.calibration.screenlines import screenline_excluded_from_benchmark
+
     for sl_name, sr in sl_results.items():
         sr_d = sr if isinstance(sr, dict) else {}
+        if screenline_excluded_from_benchmark(sl_name, sr_d):
+            continue
         obs_total = float(sr_d.get("observed_total") or 0)
         mod_total = float(sr_d.get("modeled_total") or 0)
         if obs_total <= 0 or mod_total <= 0:
             continue
         ratio = obs_total / mod_total
-        if ratio > 5.0 or ratio < 0.2:
-            continue
 
         per_link = sr_d.get("per_link", [])
         if not per_link and hasattr(sr, "per_link"):
@@ -201,6 +203,23 @@ def _supplement_class_ratios_from_screenlines(
     return merged
 
 
+def _clamp_class_ratios(
+    class_ratios: Dict[str, float],
+    odme_cfg: Dict[str, Any],
+) -> Dict[str, float]:
+    """Apply optional per-class floors/caps before class-residual OD correction."""
+    if not class_ratios:
+        return {}
+    out = dict(class_ratios)
+    for rc, cap in (odme_cfg.get("class_residual_ratio_caps") or {}).items():
+        if rc in out:
+            out[rc] = min(out[rc], float(cap))
+    for rc, floor in (odme_cfg.get("class_residual_ratio_floors") or {}).items():
+        if rc in out:
+            out[rc] = max(out[rc], float(floor))
+    return out
+
+
 def _apply_class_residual_correction(
     demand: np.ndarray,
     vol_df: pd.DataFrame,
@@ -236,9 +255,13 @@ def _apply_class_residual_correction(
 
     # Map screenlines to their dominant road class
     sl_class_map: Dict[str, str] = {}
+    from sim.calibration.screenlines import screenline_excluded_from_benchmark
+
     if sl_results:
         for sl_name, sr in sl_results.items():
             sr_d = sr if isinstance(sr, dict) else {}
+            if screenline_excluded_from_benchmark(sl_name, sr_d):
+                continue
             per_link = sr_d.get("per_link", [])
             if not per_link and hasattr(sr, "per_link"):
                 per_link = sr.per_link if sr.per_link else []

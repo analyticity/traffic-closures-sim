@@ -31,6 +31,7 @@ from sim.calibration.matching import (
     _export_matching_diagnostics,
     match_counts_to_links,
     match_quality_report,
+    resolve_matching_exclusions,
 )
 from sim.calibration.metrics import compute_extended_link_metrics, compute_geh, compute_stats
 from sim.calibration.observed import (
@@ -42,6 +43,8 @@ from sim.calibration.observed import (
     aggregate_model_by_class,
     load_csd,
     load_csd_as_link_counts,
+    resolve_csd_link_count_options,
+    load_screenlines_by_name,
     load_csd_unfiltered,
     load_pentlogram,
     normalize_csd_sil_key,
@@ -786,6 +789,7 @@ def compute_validation_benchmarks(
     daily_thresholds: Optional[Dict[str, Any]] = None,
     benchmarks: Optional[Dict[str, Any]] = None,
     holdout_stats: Optional[Dict[str, Any]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Check validation benchmarks for the model's time aggregation.
 
@@ -810,32 +814,52 @@ def compute_validation_benchmarks(
     jt_pct = jt_pass_count / max(jt_total, 1) * 100
     jt_pass = jt_pct >= jt_pass_pct_thr if jt_total > 0 else None
 
-    _AUTO_SL_PREFIXES = ("auto_gw_", "auto_csd_")
+    from sim.calibration.screenlines import (
+        annotate_screenline_benchmark_exclusion,
+        is_auto_screenline_name,
+        resolve_auto_screenline_reliability_cfg,
+        screenline_ratio_error_pct,
+    )
+
+    sl_annotated, excluded_sl = annotate_screenline_benchmark_exclusion(
+        screenline_results, cfg,
+    )
+    excluded_auto_sl = [n for n in excluded_sl if is_auto_screenline_name(n)]
+    sl_rel = resolve_auto_screenline_reliability_cfg(cfg)
+
     sl_max_error_all = 0.0
     sl_max_error_manual = 0.0
     sl_max_error_auto = 0.0
     n_manual_sl = 0
-    for sl_name, sr in screenline_results.items():
-        ratio = sr.get("ratio")
-        obs = sr.get("observed_total", 0)
-        if ratio is None or not obs or obs <= 0:
+    n_compared = 0
+    for sl_name, sr in sl_annotated.items():
+        if sr.get("excluded_from_benchmark"):
             continue
-        err = abs(ratio - 1.0) * 100
+        obs = float(sr.get("observed_total", 0) or 0)
+        if not obs or obs <= 0:
+            continue
+        n_compared += 1
+        err = screenline_ratio_error_pct(sr.get("ratio"))
         sl_max_error_all = max(sl_max_error_all, err)
-        is_auto = sl_name.startswith(_AUTO_SL_PREFIXES)
-        if is_auto:
+        if is_auto_screenline_name(sl_name):
             sl_max_error_auto = max(sl_max_error_auto, err)
         else:
             sl_max_error_manual = max(sl_max_error_manual, err)
             n_manual_sl += 1
 
-    sl_max_error = sl_max_error_manual if n_manual_sl > 0 else 0.0
+    sl_max_error = sl_max_error_manual if n_manual_sl > 0 else sl_max_error_auto
 
     result: Dict[str, Any] = {
         "model_time_period": model_time_period,
         "screenline_max_error_pct": round(sl_max_error_all, 1),
         "screenline_max_error_manual_pct": round(sl_max_error_manual, 1) if n_manual_sl > 0 else None,
         "screenline_max_error_auto_pct": round(sl_max_error_auto, 1),
+        "screenline_excluded": excluded_sl,
+        "screenline_excluded_auto": excluded_auto_sl,
+        "screenline_n_compared": n_compared,
+        "screenline_n_excluded": len(excluded_sl),
+        "screenline_reliability_ratio_below": sl_rel["ratio_below"],
+        "screenline_reliability_ratio_above": sl_rel["ratio_above"],
         "jt_within_tolerance_pct": round(jt_pct, 1) if jt_total > 0 else None,
         "jt_benchmark_pass": jt_pass,
         "jt_routes_checked": jt_total,
@@ -982,6 +1006,14 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
         "match_quality_min",
         calib_cfg.get("match_quality_min", 0.50),
     ))
+    exclude_objectids, exclude_csd_roads = resolve_matching_exclusions(calib_cfg)
+    from sim.calibration.screenlines import resolve_auto_screenline_reliability_cfg
+
+    _sl_rel = resolve_auto_screenline_reliability_cfg({"calibration": calib_cfg})
+    _ratio_kw = {
+        "exclude_ratio_below": _sl_rel["ratio_below"],
+        "exclude_ratio_above": _sl_rel["ratio_above"],
+    }
 
     # Swap closures to validation period (e.g. 2025)
     bc_cfg = cfg.get("baseline_closures") or {}
@@ -1037,13 +1069,23 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
                 calib_share=float(split_cfg.get("calib_share", 0.65)),
                 random_seed=int(split_cfg.get("random_seed", 42)),
             )
-            pent = load_csd_as_link_counts(calib_csd, links_gdf)
+            _csd_opts = resolve_csd_link_count_options(calib_cfg)
+            _csd_opts["screenlines_by_name"] = load_screenlines_by_name(cfg)
+            _csd_opts["metric_epsg"] = get_metric_epsg(cfg)
+            pent = load_csd_as_link_counts(calib_csd, links_gdf, **_csd_opts)
             if not pent.empty:
                 agg_corr = bool(calib_cfg.get("aggregate_corridor", True))
+                _ref_match = bool((calib_cfg.get("matching") or {}).get(
+                    "require_csd_road_ref_match", False,
+                ))
                 matched = match_counts_to_links(pent, links_gdf, buffer_m=buffer_m,
                                                  aggregate_corridor=agg_corr,
                                                  vol_col=vol_col,
-                                                 match_quality_min=mq_min)
+                                                 match_quality_min=mq_min,
+                                                 exclude_objectids=exclude_objectids,
+                                                 exclude_csd_roads=exclude_csd_roads,
+                                                 require_csd_road_ref_match=_ref_match,
+                                                 **_ratio_kw)
                 vc = vol_col if vol_col and vol_col in matched.columns else None
                 compare_vc = "_corridor_volume" if "_corridor_volume" in matched.columns else vc
                 if compare_vc and compare_vc in matched.columns:
@@ -1071,7 +1113,10 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
             matched = match_counts_to_links(pent, links_gdf, buffer_m=buffer_m,
                                              aggregate_corridor=agg_corr,
                                              vol_col=vol_col,
-                                             match_quality_min=mq_min)
+                                             match_quality_min=mq_min,
+                                             exclude_objectids=exclude_objectids,
+                                             exclude_csd_roads=exclude_csd_roads,
+                                             **_ratio_kw)
             vc = vol_col if vol_col and vol_col in matched.columns else None
             compare_vc = "_corridor_volume" if "_corridor_volume" in matched.columns else vc
             if compare_vc and compare_vc in matched.columns:
@@ -1185,7 +1230,12 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
     logger.info("\n3) Screenline validation ...")
     sl_results: Dict[str, Any] = {}
     try:
-        from sim.calibration.screenlines import load_screenlines_with_auto, evaluate_all_screenlines, _dedup_cross_screenline_links
+        from sim.calibration.screenlines import (
+            annotate_screenline_benchmark_exclusion,
+            load_screenlines_with_auto,
+            evaluate_all_screenlines,
+            _dedup_cross_screenline_links,
+        )
         csd_for_auto = None
         csd_full_for_gw = None
         try:
@@ -1210,8 +1260,8 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
                         sl.links = sl_query[sl.name]
             sl_res = evaluate_all_screenlines(
                 screenlines, vol_df,
-                    matched if "matched" in locals() else gpd.GeoDataFrame(),
-                vol_col or "", obs_col, links_gdf,
+                matched if "matched" in locals() else gpd.GeoDataFrame(),
+                vol_col or "", obs_col, links_gdf, cfg=cfg,
             )
             for sn, sr in sl_res.items():
                 # Omit screenlines with no trustworthy observed total (would
@@ -1219,9 +1269,31 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
                 if not sr.observed_total or float(sr.observed_total) <= 0:
                     continue
                 sl_results[sn] = sr.to_dict()
-                if sr.observed_total and sr.observed_total > 0:
-                    logger.info(f"  {sn}: mod={sr.modeled_total:,.0f} obs={sr.observed_total:,.0f} "
-                          f"ratio={sr.ratio:.2f} GEH={sr.geh:.1f}")
+            sl_results, sl_excluded = annotate_screenline_benchmark_exclusion(
+                sl_results, cfg,
+            )
+            for sn, sr in sl_results.items():
+                if not sr.get("observed_total") or float(sr["observed_total"]) <= 0:
+                    continue
+                if sr.get("excluded_from_benchmark"):
+                    logger.warning(
+                        "  %s: excluded from comparison (mod=%s obs=%s ratio=%s)",
+                        sn,
+                        f"{sr.get('modeled_total', 0):,.0f}",
+                        f"{sr.get('observed_total', 0):,.0f}",
+                        f"{sr.get('ratio', 0):.2f}" if sr.get("ratio") is not None else "?",
+                    )
+                    continue
+                logger.info(
+                    f"  {sn}: mod={sr['modeled_total']:,.0f} "
+                    f"obs={sr['observed_total']:,.0f} "
+                    f"ratio={sr['ratio']:.2f} GEH={sr['geh']:.1f}"
+                )
+            if sl_excluded:
+                logger.info(
+                    "  Screenlines excluded from benchmarks: %s",
+                    ", ".join(sl_excluded),
+                )
             report["screenlines"] = sl_results
         else:
             logger.warning("  No screenlines defined")
@@ -1372,6 +1444,7 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
         daily_thresholds=daily_conv,
         benchmarks=bm_cfg,
         holdout_stats=holdout_stats,
+        cfg=cfg,
     )
     report["benchmarks"] = benchmarks
     qcfg = (calib_cfg.get("quality_gates") or {})
@@ -1484,6 +1557,10 @@ def run_match_diagnostics(config_path: str | Path = "config/brno/sim.yaml") -> N
     conflict_res = str(calib_cfg.get("match_conflict_resolution", "nearest"))
     agg_corridor = bool(calib_cfg.get("aggregate_corridor", True))
     mq_min = float(calib_cfg.get("match_quality_min", 0.50))
+    exclude_objectids, exclude_csd_roads = resolve_matching_exclusions(calib_cfg)
+    from sim.calibration.screenlines import resolve_auto_screenline_reliability_cfg
+
+    _sl_rel = resolve_auto_screenline_reliability_cfg({"calibration": calib_cfg})
 
     count_target = str(calib_cfg.get("count_target", "motor_total"))
     _ct_map = {"car_only": "observed_car", "motor_total": "observed_motor_total", "total": "observed_total"}
@@ -1512,7 +1589,10 @@ def run_match_diagnostics(config_path: str | Path = "config/brno/sim.yaml") -> N
 
     if count_source == "csd_split":
         csd_full = load_csd(cfg)
-        pent = load_csd_as_link_counts(csd_full, links_gdf)
+        _csd_opts = resolve_csd_link_count_options(calib_cfg)
+        _csd_opts["screenlines_by_name"] = load_screenlines_by_name(cfg)
+        _csd_opts["metric_epsg"] = get_metric_epsg(cfg)
+        pent = load_csd_as_link_counts(csd_full, links_gdf, **_csd_opts)
         if pent.empty:
             raise RuntimeError(
                 "CSD produced no link-level count anchors for diagnostics. "
@@ -1531,6 +1611,9 @@ def run_match_diagnostics(config_path: str | Path = "config/brno/sim.yaml") -> N
     if vol_col and "link_id" in vol_df.columns:
         links_gdf = links_gdf.merge(vol_df[["link_id", vol_col]], on="link_id", how="left")
 
+    _ref_match = bool((calib_cfg.get("matching") or {}).get(
+        "require_csd_road_ref_match", False,
+    ))
     matched = match_counts_to_links(
         pent, links_gdf,
         buffer_m=buffer_m,
@@ -1539,6 +1622,11 @@ def run_match_diagnostics(config_path: str | Path = "config/brno/sim.yaml") -> N
         aggregate_corridor=agg_corridor,
         vol_col=vol_col,
         match_quality_min=mq_min,
+        exclude_objectids=exclude_objectids,
+        exclude_csd_roads=exclude_csd_roads,
+        exclude_ratio_below=_sl_rel["ratio_below"],
+        exclude_ratio_above=_sl_rel["ratio_above"],
+        require_csd_road_ref_match=_ref_match,
     )
 
     compare_col = "_corridor_volume" if "_corridor_volume" in matched.columns else vol_col

@@ -38,6 +38,22 @@ from sim.supernetwork.routing import build_gateway_costs, build_gateway_lookup
 logger = logging.getLogger(__name__)
 
 
+def _gateway_boundary_angles(gateways: gpd.GeoDataFrame, cfg: SuperCfg) -> Dict[str, float]:
+    """Map gateway_name → boundary_angle (degrees on AOI), from frame or diagnostics CSV."""
+    gdf = gateways
+    if "boundary_angle" not in gdf.columns and cfg.gateway_diagnostics_path.exists():
+        diag = pd.read_csv(cfg.gateway_diagnostics_path, usecols=["gateway_name", "boundary_angle"])
+        gdf = gdf.merge(diag, on="gateway_name", how="left")
+    if "boundary_angle" not in gdf.columns:
+        return {}
+    out: Dict[str, float] = {}
+    for _, row in gdf.iterrows():
+        ang = row.get("boundary_angle")
+        if pd.notna(ang):
+            out[str(row["gateway_name"])] = float(ang)
+    return out
+
+
 def run(config_path: str = "config/brno/sim.yaml") -> Dict[str, Any]:
     t_run = time.perf_counter()
     phase_t = time.perf_counter()
@@ -184,7 +200,17 @@ def run(config_path: str = "config/brno/sim.yaml") -> Dict[str, Any]:
     profile["phases_s"]["write_gateway_lookup"] = round(time.perf_counter() - phase_t, 3)
 
     phase_t = time.perf_counter()
-    classified, through_pairs = classify_relations(G, commuting_pairs, gateway_lookup, gateway_pair_costs, internal_zone_names, cfg_root, cfg)
+    gateway_boundary_angles = _gateway_boundary_angles(gateways, cfg)
+    classified, through_pairs = classify_relations(
+        G,
+        commuting_pairs,
+        gateway_lookup,
+        gateway_pair_costs,
+        internal_zone_names,
+        cfg_root,
+        cfg,
+        gateway_boundary_angles=gateway_boundary_angles,
+    )
     profile["classify_relations"] = classified.attrs.get("profile", {})
     profile["phases_s"]["classify_relations"] = round(time.perf_counter() - phase_t, 3)
     phase_t = time.perf_counter()

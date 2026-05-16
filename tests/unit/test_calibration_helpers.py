@@ -671,3 +671,17 @@ class TestBenchmarkSaveRestore:
         assert matrix_file.read_bytes() == b"original-content"
         orig = matrix_file.with_suffix(".aem.orig")
         assert orig.read_bytes() == b"original-content"
+
+
+def test_clamp_class_ratios_caps_and_floors():
+    from sim.calibration.metrics import _clamp_class_ratios
+
+    raw = {"tertiary": 1.8, "trunk": 0.9, "secondary": 1.1}
+    cfg = {
+        "class_residual_ratio_caps": {"tertiary": 1.05},
+        "class_residual_ratio_floors": {"trunk": 1.05},
+    }
+    out = _clamp_class_ratios(raw, cfg)
+    assert out["tertiary"] == 1.05
+    assert out["trunk"] == 1.05
+    assert out["secondary"] == 1.1

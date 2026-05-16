@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 import geopandas as gpd
 import numpy as np
@@ -13,6 +13,118 @@ from sim._metrics import compute_geh
 from sim.defaults import SIM_DEFAULTS as _SIM_DEFAULTS
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_exclude_objectids(calib_cfg: Dict[str, Any]) -> Set[int]:
+    """Pentlogram/CSD ``objectid`` values to force-exclude from calibration matching."""
+    return resolve_matching_exclusions(calib_cfg)[0]
+
+
+def resolve_exclude_csd_roads(calib_cfg: Dict[str, Any]) -> Set[str]:
+    """CSD ``sil`` / anchor ``csd_road`` values to force-exclude (stable vs. synthetic objectid)."""
+    return resolve_matching_exclusions(calib_cfg)[1]
+
+
+def resolve_matching_exclusions(calib_cfg: Dict[str, Any]) -> tuple[Set[int], Set[str]]:
+    """Manual count exclusions from ``calibration.matching`` config."""
+    match_cfg = calib_cfg.get("matching") or {}
+    raw_ids = match_cfg.get("exclude_objectids") or calib_cfg.get("exclude_objectids") or []
+    raw_roads = match_cfg.get("exclude_csd_roads") or calib_cfg.get("exclude_csd_roads") or []
+    objectids = {int(x) for x in raw_ids}
+    csd_roads = {str(x).strip() for x in raw_roads if str(x).strip()}
+    return objectids, csd_roads
+
+
+def _apply_ratio_exclusions(
+    joined: gpd.GeoDataFrame,
+    modeled_col: str,
+    *,
+    observed_col: str = "observed_car",
+    ratio_below: float = 0.20,
+    ratio_above: float = 5.0,
+    id_col: str = "objectid",
+) -> gpd.GeoDataFrame:
+    """Exclude matched counts with extreme modeled/observed corridor ratios.
+
+    Uses the same thresholds as ``calibration.auto_screenlines.exclude_auto_ratio_*``
+    so Bias map / ODME stay consistent with auto screenline reliability rules.
+    """
+    if modeled_col not in joined.columns or observed_col not in joined.columns:
+        return joined
+    if "_excluded" not in joined.columns:
+        joined["_excluded"] = False
+
+    matched = joined["_matched"] if "_matched" in joined.columns else pd.Series(True, index=joined.index)
+    obs = pd.to_numeric(joined[observed_col], errors="coerce").fillna(0.0)
+    mod = pd.to_numeric(joined[modeled_col], errors="coerce")
+
+    usable = matched & (~joined["_excluded"]) & (obs > 0) & mod.notna()
+    if not usable.any():
+        return joined
+
+    mod_f = mod.astype(float)
+    ratio = mod_f / obs
+    exclude = usable & (
+        (mod_f <= 0)
+        | (ratio < ratio_below)
+        | ((ratio_above > 0) & (ratio > ratio_above))
+    )
+    n = int(exclude.sum())
+    if n:
+        joined.loc[exclude, "_excluded"] = True
+        if id_col in joined.columns:
+            ids = joined.loc[exclude, id_col].dropna().astype(int).tolist()[:20]
+            logger.info(
+                "  Matching: excluded %d count station(s) outside ratio [%.2f, %.2f]: %s",
+                n,
+                ratio_below,
+                ratio_above,
+                ids,
+            )
+    return joined
+
+
+def _apply_manual_exclusions(
+    joined: gpd.GeoDataFrame,
+    exclude_objectids: Iterable[int],
+    exclude_csd_roads: Iterable[str] = (),
+    *,
+    id_col: str = "objectid",
+    csd_road_col: str = "csd_road",
+) -> gpd.GeoDataFrame:
+    ids = {int(x) for x in exclude_objectids}
+    roads = {str(x).strip() for x in exclude_csd_roads if str(x).strip()}
+    if not ids and not roads:
+        return joined
+    if "_excluded" not in joined.columns:
+        joined["_excluded"] = False
+
+    mask = pd.Series(False, index=joined.index)
+    if ids and id_col in joined.columns:
+        mask |= joined[id_col].astype(int).isin(ids)
+    if roads and csd_road_col in joined.columns:
+        mask |= joined[csd_road_col].astype(str).str.strip().isin(roads)
+
+    n = int(mask.sum())
+    if n:
+        joined.loc[mask, "_excluded"] = True
+        parts: List[str] = []
+        if ids and id_col in joined.columns:
+            oid_hits = joined.loc[mask & joined[id_col].astype(int).isin(ids), id_col]
+            if len(oid_hits):
+                parts.append(f"objectid={oid_hits.astype(int).tolist()}")
+        if roads and csd_road_col in joined.columns:
+            road_hits = sorted(
+                joined.loc[mask, csd_road_col].astype(str).str.strip().unique().tolist()
+            )
+            if road_hits:
+                parts.append(f"csd_road={road_hits}")
+        logger.info(
+            "  Matching: manually excluded %d count station(s): %s",
+            n,
+            "; ".join(parts) if parts else "see matching_diagnostics.csv",
+        )
+    return joined
 
 
 from sim.calibration.gateway import _MAJOR_ROAD_TYPES, _MAJOR_ROAD_TYPES_STRICT  # noqa: F401
@@ -279,13 +391,16 @@ def _apply_exclusion_scoring(
         else pd.Series(0, index=joined.index)
     )
     zero_major = (vol_vals <= 0) & (obs_total > 0) & link_types.isin(_MAJOR_HW)
-    n_zero_major = int(zero_major.sum())
+    newly_disconnected = zero_major & (~joined["_excluded"])
+    n_zero_major = int(newly_disconnected.sum())
     if n_zero_major > 0:
-        for idx in joined.index[zero_major]:
+        joined.loc[newly_disconnected, "_excluded"] = True
+        for idx in joined.index[newly_disconnected]:
             row = joined.loc[idx]
             logger.warning(
                 "  CONNECTIVITY WARNING: %s link %s has 0 modelled volume "
-                "but %s observed — likely disconnected from graph",
+                "but %s observed — likely disconnected from graph "
+                "(excluded from calibration comparison)",
                 row.get("link_type", "?"),
                 row.get("link_id", row.get("csd_road", "?")),
                 f"{obs_total.loc[idx]:,.0f}",
@@ -307,6 +422,11 @@ def match_counts_to_links(
     vol_col: Optional[str] = None,
     match_quality_min: float = 0.50,
     skip_exclusion: bool = False,
+    exclude_objectids: Optional[Iterable[int]] = None,
+    exclude_csd_roads: Optional[Iterable[str]] = None,
+    exclude_ratio_below: Optional[float] = None,
+    exclude_ratio_above: Optional[float] = None,
+    require_csd_road_ref_match: bool = False,
 ) -> gpd.GeoDataFrame:
     """Spatial-join observed count points/lines to nearest network links.
 
@@ -408,6 +528,21 @@ def match_counts_to_links(
                     except (TypeError, ValueError):
                         pass
 
+            if require_csd_road_ref_match:
+                csd_road = pt_row.get("csd_road")
+                if csd_road is not None and not (isinstance(csd_road, float) and np.isnan(csd_road)):
+                    from sim.calibration.observed import normalize_csd_sil_key
+
+                    want = normalize_csd_sil_key(csd_road)
+                    link_ref = str(cand.get("osm_ref", "") or "")
+                    link_refs = {
+                        normalize_csd_sil_key(p)
+                        for p in link_ref.split(";")
+                        if str(p).strip()
+                    }
+                    if want not in link_refs:
+                        continue
+
             lt = str(cand.get("link_type", ""))
             rw = _ROAD_CLASS_W.get(lt, 0.06)
             dn = d / max(buffer_m, 1.0)
@@ -501,6 +636,27 @@ def match_counts_to_links(
     for col in ("_count_bearing", "_link_bearing"):
         if col in joined.columns:
             joined = joined.drop(columns=[col])
+
+    joined = _apply_manual_exclusions(
+        joined,
+        exclude_objectids or [],
+        exclude_csd_roads or [],
+        id_col=id_col,
+    )
+
+    if (
+        not skip_exclusion
+        and exclude_ratio_below is not None
+        and exclude_ratio_above is not None
+        and corr_col
+    ):
+        joined = _apply_ratio_exclusions(
+            joined,
+            corr_col,
+            ratio_below=float(exclude_ratio_below),
+            ratio_above=float(exclude_ratio_above),
+            id_col=id_col,
+        )
 
     # Diagnostic summary of matched vs unmatched/excluded
     n_total = len(joined)

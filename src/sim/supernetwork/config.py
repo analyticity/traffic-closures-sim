@@ -28,6 +28,7 @@ class SuperCfg:
     detour_ratio_max: float
     max_extra_minutes: float
     allow_same_gateway_pair: bool
+    reject_same_boundary_sector: bool
     model_area_path: Path
     zones_path: Path
     gateway_seed_lookup_path: Path
@@ -78,6 +79,9 @@ def build_cfg(cfg_root: Dict[str, Any]) -> SuperCfg:
         detour_ratio_max=float(get_nested(sn, ["relation_filter", "detour_ratio_max"], 1.40)),
         max_extra_minutes=float(get_nested(sn, ["relation_filter", "max_extra_minutes"], 25.0)),
         allow_same_gateway_pair=bool(get_nested(sn, ["relation_filter", "allow_same_gateway_pair"], False)),
+        reject_same_boundary_sector=bool(
+            get_nested(sn, ["relation_filter", "reject_same_boundary_sector"], False)
+        ),
         model_area_path=zoning_output_dir / "model_area.geojson",
         zones_path=zoning_output_dir / "zones.geojson",
         gateway_seed_lookup_path=as_path(get_nested(cfg_root, ["zoning", "external_gateways", "export_lookup_path"], str(general_cache / "gateway_lookup_seed.parquet"))),

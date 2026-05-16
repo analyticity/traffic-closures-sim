@@ -16,6 +16,11 @@
 # Od opravy v src/sim/calibration/screenlines.py se u D## numerický fallback
 # vypíná, explicitní trunk linky se zahodí a kolmice se bere přes nejbližší
 # úsek motorway s daným ref (D35_E tedy cílí na dálnici, ne na I/35).
+#
+# Vypnuté brány v config/olomouc/sim.yaml →
+#   calibration.auto_screenlines.exclude_gateway_names
+# - 437_E: snap na obytnou síť, řez na secondary spurs I/437 (1902/1904)
+# - D46_SW_2: duplicitní řez I/46 SW, modeled ~2× oproti CSD (~75 % chyba)
 
 screenlines:
   - name: "auto_gw_D35_NW"

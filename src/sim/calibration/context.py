@@ -33,6 +33,7 @@ from sim.calibration.gateway import (
 from sim.calibration.matching import (
     match_counts_to_links,
     match_quality_report,
+    resolve_matching_exclusions,
     _export_matching_diagnostics,
 )
 from sim.calibration.metrics import (
@@ -40,6 +41,7 @@ from sim.calibration.metrics import (
     compute_geh,
     _compute_class_residuals,
     _supplement_class_ratios_from_screenlines,
+    _clamp_class_ratios,
     _apply_class_residual_correction,
     compute_extended_link_metrics,
     compute_class_volume_breakdown,
@@ -48,6 +50,8 @@ from sim.calibration.observed import (
     load_csd,
     load_csd_unfiltered,
     load_csd_as_link_counts,
+    load_screenlines_by_name,
+    resolve_csd_link_count_options,
     load_pentlogram,
     split_csd_for_calibration,
     validate_geometries_or_fail,
@@ -253,6 +257,16 @@ class _CalibrationContext:
         self.conflict_res = str(calib_cfg.get("match_conflict_resolution", "nearest"))
         self.agg_corridor = bool(calib_cfg.get("aggregate_corridor", True))
         self.match_quality_min = float(calib_cfg.get("match_quality_min", 0.50))
+        self.exclude_objectids, self.exclude_csd_roads = resolve_matching_exclusions(calib_cfg)
+        match_cfg = calib_cfg.get("matching") or {}
+        self.require_csd_road_ref_match = bool(
+            match_cfg.get("require_csd_road_ref_match", False),
+        )
+        from sim.calibration.screenlines import resolve_auto_screenline_reliability_cfg
+
+        _sl_rel = resolve_auto_screenline_reliability_cfg({"calibration": calib_cfg})
+        self.exclude_ratio_below = float(_sl_rel["ratio_below"])
+        self.exclude_ratio_above = float(_sl_rel["ratio_above"])
         self.count_target = str(calib_cfg.get("count_target", "motor_total"))
         _COUNT_TARGET_COL = {
             "car_only": "observed_car",
@@ -344,7 +358,12 @@ class _CalibrationContext:
                 calib_share=float(split_cfg.get("calib_share", 0.65)),
                 random_seed=int(split_cfg.get("random_seed", 42)),
             )
-            self.pent = load_csd_as_link_counts(calib_csd, self.links_gdf)
+            _csd_opts = resolve_csd_link_count_options(calib_cfg)
+            _csd_opts["screenlines_by_name"] = load_screenlines_by_name(cfg)
+            _csd_opts["metric_epsg"] = get_metric_epsg(cfg)
+            self.pent = load_csd_as_link_counts(
+                calib_csd, self.links_gdf, **_csd_opts,
+            )
             if self.pent.empty:
                 raise RuntimeError(
                     "CSD split produced no link-level observations for calibration. "
@@ -623,14 +642,30 @@ class _CalibrationContext:
             vol_col=vol_col,
             match_quality_min=self.match_quality_min,
             skip_exclusion=(iteration > 1),
+            exclude_objectids=self.exclude_objectids,
+            exclude_csd_roads=self.exclude_csd_roads,
+            exclude_ratio_below=self.exclude_ratio_below,
+            exclude_ratio_above=self.exclude_ratio_above,
+            require_csd_road_ref_match=self.require_csd_road_ref_match,
         )
         if iteration == 1:
-            if "_excluded" in matched.columns and "objectid" in matched.columns:
-                excl_ids = set(matched.loc[matched["_excluded"], "objectid"].dropna().astype(int))
-                if excl_ids:
+            if "_excluded" in matched.columns:
+                excl = matched[matched["_excluded"]]
+                if not excl.empty:
                     n_before = len(self.pent)
-                    self.pent = self.pent[~self.pent["objectid"].isin(excl_ids)].copy()
-                    logger.info(f"  Pre-filter: removed {n_before - len(self.pent)} excluded stations")
+                    keep = pd.Series(True, index=self.pent.index)
+                    if "objectid" in self.pent.columns and "objectid" in excl.columns:
+                        excl_ids = set(excl["objectid"].dropna().astype(int))
+                        keep &= ~self.pent["objectid"].isin(excl_ids)
+                    if self.exclude_csd_roads and "csd_road" in self.pent.columns:
+                        keep &= ~self.pent["csd_road"].astype(str).str.strip().isin(
+                            self.exclude_csd_roads,
+                        )
+                    self.pent = self.pent[keep].copy()
+                    if len(self.pent) < n_before:
+                        logger.info(
+                            f"  Pre-filter: removed {n_before - len(self.pent)} excluded stations"
+                        )
             _export_matching_diagnostics(
                 matched,
                 "_corridor_volume" if "_corridor_volume" in matched.columns else vol_col,
@@ -663,42 +698,55 @@ class _CalibrationContext:
             self.best_demand = self.mat.matrix[self.core_name][:, :].copy()
             self.best_iteration = iteration
 
-    _NEAR_ZERO_RATIO = 0.05
-
     def evaluate_and_log_screenlines(self, vol_df: pd.DataFrame, matched: gpd.GeoDataFrame, vol_col: Optional[str]):
         """Evaluate screenlines and return (sl_results_dict, max_pct_dev).
 
-        Auto-generated screenlines (``auto_gw_*``, ``auto_csd_*``) whose
-        modeled/observed ratio falls below ``_NEAR_ZERO_RATIO`` are excluded
-        from the ``max_sl_pct_dev`` aggregate.  These typically represent
-        network-boundary artifacts where the resolved link carries almost no
-        assigned traffic despite a positive CSD observation.
+        Screenlines outside the benchmark ratio band (default mod/obs < 0.2 or
+        > 5, or zero modeled flow) are excluded from comparison metrics — see
+        ``calibration.auto_screenlines.exclude_auto_ratio_*``.
         """
-        from sim.calibration.screenlines import evaluate_all_screenlines
+        from sim.calibration.screenlines import (
+            annotate_screenline_benchmark_exclusion,
+            evaluate_all_screenlines,
+            screenline_ratio_error_pct,
+        )
 
         sl_results: Dict[str, Any] = {}
         max_sl_pct_dev = 0.0
         if self.screenlines and vol_col:
             sl_res = evaluate_all_screenlines(
-                self.screenlines, vol_df, matched, vol_col, self.obs_col, self.links_gdf,
+                self.screenlines, vol_df, matched, vol_col, self.obs_col,
+                self.links_gdf, cfg=self.cfg,
             )
             for sn, sr in sl_res.items():
                 sl_results[sn] = sr.to_dict()
-                if sr.observed_total > 0 and np.isfinite(sr.ratio):
-                    is_auto = sn.startswith("auto_gw_") or sn.startswith("auto_csd_")
-                    if is_auto and sr.ratio < self._NEAR_ZERO_RATIO:
-                        logger.warning(
-                            "  SL '%s': ratio=%.3f (mod=%.0f obs=%.0f) — "
-                            "near-zero auto screenline, excluded from max_pct_dev",
-                            sn, sr.ratio, sr.modeled_total, sr.observed_total,
-                        )
-                        continue
-                    dev = abs(sr.ratio - 1.0) * 100.0
+            sl_results, excluded = annotate_screenline_benchmark_exclusion(
+                sl_results, self.cfg,
+            )
+            for sn, sr in sl_results.items():
+                if sr.get("excluded_from_benchmark"):
+                    logger.warning(
+                        "  SL '%s': ratio=%.3f (mod=%.0f obs=%.0f) — "
+                        "excluded from comparison (outside benchmark ratio band)",
+                        sn,
+                        float(sr.get("ratio") or 0.0),
+                        float(sr.get("modeled_total") or 0.0),
+                        float(sr.get("observed_total") or 0.0),
+                    )
+                    continue
+                if sr.get("observed_total", 0) > 0 and np.isfinite(sr.get("ratio")):
+                    dev = screenline_ratio_error_pct(sr.get("ratio"))
                     max_sl_pct_dev = max(max_sl_pct_dev, dev)
                     logger.info(
-                        f"  SL '{sn}': mod={sr.modeled_total:,.0f} "
-                        f"obs={sr.observed_total:,.0f} ratio={sr.ratio:.2f} GEH={sr.geh:.1f}"
+                        f"  SL '{sn}': mod={sr['modeled_total']:,.0f} "
+                        f"obs={sr['observed_total']:,.0f} ratio={sr['ratio']:.2f} "
+                        f"GEH={sr['geh']:.1f}"
                     )
+            if excluded:
+                logger.info(
+                    "  Screenlines excluded from comparison: %s",
+                    ", ".join(excluded),
+                )
         return sl_results, max_sl_pct_dev
 
     def mark_stalled(self, reason: str) -> None:
@@ -777,6 +825,7 @@ class _CalibrationContext:
         class_ratios = _supplement_class_ratios_from_screenlines(
             sl_results, self.links_gdf, class_ratios,
         )
+        class_ratios = _clamp_class_ratios(class_ratios, self.odme_cfg)
         if class_ratios:
             cr_logs = _apply_class_residual_correction(
                 demand, vol_df, self.links_gdf, class_ratios,

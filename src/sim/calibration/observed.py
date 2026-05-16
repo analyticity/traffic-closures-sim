@@ -600,9 +600,159 @@ _CSD_COMPATIBLE_LINK_TYPES: dict = {
 _MIN_VOL_FOR_CSD_LW = _SIM_DEFAULTS["calibration"]["matching"]["min_vol_for_csd_lw"]
 
 
+def resolve_csd_link_count_options(calib_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """CSD anchor overrides from ``calibration.matching`` config."""
+    match_cfg = (calib_cfg or {}).get("matching") or {}
+    raw_obs = match_cfg.get("csd_observed_overrides") or {}
+    raw_selectors = match_cfg.get("csd_anchor_selectors") or {}
+    # Deprecated: prefer ``csd_anchor_selectors`` (cut / screenline / near).
+    raw_link_ids = match_cfg.get("csd_anchor_link_ids") or {}
+    observed_overrides: Dict[str, Dict[str, float]] = {}
+    for road, vals in raw_obs.items():
+        key = normalize_csd_sil_key(road)
+        if not isinstance(vals, dict):
+            continue
+        observed_overrides[key] = {
+            k: float(v) for k, v in vals.items()
+            if k in ("observed_car", "observed_motor_total", "observed_total", "observed_truck")
+        }
+    anchor_selectors: Dict[str, Dict[str, Any]] = {}
+    for road, spec in raw_selectors.items():
+        key = normalize_csd_sil_key(road)
+        if isinstance(spec, dict):
+            anchor_selectors[key] = dict(spec)
+    anchor_link_ids = {
+        normalize_csd_sil_key(road): int(lid)
+        for road, lid in raw_link_ids.items()
+    }
+    return {
+        "observed_overrides": observed_overrides,
+        "anchor_selectors": anchor_selectors,
+        "anchor_link_ids": anchor_link_ids,
+    }
+
+
+def load_screenlines_by_name(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Load manual/auto screenline defs keyed by name (for CSD anchor selection)."""
+    try:
+        from sim.calibration.screenlines import load_screenlines_with_auto
+
+        csd_for_auto = None
+        try:
+            csd_for_auto = load_csd(cfg)
+        except Exception:
+            pass
+        sls = load_screenlines_with_auto(cfg, csd_df=csd_for_auto)
+        return {sl.name: sl for sl in sls}
+    except Exception:
+        logger.debug("Screenlines not available for CSD anchor selection", exc_info=True)
+        return {}
+
+
+def _pick_csd_anchor_links(
+    matched_links: gpd.GeoDataFrame,
+    selector: Dict[str, Any],
+    links_gdf: gpd.GeoDataFrame,
+    *,
+    screenlines_by_name: Optional[Dict[str, Any]] = None,
+    metric_epsg: int = 5514,
+) -> gpd.GeoDataFrame:
+    """Narrow CSD anchor candidates using a stable selector (not link_id)."""
+    from sim.calibration.screenlines import ScreenlineDef, resolve_screenline_links
+
+    if "screenline" in selector:
+        sl_name = str(selector["screenline"])
+        sl = (screenlines_by_name or {}).get(sl_name)
+        if sl is None:
+            logger.warning(
+                "CSD anchor screenline '%s' not found — using default link pick",
+                sl_name,
+            )
+            return matched_links
+        lids = {int(lid) for lid, _ in resolve_screenline_links(sl, links_gdf, metric_epsg)}
+    elif "cut" in selector:
+        cut = selector["cut"] or {}
+        sl = ScreenlineDef(
+            name="_csd_anchor_cut",
+            geometry_wkt=cut.get("geometry_wkt"),
+            attr_filter=dict(cut.get("filter") or {}),
+            expected_links=cut.get("expected_links"),
+        )
+        pick_mode = str(cut.get("pick", "intersect")).strip().lower()
+        geom_wkt = cut.get("geometry_wkt")
+        if pick_mode == "nearest" and geom_wkt:
+            from shapely import wkt as shapely_wkt
+            import pyproj
+            from shapely.ops import transform as shapely_transform
+
+            geom_raw = shapely_wkt.loads(geom_wkt)
+            transformer = pyproj.Transformer.from_crs(
+                "EPSG:4326", f"EPSG:{metric_epsg}", always_xy=True,
+            )
+            cut_metric = shapely_transform(transformer.transform, geom_raw)
+            work = (
+                matched_links.to_crs(epsg=metric_epsg)
+                if matched_links.crs and matched_links.crs.to_epsg() != metric_epsg
+                else matched_links
+            )
+            dists = work.geometry.distance(cut_metric)
+            return matched_links.loc[[dists.idxmin()]]
+        lids = {int(lid) for lid, _ in resolve_screenline_links(sl, links_gdf, metric_epsg)}
+    elif "near" in selector:
+        near = selector["near"] or {}
+        lon = near.get("lon", near.get("lng"))
+        lat = near.get("lat")
+        if lon is None or lat is None:
+            logger.warning("CSD anchor near: missing lon/lat — using default link pick")
+            return matched_links
+        pt = gpd.GeoSeries(
+            [gpd.points_from_xy([float(lon)], [float(lat)])[0]],
+            crs="EPSG:4326",
+        ).to_crs(epsg=metric_epsg).iloc[0]
+        work = matched_links.to_crs(epsg=metric_epsg) if matched_links.crs else matched_links
+        dists = work.geometry.distance(pt)
+        return matched_links.loc[[dists.idxmin()]]
+    else:
+        logger.warning("Unknown CSD anchor selector keys %s — using default pick", list(selector))
+        return matched_links
+
+    if not lids or "link_id" not in matched_links.columns:
+        return matched_links
+    picked = matched_links[matched_links["link_id"].astype(int).isin(lids)]
+    if picked.empty:
+        logger.warning(
+            "CSD anchor selector %s matched no links among sil candidates — default pick",
+            selector,
+        )
+        return matched_links
+    tie_near = (selector.get("cut") or {}).get("tie_break_near")
+    if len(picked) > 1 and isinstance(tie_near, dict):
+        lon = tie_near.get("lon", tie_near.get("lng"))
+        lat = tie_near.get("lat")
+        if lon is not None and lat is not None:
+            pt = gpd.GeoSeries(
+                [gpd.points_from_xy([float(lon)], [float(lat)])[0]],
+                crs="EPSG:4326",
+            ).to_crs(epsg=metric_epsg).iloc[0]
+            work = (
+                picked.to_crs(epsg=metric_epsg)
+                if picked.crs and picked.crs.to_epsg() != metric_epsg
+                else picked
+            )
+            dists = work.geometry.distance(pt)
+            picked = picked.loc[[dists.idxmin()]]
+    return picked
+
+
 def load_csd_as_link_counts(
     csd: pd.DataFrame,
     links_gdf: gpd.GeoDataFrame,
+    *,
+    observed_overrides: Optional[Dict[str, Dict[str, float]]] = None,
+    anchor_selectors: Optional[Dict[str, Dict[str, Any]]] = None,
+    anchor_link_ids: Optional[Dict[str, int]] = None,
+    screenlines_by_name: Optional[Dict[str, Any]] = None,
+    metric_epsg: Optional[int] = None,
 ) -> gpd.GeoDataFrame:
     """Convert CSD sections into a pentlogram-compatible GeoDataFrame.
 
@@ -642,6 +792,17 @@ def load_csd_as_link_counts(
         csd_mean_o = float(csd_sub["o"].mean())
         csd_mean_sv = float(csd_sub["sv"].mean())
         csd_mean_tv = float(csd_sub["tv"].mean())
+        road_key = normalize_csd_sil_key(road)
+        ov = (observed_overrides or {}).get(road_key)
+        if ov:
+            if "observed_car" in ov:
+                csd_mean_o = float(ov["observed_car"])
+            if "observed_motor_total" in ov:
+                csd_mean_sv = float(ov["observed_motor_total"])
+            elif "observed_total" in ov:
+                csd_mean_sv = float(ov["observed_total"])
+            if "observed_truck" in ov:
+                csd_mean_tv = float(ov["observed_truck"])
         road_class = csd_sub["road_class"].iloc[0]
 
         matched_links = links_gdf.loc[matching_indices.unique()]
@@ -655,6 +816,27 @@ def load_csd_as_link_counts(
             ]
         if matched_links.empty:
             continue
+
+        selector = (anchor_selectors or {}).get(road_key)
+        if selector:
+            matched_links = _pick_csd_anchor_links(
+                matched_links,
+                selector,
+                links_gdf,
+                screenlines_by_name=screenlines_by_name,
+                metric_epsg=int(metric_epsg or get_metric_epsg({})),
+            )
+        else:
+            forced_lid = (anchor_link_ids or {}).get(road_key)
+            if forced_lid is not None and "link_id" in matched_links.columns:
+                forced = matched_links[matched_links["link_id"] == int(forced_lid)]
+                if forced.empty:
+                    logger.warning(
+                        "CSD anchor link_id=%s not among matches for sil=%s — using default pick",
+                        forced_lid, road,
+                    )
+                else:
+                    matched_links = forced
 
         if "link_type" in matched_links.columns:
             matched_links = matched_links.sort_values(

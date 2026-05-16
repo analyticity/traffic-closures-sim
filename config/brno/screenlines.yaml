@@ -1,11 +1,11 @@
-# Screenlines for Brno — supplement auto-generated cuts (see load_screenlines_with_auto).
-# Manual entries with the same `name` as auto_* override the auto definition.
+# Screenlines pro Brno — doplňují auto-generované řezy (viz load_screenlines_with_auto).
+# Manuální položky se stejným `name` jako auto_* přepíší auto definici.
 #
-# Three local cuts: WGS84 perpendicular + filter (no link_id — stable across OSM reimports).
+# Tři lokální řezy: WGS84 kolmice + filter (bez link_id — stabilnější po reimportu OSM).
 
 screenlines:
   - name: "manual_brno_antonin_prochazky_tertiary"
-    description: "Antonína Procházky — III/15272 tertiary; observed 4,674 veh/day"
+    description: "Antonína Procházky — III/15272 tertiary; pozorované 4 674 voz/den"
     type: radial
     geometry_wkt: "LINESTRING (16.5617027465 49.1940792124, 16.5611579466 49.1933528994)"
     filter:
@@ -15,7 +15,7 @@ screenlines:
     observed_aadt_all: 4674.0
 
   - name: "manual_brno_tertiary_37915"
-    description: "III/37915 (formerly unnamed in UI) — tertiary; observed 3,945 veh/day"
+    description: "III/37915 (dříve bez názvu v UI) — tertiary; pozorované 3 945 voz/den"
     type: radial
     geometry_wkt: "LINESTRING (16.6275069611 49.2426175081, 16.6263091449 49.2424176012)"
     filter:
@@ -25,7 +25,7 @@ screenlines:
     observed_aadt_all: 3945.0
 
   - name: "manual_brno_selska_secondary"
-    description: "Selská — II/374 secondary; observed 6,598 veh/day"
+    description: "Selská — II/374 secondary; pozorované 6 598 voz/den"
     type: radial
     geometry_wkt: "LINESTRING (16.6445737487 49.2151409293, 16.6433418579 49.2152021936)"
     filter:
@@ -34,9 +34,9 @@ screenlines:
     expected_links: 1
     observed_aadt_all: 6598.0
 
-  # Override auto_csd_*: CSD mean sv from validation; cut perpendicular to busiest network segment.
+  # Přepis auto_csd_*: CSD průměr sv z validace; řez kolmo k nejvytíženějšímu segmentu v síti.
   - name: "auto_csd_640"
-    description: "II/640 secondary — CSD mean sv ≈29,301 veh/day (validation); manual cut instead of auto (broad matching)"
+    description: "II/640 secondary — CSD mean sv ≈29 301 voz/den (validace); ruční kolmice místo auto (široké párování)"
     type: radial
     geometry_wkt: "LINESTRING (16.5945026812 49.2058647109, 16.5934291776 49.2053044372)"
     filter:
@@ -46,7 +46,7 @@ screenlines:
     observed_aadt_all: 29301.0
 
   - name: "auto_csd_50"
-    description: "I/50 trunk — CSD mean sv ≈27,624 veh/day (validation); manual cut (auto over-aggregates)"
+    description: "I/50 trunk — CSD mean sv ≈27 624 voz/den (validace); ruční kolmice (auto over-agg)"
     type: radial
     geometry_wkt: "LINESTRING (16.6538768078 49.1891762232, 16.6531206684 49.1884258629)"
     filter:

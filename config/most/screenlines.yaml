@@ -2,12 +2,12 @@
 #
 # Manual entries take precedence over auto-generated ones with the same name.
 #
-# Prefer geometry_wkt (WGS84 cut-line) + filter over raw link_id — link_id changes
-# on OSM reimport; cut + osm_ref_norm/link_type keep the same cross-section.
+# Prefer geometry_wkt (WGS84 cut-line) + filter over raw link_id — link_id se
+# mění při reimportu OSM, řez + osm_ref_norm/link_type drží stejný průřez.
 
 screenlines:
   - name: "auto_gw_15_SE"
-    description: "Gateway 15 SE — D15 primary; WGS84 cut + ref 15 (instead of link_id, stable across reimport)"
+    description: "Gateway 15 SE — D15 primary; řez WGS84 + ref 15 (místo link_id, stabilní po reimportu)"
     type: "radial"
     geometry_wkt: "LINESTRING (13.705029572832533 50.492395945735396, 13.70500939777942 50.49215679522372)"
     filter:
@@ -16,10 +16,10 @@ screenlines:
     expected_links: 1
     observed_aadt_all: 9761.0
 
-  # CSD count post — road II/2538 (tertiary), observed 1,132 veh/day.
-  # Cut perpendicular to road axis at mid-segment; filter binds ref 2538 and type.
+  # CSD / kontrolní řez — sil. II/2538 (tertiary), pozorované 1 132 voz/den.
+  # Řez kolmo k ose cesty v polovině úseku; filter váže na ref 2538 a typ.
   - name: "manual_csd_ii2538_tertiary"
-    description: "II/2538 — tertiary corridor (obs 1,132 veh/day); WGS84 cut + osm_ref_norm 2538"
+    description: "II/2538 — tertiary koridor (obs 1132 voz/den); řez WGS84 + osm_ref_norm 2538"
     type: "radial"
     geometry_wkt: "LINESTRING (13.669451822656407 50.52375454110119, 13.669514609574696 50.52398618264085)"
     filter:
@@ -28,10 +28,10 @@ screenlines:
     expected_links: 1
     observed_aadt_all: 1132.0
 
-  # CSD — two carriageways I/13+I/27 (trunk), observed 5,734 veh/day (sum of both directions).
-  # Short perpendicular cut crosses both parallel trunk links (different osm_id), not link_id.
+  # CSD — dvě jízdní řady I/13+I/27 (trunk), pozorované 5 734 voz/den (součet obou směrů).
+  # Krátký kolmý řez protíná obě paralelní trunk linky (jiné osm_id), ne link_id.
   - name: "manual_csd_i13_i27_trunk_dual"
-    description: "I/13+I/27 — two trunk carriageways (obs 5,734 veh/day); cut + ref 13;27"
+    description: "I/13+I/27 — dvě trunk jízdní řady (obs 5734 voz/den); řez + ref 13;27"
     type: "radial"
     geometry_wkt: "LINESTRING (13.653390619379886 50.51193940938457, 13.653524393461035 50.5122079321866)"
     filter:

@@ -649,6 +649,7 @@ class _CalibrationContext:
             exclude_ratio_below=self.exclude_ratio_below,
             exclude_ratio_above=self.exclude_ratio_above,
             require_csd_road_ref_match=self.require_csd_road_ref_match,
+            observed_col=self.obs_col,
         )
         if iteration == 1:
             if "_excluded" in matched.columns:

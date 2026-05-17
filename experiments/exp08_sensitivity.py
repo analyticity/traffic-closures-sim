@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Experiment 08: Sensitivity analysis.
 
-Three sub-experiments:
- a) Demand scaling — multiply OD matrix by 0.9 and 1.1, compare ΔVHT
- b) Severity variation — for one closure, vary capacity_factor (0.0, 0.1, 0.3, 0.5)
- c) Convergence — vary RGAP (1e-3, 1e-4, 1e-5) for one scenario
+Three sub-experiments testing model robustness:
+ a) Demand scaling — OD matrix × {0.8, 0.9, 1.0, 1.1, 1.2}, report ΔVHT and
+    overloaded link count for a test closure scenario.
+ b) Severity variation — for one closure, sweep residual capacity from 0%
+    (full closure) through 25%, 50%, 75% to 100% (no closure).
+ c) Convergence — vary RGAP target {1e-3, 1e-4, 1e-5} to verify result
+    stability vs compute cost trade-off.
 """
 from __future__ import annotations
 
@@ -190,7 +193,7 @@ def main() -> None:
     # A) Demand scaling
     # ==================================================================
     logger.info("=== A) Demand scaling ===")
-    demand_factors = [0.9, 1.0, 1.1]
+    demand_factors = [0.8, 0.9, 1.0, 1.1, 1.2]
     demand_rows = []
 
     for factor in demand_factors:
@@ -208,12 +211,22 @@ def main() -> None:
         demand_df = pd.DataFrame(demand_rows)
         save_csv(demand_df, out_dir / "demand_scaling.csv")
 
-        fig, ax = plt.subplots(figsize=(7, 5))
-        ax.plot(demand_df["demand_factor"], demand_df["delta_vht"], "o-", markersize=8)
-        ax.set_xlabel("Faktor poptávky")
-        ax.set_ylabel("ΔVHT (voz·hod)")
-        ax.set_title("Citlivost ΔVHT na škálování poptávky")
-        ax.grid(True, alpha=0.3)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        ax1.plot(demand_df["demand_factor"], demand_df["delta_vht"], "o-", markersize=8, color="steelblue")
+        ax1.set_xlabel("Faktor poptávky")
+        ax1.set_ylabel("ΔVHT (voz·hod)")
+        ax1.set_title("Citlivost ΔVHT na škálování poptávky")
+        ax1.grid(True, alpha=0.3)
+
+        ax2.plot(demand_df["demand_factor"], demand_df["scenario_overloaded"], "s-",
+                 markersize=8, color="coral")
+        ax2.set_xlabel("Faktor poptávky")
+        ax2.set_ylabel("Počet přetížených hran")
+        ax2.set_title("Přetížené hrany vs. poptávka")
+        ax2.grid(True, alpha=0.3)
+
+        fig.suptitle("Citlivost na objem poptávky", fontsize=13)
+        fig.tight_layout()
         save_figure(fig, out_dir / "demand_sensitivity.png")
         plt.close(fig)
 
@@ -223,11 +236,7 @@ def main() -> None:
     # B) Severity variation
     # ==================================================================
     logger.info("=== B) Severity variation ===")
-    # Fraction of original lanes *remaining open* (1.0 = no closure effect on
-    # capacity for the lane-reduction path).  Values must differ after rounding
-    # for typical 2-lane links — e.g. 0.1/0.3/0.5 all collapsed to 1 open lane
-    # when combined with the old engine clamp (see scenarios/engine.py).
-    capacity_factors = [0.0, 0.5, 1.0]
+    capacity_factors = [0.0, 0.25, 0.5, 0.75, 1.0]
     severity_rows = []
 
     for cap_frac in capacity_factors:
@@ -264,13 +273,27 @@ def main() -> None:
         sev_df = pd.DataFrame(severity_rows)
         save_csv(sev_df, out_dir / "severity_variation.csv")
 
-        fig, ax = plt.subplots(figsize=(7, 5))
-        ax.plot(sev_df["capacity_factor"], sev_df["delta_vht"], "s-", color="coral", markersize=8)
-        ax.set_xlabel("Zbytková kapacita (podíl)")
-        ax.set_ylabel("ΔVHT (voz·hod)")
-        ax.set_title("Citlivost ΔVHT na závažnost uzavírky")
-        ax.grid(True, alpha=0.3)
-        ax.invert_xaxis()
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        ax1.plot(sev_df["capacity_factor"], sev_df["delta_vht"], "s-", color="coral", markersize=8)
+        ax1.set_xlabel("Zbytková kapacita (podíl)")
+        ax1.set_ylabel("ΔVHT (voz·hod)")
+        ax1.set_title("ΔVHT vs. závažnost uzavírky")
+        ax1.grid(True, alpha=0.3)
+        ax1.invert_xaxis()
+        for _, row in sev_df.iterrows():
+            ax1.annotate(f"{row['delta_vht']:.0f}", (row["capacity_factor"], row["delta_vht"]),
+                         textcoords="offset points", xytext=(0, 10), fontsize=8, ha="center")
+
+        ax2.plot(sev_df["capacity_factor"], sev_df["delta_overloaded"], "D-",
+                 color="darkred", markersize=8)
+        ax2.set_xlabel("Zbytková kapacita (podíl)")
+        ax2.set_ylabel("Δ přetížených hran")
+        ax2.set_title("Přetížené hrany vs. závažnost")
+        ax2.grid(True, alpha=0.3)
+        ax2.invert_xaxis()
+
+        fig.suptitle("Citlivost na závažnost uzavírky", fontsize=13)
+        fig.tight_layout()
         save_figure(fig, out_dir / "severity_sensitivity.png")
         plt.close(fig)
 

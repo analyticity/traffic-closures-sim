@@ -7,6 +7,7 @@ the opposite direction.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -285,20 +286,44 @@ def _apply_practical_speed_reduction(
 ) -> None:
     """HCM-inspired practical free-flow speed reduction.
 
-    ``practical_speed = posted_speed * base_factor - penalty * ipkm``
+    ``practical_speed = posted_speed * base_factor[lt] - penalty[lt] * ipkm``
 
     where *ipkm* is the intersection density (nodes with degree >= threshold
-    per kilometre of link length).  This captures the speed loss caused by
-    signalisation, priority intersections, access points and general urban
-    friction without any city-specific tuning.
+    per kilometre of link length).  Higher-class roads (trunk, primary) use
+    larger base factors and smaller intersection penalties to reflect
+    coordinated signals, wider lanes, and better geometric design.
+
+    Per-link-type overrides are read from ``base_factor_by_link_type`` and
+    ``intersection_penalty_by_link_type``; link types not listed fall back
+    to the scalar ``base_factor`` / ``intersection_penalty_per_km``.
+
+    The **posted speed** (pre-reduction) is persisted in ``posted_speed_ab`` /
+    ``posted_speed_ba`` columns so that repeated normalization runs always
+    reduce from the same base, making this operation idempotent.
     """
     if not pffs_cfg.get("enabled", False):
         return
 
-    base_factor = float(pffs_cfg.get("base_factor", 0.85))
-    penalty = float(pffs_cfg.get("intersection_penalty_per_km", 0.02))
+    base_factor_default = float(pffs_cfg.get("base_factor", 0.85))
+    penalty_default = float(pffs_cfg.get("intersection_penalty_per_km", 0.02))
     min_degree = int(pffs_cfg.get("min_intersection_degree", 3))
     min_speed = float(pffs_cfg.get("min_speed_kmh", 5.0))
+
+    bf_by_lt = pffs_cfg.get("base_factor_by_link_type") or {}
+    pen_by_lt = pffs_cfg.get("intersection_penalty_by_link_type") or {}
+
+    has_lt = "link_type" in links.columns
+    if has_lt:
+        lt_series = links["link_type"].astype(str)
+        base_factor_arr = lt_series.map(
+            lambda lt: float(bf_by_lt.get(lt, base_factor_default))
+        )
+        penalty_arr = lt_series.map(
+            lambda lt: float(pen_by_lt.get(lt, penalty_default))
+        )
+    else:
+        base_factor_arr = base_factor_default
+        penalty_arr = penalty_default
 
     node_counts = (
         links["a_node"].value_counts().add(
@@ -315,15 +340,34 @@ def _apply_practical_speed_reduction(
     ipkm = n_intersections / dist_km
 
     for col in ("speed_ab", "speed_ba"):
-        links[col] = (links[col] * base_factor - penalty * ipkm).clip(lower=min_speed)
+        posted_col = f"posted_{col}"
+        has_posted = (
+            posted_col in links.columns
+            and links[posted_col].notna().any()
+            and (pd.to_numeric(links[posted_col], errors="coerce") > 0).any()
+        )
+        if not has_posted:
+            links[posted_col] = links[col].copy()
+        else:
+            links[posted_col] = pd.to_numeric(links[posted_col], errors="coerce")
+        links[col] = (links[posted_col] * base_factor_arr - penalty_arr * ipkm).clip(lower=min_speed)
 
+    if has_lt and bf_by_lt:
+        overridden = sorted(bf_by_lt.keys())
+        logger.info(
+            "Practical speed reduction (per-class): fallback base=%.2f, penalty=%.3f/km; "
+            "overrides for %s",
+            base_factor_default, penalty_default, ", ".join(overridden),
+        )
+    else:
+        logger.info(
+            "Practical speed reduction (base=%.2f, penalty=%.3f/km)",
+            base_factor_default, penalty_default,
+        )
     logger.info(
-        "Practical speed reduction (base=%.2f, penalty=%.3f/km): "
-        "median ipkm=%.1f, mean speed change %.1f km/h",
-        base_factor,
-        penalty,
+        "  median ipkm=%.1f, mean speed delta %.1f km/h (idempotent)",
         float(ipkm.median()),
-        float((links["speed_ab"] * (1 - base_factor)).mean()),
+        float((links["posted_speed_ab"] - links["speed_ab"]).mean()),
     )
 
 
@@ -479,7 +523,7 @@ def normalize_network_attributes(
             links.loc[restore_mask, "link_type"] = osm_hw[restore_mask]
             logger.info("Restored link_type from osm_highway for %d *_link links", n_restored)
 
-    # Reclassify construction links
+    # Reclassify construction links (fresh from build-network)
     constr_mask = links["link_type"].astype(str) == "construction"
     n_constr = int(constr_mask.sum())
     if n_constr > 0:
@@ -498,6 +542,82 @@ def normalize_network_attributes(
         logger.info(
             "Reclassified %d construction links (%d motorway_link, %d trunk_link, %d residential)",
             n_constr, int(hw_1lane.sum()), int(hw_multi.sum()), int(still_constr.sum()),
+        )
+
+    # Recover misclassified construction-zone links.
+    # OSM tags these as highway=construction (with construction=secondary etc.)
+    # which AequilibraE imports as link_type="construction", and the block above
+    # (or a prior run) falls back to "residential".  OSMnx drive filter also
+    # skips construction ways, leaving osm_highway NULL.  Detect these by
+    # finding named residential/service links with no osm_highway that sit on
+    # the same corridor as a higher-class road, and promote them.
+    _MAJOR_TYPES = {
+        "motorway", "trunk", "primary", "secondary", "tertiary",
+        "motorway_link", "trunk_link", "primary_link",
+        "secondary_link", "tertiary_link",
+    }
+    _PROMOTABLE = {"residential", "service", "living_street", "unclassified"}
+    has_osm_hw = "osm_highway" in links.columns
+    has_name = "name" in links.columns
+    n_corridor_promoted = 0
+    if has_name and has_osm_hw:
+        osm_hw_null = links["osm_highway"].isna() | (links["osm_highway"].astype(str).str.strip().isin(["", "None", "nan"]))
+        candidate_mask = (
+            links["link_type"].isin(_PROMOTABLE)
+            & osm_hw_null
+            & links["name"].notna()
+            & (links["name"].astype(str).str.strip() != "")
+        )
+        if candidate_mask.any():
+            node_to_links: dict[int, list[int]] = {}
+            for idx, row in links.iterrows():
+                for nd in (int(row["a_node"]), int(row["b_node"])):
+                    node_to_links.setdefault(nd, []).append(idx)
+
+            candidate_indices = set(links.index[candidate_mask])
+            visited: set[int] = set()
+            for seed in list(candidate_indices):
+                if seed in visited:
+                    continue
+                rname = str(links.at[seed, "name"] or "").strip()
+                if not rname:
+                    visited.add(seed)
+                    continue
+                component: list[int] = []
+                stack = [seed]
+                visited.add(seed)
+                border_types: list[str] = []
+                while stack:
+                    cur = stack.pop()
+                    component.append(cur)
+                    for nd in (int(links.at[cur, "a_node"]), int(links.at[cur, "b_node"])):
+                        for nidx in node_to_links.get(nd, []):
+                            if nidx == cur:
+                                continue
+                            nb_name = str(links.at[nidx, "name"] or "").strip()
+                            nb_type = str(links.at[nidx, "link_type"])
+                            if nb_name != rname:
+                                continue
+                            if nidx in candidate_indices and nidx not in visited:
+                                visited.add(nidx)
+                                stack.append(nidx)
+                            elif nb_type in _MAJOR_TYPES:
+                                border_types.append(nb_type)
+                if border_types:
+                    best_type = Counter(border_types).most_common(1)[0][0]
+                    for cidx in component:
+                        old_type = links.at[cidx, "link_type"]
+                        links.at[cidx, "link_type"] = best_type
+                        n_corridor_promoted += 1
+                        logger.debug(
+                            "Corridor promotion: link %s '%s' %s → %s",
+                            links.at[cidx, "link_id"], rname, old_type, best_type,
+                        )
+    if n_corridor_promoted:
+        logger.info(
+            "Corridor promotion: %d links with missing osm_highway promoted "
+            "to match adjacent named corridor",
+            n_corridor_promoted,
         )
 
     # Per-road link_type overrides from experiment profile
@@ -528,6 +648,43 @@ def normalize_network_attributes(
                     links.loc[mask, "speed_ab"] = np.where(spd_ab.isna(), min_spd, np.maximum(spd_ab, min_spd))
                     links.loc[mask, "speed_ba"] = np.where(spd_ba.isna(), min_spd, np.maximum(spd_ba, min_spd))
                     logger.info("Applied min_speed=%s km/h (%d links raised)", min_spd, n_raised)
+
+    # Per-profile link removals (e.g. dead-end AOI boundary spurs)
+    link_removals = profile.get("link_removals") or []
+    if link_removals:
+        remove_mask = pd.Series(False, index=links.index)
+        for rule in link_removals:
+            match_spec = dict(rule.get("match") or {})
+            lon_max = rule.get("centroid_lon_max")
+            if lon_max is not None:
+                match_spec.pop("centroid_lon_max", None)
+            if not match_spec and lon_max is None:
+                continue
+            mask = pd.Series(True, index=links.index)
+            for col, val in match_spec.items():
+                if col not in links.columns:
+                    mask[:] = False
+                    break
+                mask &= links[col].astype(str).str.lower() == str(val).lower()
+            if lon_max is not None and "geometry" in links.columns:
+                mask &= links.geometry.centroid.x <= float(lon_max)
+            n_rule = int(mask.sum())
+            if n_rule > 0:
+                comment = rule.get("comment", "")
+                logger.info(
+                    "link_removals: matched %d links%s",
+                    n_rule,
+                    f" — {comment}" if comment else "",
+                )
+            remove_mask |= mask
+        n_remove = int(remove_mask.sum())
+        if n_remove > 0:
+            remove_ids = links.loc[remove_mask, "link_id"].tolist()
+            links = links[~remove_mask].copy()
+            with project_db(project) as conn:
+                ph = ",".join("?" * len(remove_ids))
+                conn.execute(f"DELETE FROM links WHERE link_id IN ({ph})", remove_ids)
+            logger.info("Removed %d links via link_removals", n_remove)
 
     # Remove crossing links
     crossing_mask = links["link_type"].astype(str) == "crossing"
@@ -597,6 +754,33 @@ def normalize_network_attributes(
         links.loc[links[col_ab].isna(), col_ab] = fallback_val
         links.loc[links[col_ba].isna(), est_ba] = 1
         links.loc[links[col_ba].isna(), col_ba] = fallback_val
+
+    # If posted_speed columns are missing from the DB, the practical-speed
+    # reduction was never persisted — speeds may already be degraded from
+    # previous (non-idempotent) runs.  Reset them to NULL so that
+    # _resolve_directional fills them from defaults / OSM maxspeed again.
+    _posted_present = (
+        "posted_speed_ab" in links.columns
+        and links["posted_speed_ab"].notna().any()
+    )
+    if not _posted_present:
+        _degradation_detected = False
+        for _lt, _expected in default_speeds.items():
+            _lt_mask_chk = links["link_type"].astype(str) == _lt
+            if _lt_mask_chk.any():
+                _cur_max = pd.to_numeric(
+                    links.loc[_lt_mask_chk, "speed_ab"], errors="coerce"
+                ).max()
+                if pd.notna(_cur_max) and _cur_max < _expected * 0.7:
+                    _degradation_detected = True
+                    break
+        if _degradation_detected:
+            logger.warning(
+                "Speed degradation detected (no posted_speed columns in DB). "
+                "Resetting speed_ab/speed_ba to NULL so defaults are re-applied."
+            )
+            links["speed_ab"] = None
+            links["speed_ba"] = None
 
     _resolve_directional("speed_ab", "speed_ba", default_speeds, fallback_speed, "estimated_speed_ab", "estimated_speed_ba")
     _resolve_directional("lanes_ab", "lanes_ba", default_lanes, 1, "estimated_lanes_ab", "estimated_lanes_ba")
@@ -684,14 +868,28 @@ def normalize_network_attributes(
         logger.warning("Project database not found at %s, DB update skipped", db_path)
         return links
 
+    with project_db(project) as conn:
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(links)").fetchall()
+        }
+        for col in ("posted_speed_ab", "posted_speed_ba"):
+            if col not in existing_cols:
+                conn.execute(f"ALTER TABLE links ADD COLUMN {col} REAL")
+                logger.info("Added column '%s' to links table", col)
+
     _needed = ["link_type", "speed_ab", "speed_ba", "lanes_ab", "lanes_ba",
-               "capacity_ab", "capacity_ba", "travel_time_ab", "travel_time_ba", "link_id"]
+               "capacity_ab", "capacity_ba", "travel_time_ab", "travel_time_ba",
+               "posted_speed_ab", "posted_speed_ba", "link_id"]
+    for col in ("posted_speed_ab", "posted_speed_ba"):
+        if col not in links.columns:
+            links[col] = None
     updates = list(links[_needed].itertuples(index=False, name=None))
 
     with project_db(project) as conn:
         conn.executemany(
             "UPDATE links SET link_type=?, speed_ab=?, speed_ba=?, lanes_ab=?, lanes_ba=?, "
-            "capacity_ab=?, capacity_ba=?, travel_time_ab=?, travel_time_ba=? "
+            "capacity_ab=?, capacity_ba=?, travel_time_ab=?, travel_time_ba=?, "
+            "posted_speed_ab=?, posted_speed_ba=? "
             "WHERE link_id=?",
             updates,
         )

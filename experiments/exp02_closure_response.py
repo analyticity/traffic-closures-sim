@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Experiment 02: Closure response — rerouting and local congestion sanity.
+"""Experiment 02: Closure impact analysis — rerouting, congestion & system KPIs.
 
-For a small set of real closures (always **full** closure on matched links):
-- Volume drop on closed links (sanity)
-- Top links by absolute Δvolume (excluding closed links)
-- Count of links with |Δvol| above a threshold
-- GeoJSON map of Δvolume in a buffer around the closure
+For a small set of real closures (full closure on matched links):
+- System-level KPIs: ΔVHT, ΔVKT, change in overloaded links
+- Volume drop on closed links (sanity check: volume → 0)
+- Top links by absolute Δvolume — where does traffic reroute?
+- Δvolume distribution histogram (how many links affected, by how much)
+- GeoJSON delta map for interactive exploration
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from shapely.geometry import Point
 
 from _common import (
     city_display_name,
+    compute_scenario_kpis,
     ensure_metric_links,
     init_experiment,
     load_assignment_results,
@@ -175,6 +177,7 @@ def main() -> None:
         return
 
     all_results: List[Dict[str, Any]] = []
+    all_deltas: List[pd.DataFrame] = []
 
     for idx, (_, closure) in enumerate(selected.iterrows(), start=1):
         label = f"closure_{idx}"
@@ -237,9 +240,11 @@ def main() -> None:
             )
         save_csv(top, out_dir / f"{label}_top_links.csv")
 
+        # System-level KPIs
+        kpis = compute_scenario_kpis(baseline_merged, scenario_df)
+
         n_high = int((delta_df["abs_delta_vol"] > DELTA_THRESHOLD).sum())
         total_abs = float(delta_df["abs_delta_vol"].sum())
-        total_net_shift = float(delta_df["delta_vol"].abs().sum())
 
         lat, lon = float(closure["lat"]), float(closure["lon"])
         gj = _buffer_delta_geojson(links, delta_df, lat, lon, MAP_BUFFER_M)
@@ -253,36 +258,101 @@ def main() -> None:
             "description": desc,
             "n_scenario_links": len(scenario_links),
             "volume_on_closed_links": vol_drop,
+            "system_kpis": kpis,
             "n_links_abs_delta_gt_threshold": n_high,
             "threshold_vol": DELTA_THRESHOLD,
             "sum_abs_delta_vol_network": round(total_abs, 1),
-            "sum_abs_delta_vol_l1": round(total_net_shift, 1),
         }
         all_results.append(rec)
+        all_deltas.append(delta_df.assign(_closure=label))
         save_json(rec, out_dir / f"{label}_summary.json")
 
-    # Summary bar chart: mean volume on closed links before vs after
-    if all_results:
-        labels = [r["label"] for r in all_results]
-        base_means = [
-            (r["volume_on_closed_links"].get("mean_vol_base_on_closed") or 0) for r in all_results
-        ]
-        scen_means = [
-            (r["volume_on_closed_links"].get("mean_vol_scen_on_closed") or 0) for r in all_results
-        ]
-        x = np.arange(len(labels))
-        w = 0.35
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.bar(x - w / 2, base_means, w, label="Baseline prům. objem (uzavřené)")
-        ax.bar(x + w / 2, scen_means, w, label="Scénář prům. objem (uzavřené)")
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels)
-        ax.set_ylabel(f"Průměr {VOL_COL}")
-        ax.set_title("Sanity: objem na uzavřených hranách klesá?")
-        ax.legend()
-        fig.tight_layout()
-        save_figure(fig, out_dir / "rerouting_summary.png")
-        plt.close(fig)
+    if not all_results:
+        save_json({"closures": [], "status": "no_valid_closures"}, out_dir / "summary.json")
+        print(f"[{NAME}] No valid closures processed.")
+        return
+
+    # --- Visualization 1: Closed-link volume sanity ---
+    labels = [r["label"] for r in all_results]
+    base_means = [
+        (r["volume_on_closed_links"].get("mean_vol_base_on_closed") or 0) for r in all_results
+    ]
+    scen_means = [
+        (r["volume_on_closed_links"].get("mean_vol_scen_on_closed") or 0) for r in all_results
+    ]
+    x = np.arange(len(labels))
+    w = 0.35
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(x - w / 2, base_means, w, label="Baseline prům. objem (uzavřené)")
+    ax.bar(x + w / 2, scen_means, w, label="Scénář prům. objem (uzavřené)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel(f"Průměr {VOL_COL}")
+    ax.set_title("Sanity: objem na uzavřených hranách klesá?")
+    ax.legend()
+    fig.tight_layout()
+    save_figure(fig, out_dir / "rerouting_summary.png")
+    plt.close(fig)
+
+    # --- Visualization 2: System KPI comparison across closures ---
+    kpi_df = pd.DataFrame([
+        {
+            "closure": r["label"],
+            "description": r["description"][:40],
+            "ΔVHT (voz·h)": r["system_kpis"]["delta_vht"],
+            "ΔVHT (%)": r["system_kpis"]["delta_vht_pct"],
+            "ΔVKT (voz·km)": r["system_kpis"]["delta_vkt"],
+            "Δ přetížených": r["system_kpis"]["delta_overloaded"],
+        }
+        for r in all_results
+    ])
+    save_csv(kpi_df, out_dir / "closure_kpis.csv")
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    ax = axes[0]
+    ax.barh(kpi_df["closure"], kpi_df["ΔVHT (voz·h)"], color="steelblue")
+    ax.set_xlabel("ΔVHT (voz·h)")
+    ax.set_title("Dopad na celkový čas v síti")
+    ax.invert_yaxis()
+
+    ax = axes[1]
+    ax.barh(kpi_df["closure"], kpi_df["ΔVHT (%)"], color="coral")
+    ax.set_xlabel("ΔVHT (%)")
+    ax.set_title("Relativní dopad na VHT")
+    ax.invert_yaxis()
+
+    ax = axes[2]
+    ax.barh(kpi_df["closure"], kpi_df["Δ přetížených"], color="darkred")
+    ax.set_xlabel("Δ počet přetížených hran")
+    ax.set_title("Změna přetížených hran")
+    ax.invert_yaxis()
+
+    fig.suptitle("Systémový dopad uzavírek", fontsize=14)
+    fig.tight_layout()
+    save_figure(fig, out_dir / "system_kpis.png")
+    plt.close(fig)
+
+    # --- Visualization 3: Delta volume distribution ---
+    if all_deltas:
+        combined_delta = pd.concat(all_deltas, ignore_index=True)
+        for cl_label in combined_delta["_closure"].unique():
+            cl_data = combined_delta[combined_delta["_closure"] == cl_label]
+            nonzero = cl_data[cl_data["abs_delta_vol"] > 10]["delta_vol"]
+            if len(nonzero) < 5:
+                continue
+            fig, ax = plt.subplots(figsize=(10, 5))
+            clip_val = float(np.percentile(nonzero.abs(), 95))
+            bins = np.linspace(-clip_val, clip_val, 60)
+            ax.hist(nonzero.clip(-clip_val, clip_val), bins=bins,
+                    color="steelblue", edgecolor="white", alpha=0.85)
+            ax.axvline(0, color="black", lw=0.8)
+            ax.set_xlabel("Δ objem (voz/den)")
+            ax.set_ylabel("Počet hran")
+            ax.set_title(f"{cl_label}: distribuce změn objemu (hrany s |Δ|>10)")
+            ax.grid(True, alpha=0.3)
+            save_figure(fig, out_dir / f"{cl_label}_delta_distribution.png")
+            plt.close(fig)
 
     save_json({"closures": all_results}, out_dir / "summary.json")
     print(f"[{NAME}] Done — {len(all_results)} closures → {out_dir}")

@@ -1114,6 +1114,7 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
                                                  exclude_objectids=exclude_objectids,
                                                  exclude_csd_roads=exclude_csd_roads,
                                                  require_csd_road_ref_match=_ref_match,
+                                                 observed_col=obs_col,
                                                  **_ratio_kw)
                 vc = vol_col if vol_col and vol_col in matched.columns else None
                 compare_vc = "_corridor_volume" if "_corridor_volume" in matched.columns else vc
@@ -1143,6 +1144,7 @@ def run_validation_only(config_path: str | Path = "config/brno/sim.yaml") -> Non
                                              match_quality_min=mq_min,
                                              exclude_objectids=exclude_objectids,
                                              exclude_csd_roads=exclude_csd_roads,
+                                             observed_col=obs_col,
                                              **_ratio_kw)
             vc = vol_col if vol_col and vol_col in matched.columns else None
             compare_vc = "_corridor_volume" if "_corridor_volume" in matched.columns else vc
@@ -1658,6 +1660,7 @@ def run_match_diagnostics(config_path: str | Path = "config/brno/sim.yaml") -> N
         exclude_ratio_below=_sl_rel["ratio_below"],
         exclude_ratio_above=_sl_rel["ratio_above"],
         require_csd_road_ref_match=_ref_match,
+        observed_col=obs_col,
     )
 
     compare_col = "_corridor_volume" if "_corridor_volume" in matched.columns else vol_col

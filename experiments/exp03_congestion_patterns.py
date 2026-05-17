@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
-"""Experiment 03: Congestion patterns — directional checks vs Waze (daily model).
+"""Experiment 03: Congestion pattern validation — model V/C vs Waze jams.
 
-No strong global correlation expectation. Instead:
-- V/C quartiles vs jam counts (medians, Q4/Q1 ratio, Mann–Whitney)
-- Top-V/C vs top-jam overlap (directional sanity)
-- Per link_type Spearman (where n is sufficient)
+Validates whether the static daily model captures congestion *patterns*
+(not magnitudes) using Waze crowdsourced jam reports as an independent proxy.
+
+Sub-analyses:
+ A) **Spatial**: Global & per-class Spearman of daily V/C vs jam frequency
+ B) **Quartile analysis**: V/C quartiles vs jam counts + Mann–Whitney
+ C) **Top-overlap**: High-V/C links vs high-jam links intersection
+ D) **Temporal bands**: Does daily V/C correlate more with peak-hour jams?
+    (merged from former exp09_temporal_profiles)
 """
 from __future__ import annotations
+
+import logging
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.patches import Patch
 from scipy import stats as sp_stats
 
 from _common import (
+    _cache_dir,
     compute_quartile_comparison,
     init_experiment,
     load_assignment_results,
@@ -25,11 +34,22 @@ from _common import (
     save_json,
 )
 
+logger = logging.getLogger(__name__)
 NAME = "exp03_congestion_patterns"
 
 VC_TOP_FRAC = 0.10
 JAM_TOP_FRAC = 0.30
 MIN_PER_CLASS = 30
+
+TIME_BANDS = {
+    "ráno (6–9)": (6, 9),
+    "dopoledne (9–12)": (9, 12),
+    "odpoledne (12–15)": (12, 15),
+    "odpolední špička (15–18)": (15, 18),
+    "večer (18–22)": (18, 22),
+}
+PEAK_HOURS = {7, 8, 9, 15, 16, 17}
+WORKDAY_RANGE = range(0, 5)
 
 
 def main() -> None:
@@ -167,6 +187,139 @@ def main() -> None:
     if class_rows:
         summary["per_class_spearman"] = class_rows
         save_csv(pd.DataFrame(class_rows), out_dir / "class_correlation.csv")
+
+    # ==================================================================
+    # D) Temporal band analysis (merged from exp09)
+    # ==================================================================
+    cache = _cache_dir(cfg)
+    jams_path = cache / "jams.parquet"
+    if jams_path.exists():
+        try:
+            jams_raw = pd.read_parquet(jams_path)
+
+            if "hour" not in jams_raw.columns and "first_seen" in jams_raw.columns:
+                jams_raw["first_seen"] = pd.to_datetime(jams_raw["first_seen"], errors="coerce", utc=True)
+                jams_raw["hour"] = jams_raw["first_seen"].dt.hour
+            if "weekday" not in jams_raw.columns and "first_seen" in jams_raw.columns:
+                jams_raw["weekday"] = jams_raw["first_seen"].dt.weekday
+
+            jams_wd = jams_raw[jams_raw["weekday"].isin(WORKDAY_RANGE)].copy()
+            jams_wd["link_id"] = jams_wd["segment_id"].map(seg_map)
+            jams_wd = jams_wd.dropna(subset=["link_id"])
+            jams_wd["link_id"] = jams_wd["link_id"].astype(int)
+
+            vc_map = df.set_index("link_id")["vc"].to_dict()
+
+            # Hourly profile
+            hourly = jams_wd.groupby("hour").size().reindex(range(24), fill_value=0)
+            fig, ax = plt.subplots(figsize=(10, 5))
+            colors = ["coral" if h in PEAK_HOURS else "steelblue" for h in range(24)]
+            ax.bar(range(24), hourly.values, color=colors, edgecolor="white")
+            ax.set_xlabel("Hodina dne")
+            ax.set_ylabel("Počet zácp (Waze)")
+            ax.set_title("Hodinový profil zácp (pracovní dny)")
+            ax.set_xticks(range(24))
+            ax.legend(handles=[Patch(color="coral", label="Špička"),
+                                Patch(color="steelblue", label="Mimo špičku")])
+            save_figure(fig, out_dir / "hourly_profile.png")
+            plt.close(fig)
+
+            # Per time-band correlation
+            band_correlations = []
+            for band_name, (h_start, h_end) in TIME_BANDS.items():
+                band_jams = jams_wd[(jams_wd["hour"] >= h_start) & (jams_wd["hour"] < h_end)]
+                band_counts = band_jams.groupby("link_id").size().reset_index(name="jam_count")
+                band_counts["vc"] = band_counts["link_id"].map(vc_map)
+                band_counts = band_counts.dropna(subset=["vc"])
+                band_counts = band_counts[(band_counts["vc"] > 0) & (band_counts["jam_count"] > 0)]
+
+                if len(band_counts) >= 10:
+                    rho_b, p_b = sp_stats.spearmanr(band_counts["vc"], band_counts["jam_count"])
+                else:
+                    rho_b, p_b = float("nan"), float("nan")
+
+                band_correlations.append({
+                    "time_band": band_name,
+                    "h_start": h_start, "h_end": h_end,
+                    "n_jams": len(band_jams),
+                    "n_links_matched": len(band_counts),
+                    "spearman_rho": round(float(rho_b), 4),
+                    "p_value": float(p_b),
+                })
+
+            band_df = pd.DataFrame(band_correlations)
+            save_csv(band_df, out_dir / "time_band_correlations.csv")
+            summary["temporal_band_correlations"] = band_correlations
+
+            # Time-band bar chart
+            fig, ax = plt.subplots(figsize=(9, 5))
+            x = np.arange(len(band_df))
+            rhos = band_df["spearman_rho"].values
+            bar_colors = ["coral" if r > 0 else "steelblue" for r in rhos]
+            ax.bar(x, rhos, color=bar_colors, edgecolor="white")
+            ax.set_xticks(x)
+            ax.set_xticklabels(band_df["time_band"], rotation=30, ha="right")
+            ax.set_ylabel("Spearman ρ (V/C vs. počet zácp)")
+            ax.set_title("Korelace V/C s frekvencí zácp podle časového pásma")
+            ax.axhline(0, color="black", lw=0.5)
+            ax.grid(axis="y", alpha=0.3)
+            fig.tight_layout()
+            save_figure(fig, out_dir / "band_correlations.png")
+            plt.close(fig)
+
+            # Peak vs off-peak comparison
+            peak_jams = jams_wd[jams_wd["hour"].isin(PEAK_HOURS)]
+            offpeak_jams = jams_wd[~jams_wd["hour"].isin(PEAK_HOURS)]
+            peak_counts = peak_jams.groupby("link_id").size().reset_index(name="jc_peak")
+            offpeak_counts = offpeak_jams.groupby("link_id").size().reset_index(name="jc_offpeak")
+
+            comp = net[["link_id", "vc"]].merge(peak_counts, on="link_id", how="left")
+            comp = comp.merge(offpeak_counts, on="link_id", how="left")
+            comp["jc_peak"] = comp["jc_peak"].fillna(0)
+            comp["jc_offpeak"] = comp["jc_offpeak"].fillna(0)
+
+            pv = comp[(comp["vc"] > 0) & (comp["jc_peak"] > 0)]
+            ov = comp[(comp["vc"] > 0) & (comp["jc_offpeak"] > 0)]
+
+            rho_peak = rho_off = float("nan")
+            if len(pv) >= 10:
+                rho_peak, _ = sp_stats.spearmanr(pv["vc"], pv["jc_peak"])
+            if len(ov) >= 10:
+                rho_off, _ = sp_stats.spearmanr(ov["vc"], ov["jc_offpeak"])
+
+            summary["temporal_peak_vs_offpeak"] = {
+                "spearman_peak": round(float(rho_peak), 4),
+                "spearman_offpeak": round(float(rho_off), 4),
+                "peak_share_pct": round(len(peak_jams) / max(len(jams_wd), 1) * 100, 1),
+            }
+
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+            if len(pv) >= 5:
+                ax1.scatter(pv["vc"], pv["jc_peak"], alpha=0.3, s=8, edgecolors="none")
+                ax1.set_title(f"Špička (7–9, 15–17)  ρ = {rho_peak:.3f}")
+            else:
+                ax1.set_title("Špička — nedostatek dat")
+            ax1.set_xlabel("Modelový V/C")
+            ax1.set_ylabel("Počet zácp (Waze)")
+
+            if len(ov) >= 5:
+                ax2.scatter(ov["vc"], ov["jc_offpeak"], alpha=0.3, s=8, edgecolors="none")
+                ax2.set_title(f"Mimo špičku  ρ = {rho_off:.3f}")
+            else:
+                ax2.set_title("Mimo špičku — nedostatek dat")
+            ax2.set_xlabel("Modelový V/C")
+            ax2.set_ylabel("Počet zácp (Waze)")
+
+            fig.suptitle("V/C korelace: špička vs. mimo špičku", fontsize=13)
+            fig.tight_layout()
+            save_figure(fig, out_dir / "peak_vs_offpeak.png")
+            plt.close(fig)
+
+        except Exception as e:
+            logger.warning("Temporal analysis skipped: %s", e)
+            summary["temporal_analysis_warning"] = str(e)
+    else:
+        summary["temporal_analysis_note"] = "jams.parquet not found — temporal sub-analysis skipped"
 
     save_json(summary, out_dir / "summary.json")
     print(f"[{NAME}] Done → {out_dir}")

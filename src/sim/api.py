@@ -638,7 +638,8 @@ def run_closure_scenario(req: ClosureScenarioRequest):
 
 # --- Diagnostics ---
 
-_MATCHING_DIAG_BIAS_COLS = ("link_id", "observed_car", "_corridor_volume")
+_MATCHING_DIAG_BIAS_COLS = ("link_id", "_corridor_volume")
+_MATCHING_DIAG_OBS_COLS = ("observed_motor_total", "observed_car")
 
 
 def _diag_truthy(s: pd.Series) -> pd.Series:
@@ -703,13 +704,17 @@ def _filter_matching_diag_bias(df: pd.DataFrame) -> pd.DataFrame:
     """
     if not all(c in df.columns for c in _MATCHING_DIAG_BIAS_COLS):
         return pd.DataFrame(columns=list(_MATCHING_DIAG_BIAS_COLS))
+    has_obs = any(c in df.columns for c in _MATCHING_DIAG_OBS_COLS)
+    if not has_obs:
+        return pd.DataFrame(columns=list(_MATCHING_DIAG_BIAS_COLS))
 
     out = df.copy()
     if "_matched" in out.columns:
         out = out[_diag_truthy(out["_matched"])]
     if "_excluded" in out.columns:
         out = out[_diag_falsy(out["_excluded"])]
-    out = out.dropna(subset=list(_MATCHING_DIAG_BIAS_COLS))
+    _obs_col = next(c for c in _MATCHING_DIAG_OBS_COLS if c in out.columns)
+    out = out.dropna(subset=list(_MATCHING_DIAG_BIAS_COLS) + [_obs_col])
     out["link_id"] = out["link_id"].astype(int)
     return out
 
@@ -749,7 +754,8 @@ def _bias_all_stations(raw_df: pd.DataFrame) -> JSONResponse:
         if lng is None:
             continue
 
-        observed = float(row.get("observed_car", 0) or 0)
+        _obs_val = row.get("observed_motor_total", row.get("observed_car", 0))
+        observed = float(_obs_val) if _obs_val is not None and not pd.isna(_obs_val) else 0.0
         mod_val = row.get("_corridor_volume", None)
         modeled = float(mod_val) if mod_val is not None and not pd.isna(mod_val) else 0.0
         ratio = modeled / observed if observed > 0 else 0.0
@@ -836,7 +842,9 @@ def diagnostics_bias(
                 continue
             midpoint = geom.interpolate(0.5, normalized=True)
 
-            observed = float(row["observed_car"])
+            obs_col = "observed_motor_total" if "observed_motor_total" in row.index else "observed_car"
+            observed = float(row[obs_col])
+            n_corr = int(row.get("_corridor_n_links", 1))
             modeled = float(row["_corridor_volume"])
             ratio = modeled / observed if observed > 0 else 0.0
             error = modeled - observed
@@ -863,7 +871,7 @@ def diagnostics_bias(
                     "ratio": round(ratio, 3),
                     "error": round(error),
                     "geh": round(float(geh_val), 1),
-                    "corridor_n_links": int(row.get("_corridor_n_links", 1)),
+                    "corridor_n_links": n_corr,
                     "status": "usable",
                 },
             })
@@ -901,13 +909,15 @@ def diagnostics_bias(
     wgs_gdf["_cluster"] = labels
     wgs_midpoints = wgs_gdf.geometry.apply(lambda g: g.interpolate(0.5, normalized=True) if g and not g.is_empty else None)
 
+    _obs_col_c = "observed_motor_total" if "observed_motor_total" in metric_gdf.columns else "observed_car"
+
     features = []
     for cid in sorted(metric_gdf["_cluster"].unique()):
         mask = metric_gdf["_cluster"] == cid
         grp = metric_gdf[mask]
         wgs_grp_mid = wgs_midpoints[mask].dropna()
 
-        sum_obs = float(grp["observed_car"].sum())
+        sum_obs = float(grp[_obs_col_c].sum())
         sum_mod = float(grp["_corridor_volume"].sum())
         if sum_obs <= 0:
             continue
@@ -1034,6 +1044,100 @@ def diagnostics_through_traffic():
         "links": {"type": "FeatureCollection", "features": link_features},
         "gateways": gateways_geojson or {"type": "FeatureCollection", "features": []},
         "screenlines": {"type": "FeatureCollection", "features": sl_features},
+    })
+
+
+@app.get("/api/diagnostics/screenlines")
+def diagnostics_screenlines():
+    """Screenline cut-line geometries with calibration results for map overlay."""
+    from shapely import wkt as shapely_wkt
+    from sim.calibration.screenlines import (
+        load_screenlines_with_auto,
+        resolve_screenline_links,
+        is_auto_screenline_name,
+    )
+
+    screenline_defs = load_screenlines_with_auto(_cfg)
+    links_gdf = _get_links()
+
+    report_path = _out("demand") / "calibration_report.json"
+    sl_results: Dict[str, Any] = {}
+    if report_path.exists():
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        sl_results = report.get("screenlines") or {}
+
+    features: List[Dict[str, Any]] = []
+    for sl_def in screenline_defs:
+        geom_geojson = None
+
+        if sl_def.geometry_wkt:
+            try:
+                geom = shapely_wkt.loads(sl_def.geometry_wkt)
+                coords = list(geom.coords)
+                geom_geojson = {
+                    "type": "LineString",
+                    "coordinates": [[c[0], c[1]] for c in coords],
+                }
+            except Exception:
+                pass
+
+        if geom_geojson is None:
+            resolved = resolve_screenline_links(sl_def, links_gdf)
+            if resolved:
+                link_ids = [lid for lid, _ in resolved]
+                sl_links = links_gdf[links_gdf["link_id"].isin(link_ids)]
+                if not sl_links.empty:
+                    sl_wgs = sl_links.to_crs(epsg=4326) if sl_links.crs and sl_links.crs.to_epsg() != 4326 else sl_links
+                    all_coords = []
+                    for g in sl_wgs.geometry:
+                        if g and not g.is_empty:
+                            all_coords.extend(list(g.coords))
+                    if all_coords:
+                        cx = sum(c[0] for c in all_coords) / len(all_coords)
+                        cy = sum(c[1] for c in all_coords) / len(all_coords)
+                        geom_geojson = {"type": "Point", "coordinates": [cx, cy]}
+
+        if geom_geojson is None:
+            continue
+
+        is_gateway = sl_def.name.startswith("auto_gw_")
+        is_auto = is_auto_screenline_name(sl_def.name)
+        sl_category = "gateway" if is_gateway else ("auto" if is_auto else "manual")
+
+        props: Dict[str, Any] = {
+            "name": sl_def.name,
+            "description": sl_def.description,
+            "sl_type": sl_def.sl_type,
+            "category": sl_category,
+            "observed_aadt_cars": sl_def.observed_aadt_cars,
+            "observed_aadt_all": sl_def.observed_aadt_all,
+        }
+
+        res = sl_results.get(sl_def.name)
+        if res:
+            props["modeled_total"] = res.get("modeled_total")
+            props["observed_total"] = res.get("observed_total")
+            props["ratio"] = res.get("ratio")
+            props["geh"] = res.get("geh")
+            props["n_links"] = res.get("n_links")
+            props["obs_source"] = res.get("obs_source")
+            props["excluded_from_benchmark"] = res.get("excluded_from_benchmark", False)
+        else:
+            props["modeled_total"] = None
+            props["observed_total"] = None
+            props["ratio"] = None
+            props["geh"] = None
+            props["n_links"] = None
+
+        features.append({
+            "type": "Feature",
+            "geometry": geom_geojson,
+            "properties": _sanitize_nan(props),
+        })
+
+    return JSONResponse({
+        "type": "FeatureCollection",
+        "features": features,
     })
 
 

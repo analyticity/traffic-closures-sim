@@ -747,6 +747,45 @@ def resolve_screenline_links(
             lid = int(row["link_id"])
             resolved.append((lid, 0))
 
+        # Divided highways have carriageways 20-50 m apart; the zero-width
+        # cut-line may miss the opposite carriageway.  Retry with a 60 m
+        # buffer when fewer links than expected are found.  To avoid
+        # capturing interchange ramps, add only the closest candidates
+        # up to expected_links.
+        _DIVIDED_HWY_BUFFER_M = 60.0
+        if (
+            sl.expected_links is not None
+            and len(resolved) < sl.expected_links
+            and sl.attr_filter
+        ):
+            n_before = len(resolved)
+            n_need = sl.expected_links - n_before
+            resolved_ids = {lid for lid, _ in resolved}
+            buf_geom = geom_metric.buffer(_DIVIDED_HWY_BUFFER_M)
+            buf_candidates = lm.sindex.query(buf_geom, predicate="intersects")
+            extra: List[Tuple[float, int]] = []
+            for idx in buf_candidates:
+                row = lm.iloc[idx]
+                if row.geometry is None:
+                    continue
+                if not _match_attr_filter(row, sl.attr_filter):
+                    continue
+                lid = int(row["link_id"])
+                if lid not in resolved_ids:
+                    dist = row.geometry.distance(geom_metric)
+                    extra.append((dist, lid))
+            extra.sort()
+            for _, lid in extra[:n_need]:
+                resolved.append((lid, 0))
+                resolved_ids.add(lid)
+            n_added = len(resolved) - n_before
+            if n_added > 0:
+                logger.info(
+                    "Screenline '%s': buffered query (+%.0f m) found %d "
+                    "additional link(s) for divided highway",
+                    sl.name, _DIVIDED_HWY_BUFFER_M, n_added,
+                )
+
     if not resolved and sl.attr_filter and geom_raw is not None:
         resolved = _resolve_attr_only_screenline(sl, links_gdf)
 

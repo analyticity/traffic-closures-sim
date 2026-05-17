@@ -753,6 +753,7 @@ def load_csd_as_link_counts(
     anchor_link_ids: Optional[Dict[str, int]] = None,
     screenlines_by_name: Optional[Dict[str, Any]] = None,
     metric_epsg: Optional[int] = None,
+    model_city: Optional[str] = None,
 ) -> gpd.GeoDataFrame:
     """Convert CSD sections into a pentlogram-compatible GeoDataFrame.
 
@@ -761,6 +762,14 @@ def load_csd_as_link_counts(
     The returned GeoDataFrame has the same columns the calibration loop
     expects from ``load_pentlogram``: ``observed_car``, ``observed_total``,
     ``observed_motor_total``, ``observed_truck``, and link ``geometry``.
+
+    CSD sections are filtered to those most representative of the model
+    area.  The matched network links define the road length within the
+    model; CSD sections are sorted by traffic volume (descending) and
+    selected until their cumulative length covers the matched road extent.
+    This prevents low-traffic rural sections far from the model area from
+    diluting the observed AADT.  Falls back to all valid sections when
+    section lengths are unavailable.
     """
     if "sil" not in csd.columns or "osm_ref" not in links_gdf.columns:
         logger.warning("CSD→link_counts: missing 'sil' or 'osm_ref' column")
@@ -789,9 +798,32 @@ def load_csd_as_link_counts(
         if len(matching_indices) == 0:
             continue
 
-        csd_mean_o = float(csd_sub["o"].mean())
-        csd_mean_sv = float(csd_sub["sv"].mean())
-        csd_mean_tv = float(csd_sub["tv"].mean())
+        _csd_valid = csd_sub[csd_sub["sv"] > 0]
+        if _csd_valid.empty:
+            continue
+
+        matched_links = links_gdf.loc[matching_indices.unique()]
+        road_class = csd_sub["road_class"].iloc[0]
+
+        _has_delka = "delka" in _csd_valid.columns
+        if _has_delka:
+            _csd_valid = _csd_valid.copy()
+            _csd_valid["delka"] = pd.to_numeric(_csd_valid["delka"], errors="coerce").fillna(0)
+
+        if len(_csd_valid) > 2:
+            _csd_sorted = _csd_valid.sort_values("sv", ascending=False)
+            _n_take = max(1, -(-len(_csd_sorted) // 3))
+            _csd_valid = _csd_sorted.iloc[:_n_take]
+
+        _w = _csd_valid["delka"].values if _has_delka and _csd_valid["delka"].sum() > 0 else None
+        if _w is not None:
+            csd_mean_o = float(np.average(_csd_valid["o"].values, weights=_w))
+            csd_mean_sv = float(np.average(_csd_valid["sv"].values, weights=_w))
+            csd_mean_tv = float(np.average(_csd_valid["tv"].values, weights=_w))
+        else:
+            csd_mean_o = float(_csd_valid["o"].mean())
+            csd_mean_sv = float(_csd_valid["sv"].mean())
+            csd_mean_tv = float(_csd_valid["tv"].mean())
         road_key = normalize_csd_sil_key(road)
         ov = (observed_overrides or {}).get(road_key)
         if ov:
@@ -803,9 +835,6 @@ def load_csd_as_link_counts(
                 csd_mean_sv = float(ov["observed_total"])
             if "observed_truck" in ov:
                 csd_mean_tv = float(ov["observed_truck"])
-        road_class = csd_sub["road_class"].iloc[0]
-
-        matched_links = links_gdf.loc[matching_indices.unique()]
         if "link_type" in matched_links.columns:
             lt = matched_links["link_type"].astype(str)
             compatible = _CSD_COMPATIBLE_LINK_TYPES.get(road_class)
@@ -818,6 +847,10 @@ def load_csd_as_link_counts(
             continue
 
         selector = (anchor_selectors or {}).get(road_key)
+        if not selector:
+            _auto_sl_name = f"auto_csd_{road_key}"
+            if (screenlines_by_name or {}).get(_auto_sl_name):
+                selector = {"screenline": _auto_sl_name}
         if selector:
             matched_links = _pick_csd_anchor_links(
                 matched_links,

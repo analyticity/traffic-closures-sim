@@ -274,6 +274,7 @@ def run_multistage_calibration(config_path: str | Path = "config/brno/sim.yaml")
                 exclude_csd_roads=ctx_final.exclude_csd_roads,
                 exclude_ratio_below=ctx_final.exclude_ratio_below,
                 exclude_ratio_above=ctx_final.exclude_ratio_above,
+                observed_col=ctx_final.obs_col,
             )
             sl_res_f = evaluate_all_screenlines(
                 ctx_final.screenlines, vol_df_f, matched_f,
@@ -875,6 +876,7 @@ def run_calibration(config_path: str | Path = "config/brno/sim.yaml") -> None:
                         match_quality_min=mq_min,
                         exclude_objectids=ctx.exclude_objectids,
                         exclude_csd_roads=ctx.exclude_csd_roads,
+                        observed_col=ctx.obs_col,
                     )
 
                     obs_period_col = f"_obs_{period}"

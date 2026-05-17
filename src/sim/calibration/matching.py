@@ -165,6 +165,7 @@ def _aggregate_corridor_volumes(
 
     vc = vol_cols[0]
     joined["_corridor_volume"] = joined[vc].copy()
+    joined["_single_link_volume"] = joined[vc].copy()
     joined["_corridor_n_links"] = 1
 
     link_lid = links["link_id"].values if "link_id" in links.columns else np.array([])
@@ -435,6 +436,7 @@ def match_counts_to_links(
     exclude_ratio_below: Optional[float] = None,
     exclude_ratio_above: Optional[float] = None,
     require_csd_road_ref_match: bool = False,
+    observed_col: Optional[str] = None,
 ) -> gpd.GeoDataFrame:
     """Spatial-join observed count points/lines to nearest network links.
 
@@ -661,9 +663,11 @@ def match_counts_to_links(
         and exclude_ratio_above is not None
         and corr_col
     ):
+        _obs_col_for_ratio = observed_col or "observed_car"
         joined = _apply_ratio_exclusions(
             joined,
             corr_col,
+            observed_col=_obs_col_for_ratio,
             ratio_below=float(exclude_ratio_below),
             ratio_above=float(exclude_ratio_above),
             id_col=id_col,
@@ -730,7 +734,8 @@ def _export_matching_diagnostics(
     diag_cols = ["objectid", "link_id", "link_type", "name", "osm_ref"]
     for c in [obs_col, "observed_car", "observed_truck", "observed_total",
               "_dist", "_bearing_diff", "_match_quality",
-              "_corridor_volume", "_corridor_n_links", "_matched", "_excluded"]:
+              "_corridor_volume", "_single_link_volume", "_corridor_n_links",
+              "_matched", "_excluded"]:
         if c not in diag_cols:
             diag_cols.append(c)
     if model_col and model_col not in diag_cols:

@@ -32,12 +32,9 @@ ALL_EXPERIMENTS = [
     "exp01_baseline_plausibility",
     "exp02_closure_response",
     "exp03_congestion_patterns",
+    "exp04_portability",
     "exp05_line_vs_point",
-    "exp06_event_links_validation",
-    "exp07_accident_correlation",
     "exp08_sensitivity",
-    "exp09_temporal_profiles",
-    "exp10_quality_score_sensitivity",
     "exp11_waze_speeds",
 ]
 

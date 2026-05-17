@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Experiment 05: Point-based vs line-based closure matching.
+"""Experiment 05 (supplementary): Point-based vs line-based closure matching.
+
+Supplementary analysis testing an engineering design choice: how much does the
+spatial representation of a closure (point vs line geometry) affect scenario
+results?  This is included in the appendix, not as a main experiment.
 
 For closures that have ``line_wkt`` geometry, compares:
  a) point matching  — nearest link to (lat, lon)

@@ -28,6 +28,19 @@ screenlines:
     expected_links: 1
     observed_aadt_all: 1132.0
 
+  # Gateway I/13 západ — auto_gw_13_W se špatně resolvuje na link 2769 (3,7 km,
+  # nulový tok).  Řez posunutý východně protíná obě jízdní řady tam, kde síť
+  # skutečně nese provoz (linky 5018 + 2768).  CSD AADT shodné s auto_gw_13_E.
+  - name: "auto_gw_13_W"
+    description: "Gateway 13 W — trunk dual; řez WGS84 + ref 13 (manuální override)"
+    type: "radial"
+    geometry_wkt: "LINESTRING (13.5405 50.5230, 13.5440 50.5210)"
+    filter:
+      link_type: trunk
+      osm_ref_norm: "13"
+    expected_links: 2
+    observed_aadt_all: 9631.0
+
   # CSD — dvě jízdní řady I/13+I/27 (trunk), pozorované 5 734 voz/den (součet obou směrů).
   # Krátký kolmý řez protíná obě paralelní trunk linky (jiné osm_id), ne link_id.
   - name: "manual_csd_i13_i27_trunk_dual"

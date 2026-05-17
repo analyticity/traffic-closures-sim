@@ -350,6 +350,11 @@ def _apply_practical_speed_reduction(
             links[posted_col] = links[col].copy()
         else:
             links[posted_col] = pd.to_numeric(links[posted_col], errors="coerce")
+            # Links without a persisted posted_speed (e.g. newly raised by
+            # minimum enforcement) fall back to the current in-memory speed.
+            _missing_posted = links[posted_col].isna()
+            if _missing_posted.any():
+                links.loc[_missing_posted, posted_col] = links.loc[_missing_posted, col]
         links[col] = (links[posted_col] * base_factor_arr - penalty_arr * ipkm).clip(lower=min_speed)
 
     if has_lt and bf_by_lt:
@@ -783,6 +788,41 @@ def normalize_network_attributes(
             links["speed_ba"] = None
 
     _resolve_directional("speed_ab", "speed_ba", default_speeds, fallback_speed, "estimated_speed_ab", "estimated_speed_ba")
+
+    # Enforce minimum speed per link type: gap-filler or connector links may
+    # carry a major link_type but retain their original low speed (20 km/h)
+    # because _resolve_directional only fills NaN.  Raise any link whose speed
+    # is below 40 % of its type's default to that default.
+    _MIN_SPEED_RATIO = 0.4
+    _speed_raised_mask = pd.Series(False, index=links.index)
+    if "link_type" in links.columns:
+        n_speed_raised = 0
+        for _lt, _dspd in default_speeds.items():
+            _lt_m = links["link_type"].astype(str).str.fullmatch(_lt, case=False)
+            _floor = _dspd * _MIN_SPEED_RATIO
+            for _scol in ("speed_ab", "speed_ba"):
+                _svals = pd.to_numeric(links[_scol], errors="coerce")
+                _low = _lt_m & _svals.notna() & (_svals > 0) & (_svals < _floor)
+                if _low.any():
+                    links.loc[_low, _scol] = _dspd
+                    links.loc[_low, f"estimated_{_scol}"] = 1
+                    _speed_raised_mask |= _low
+                    n_speed_raised += int(_low.sum())
+        if n_speed_raised:
+            logger.info(
+                "Minimum speed enforcement: raised %d link-directions below "
+                "%.0f%% of their type default",
+                n_speed_raised, _MIN_SPEED_RATIO * 100,
+            )
+            for _ccol in ("capacity_ab", "capacity_ba"):
+                if _ccol in links.columns:
+                    links.loc[_speed_raised_mask, _ccol] = None
+            # Also update posted_speed so practical speed reduction starts
+            # from the corrected base, not the stale DB value.
+            for _scol, _pcol in [("speed_ab", "posted_speed_ab"), ("speed_ba", "posted_speed_ba")]:
+                if _pcol in links.columns:
+                    links.loc[_speed_raised_mask, _pcol] = links.loc[_speed_raised_mask, _scol]
+
     _resolve_directional("lanes_ab", "lanes_ba", default_lanes, 1, "estimated_lanes_ab", "estimated_lanes_ba")
     links["lanes_ab"] = links["lanes_ab"].clip(lower=1)
     links["lanes_ba"] = links["lanes_ba"].clip(lower=1)

@@ -1,0 +1,4 @@
+[submodule "frontend"]
+	path = frontend
+	url = git@github.com:analyticity/bp_ux_ui.git
+	branch = feat/simulation

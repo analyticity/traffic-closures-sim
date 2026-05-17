@@ -2,90 +2,93 @@
 # Manuální položky se stejným `name` jako auto_* přepíší auto definici.
 #
 # Lokální řezy: WGS84 kolmice + filter (bez link_id — stabilnější po reimportu OSM).
+# observed_aadt_all: CSD 2016 section-specific sv (bidirectional RPDI) at the screenline location.
 
 screenlines:
-  - name: "manual_brno_antonin_prochazky_tertiary"
-    description: "Antonína Procházky — III/15272 tertiary; pozorované 4 674 voz/den"
-    type: radial
-    geometry_wkt: "LINESTRING (16.5617027465 49.1940792124, 16.5611579466 49.1933528994)"
-    filter:
-      link_type: tertiary
-      osm_ref_norm: "15272"
-    expected_links: 1
-    observed_aadt_all: 4674.0
-
-  - name: "manual_brno_tertiary_37915"
-    description: "III/37915 (dříve bez názvu v UI) — tertiary; pozorované 3 945 voz/den"
-    type: radial
-    geometry_wkt: "LINESTRING (16.6275069611 49.2426175081, 16.6263091449 49.2424176012)"
-    filter:
-      link_type: tertiary
-      osm_ref_norm: "37915"
-    expected_links: 1
-    observed_aadt_all: 3945.0
-
-  # Přepis auto_gw_D1_W / D1_E: řez kolmo na D1 u hranice AOI (oba jízdní směry).
-  # Bez override může auto_gw_D1_W sáhnout na vzdálený pentlogram/CSD profil
-  # (modelovaný tok ~4× vyšší než pozorovaný).
+  # D1_W: řez VÝCHODNĚ od centroid connectoru gateway zóny (lon ~16.468).
+  # CSD section 6-8680 "Ostrovačice → Kývalka" sv = 59 095.
   - name: "auto_gw_D1_W"
-    description: "D1 west gateway — manual override; both carriageways at AOI boundary"
+    description: "D1 west gateway — CSD section 6-8680 (Ostrovačice–Kývalka)"
     type: radial
-    geometry_wkt: "LINESTRING (16.442 49.189056, 16.454 49.189056)"
+    geometry_wkt: "LINESTRING (16.468 49.182, 16.468 49.188)"
     filter:
       link_type: motorway
       osm_ref_norm: "D1"
     expected_links: 2
-    observed_aadt_all: 47721.0
+    observed_aadt_all: 59095.0
 
+  # D1_E: between Brno,Slatina exit (lon ~16.66) and Brno,východ exit (lon ~16.69).
+  # I/50 merges onto D1 much further east (lon ~16.72), so this is D1-only traffic.
+  # CSD section 6-8802 "Brno,Slatina → Brno,východ" sv = 56 409.
   - name: "auto_gw_D1_E"
-    description: "D1 east gateway — manual override; both carriageways at AOI boundary"
+    description: "D1 east gateway — CSD section 6-8802 (Slatina–Východ, before I/50 merge)"
     type: radial
-    geometry_wkt: "LINESTRING (16.718 49.184924, 16.738 49.184924)"
+    geometry_wkt: "LINESTRING (16.680 49.160, 16.680 49.170)"
     filter:
       link_type: motorway
       osm_ref_norm: "D1"
     expected_links: 2
-    observed_aadt_all: 47721.0
+    observed_aadt_all: 56409.0
 
-  # Přepis auto_gw_D2_S: řez uvnitř sítě přes obě jízdní pásy D2.
-  # Lat 49.125 protíná link 492 (JB směr) i link 59257 (SB směr).
+  # D2_S: řez na hlavním D2 koridoru (lat ~49.124).
+  # CSD section 6-8710 "Brno,Chrlice → Blučina" sv = 41 320.
   - name: "auto_gw_D2_S"
-    description: "D2 south gateway — manual override; both carriageways"
+    description: "D2 south gateway — CSD section 6-8710 (Chrlice–Blučina)"
     type: radial
-    geometry_wkt: "LINESTRING (16.637 49.125, 16.648 49.125)"
+    geometry_wkt: "LINESTRING (16.635 49.124, 16.650 49.124)"
     filter:
       link_type: motorway
       osm_ref_norm: "D2"
     expected_links: 2
-    observed_aadt_all: 32864.0
+    observed_aadt_all: 41320.0
 
-  # Přepis auto_gw_I52_S: řez přes obě jízdní pásy I/52 uvnitř sítě.
-  # Lat 49.120 protíná link 8601 (SB) i link 22126 (JB), celkem ~29k.
+  # I52_S: řez na lat 49.125, ~3.9 km jižně od D1 křižovatky (lat ~49.16).
+  # Úsek 6-0202 (2.486 km) končí u lat ~49.138, screenline je jižněji.
+  # CSD section 6-0216 "hr.okr.Brno-město → mimoúr.x s 152" sv = 50 911.
   - name: "auto_gw_I52_S"
-    description: "I/52 south gateway — manual override; both carriageways"
+    description: "I/52 south gateway — CSD section 6-0216 (south of city boundary)"
     type: radial
-    geometry_wkt: "LINESTRING (16.600 49.120, 16.610 49.120)"
+    geometry_wkt: "LINESTRING (16.595 49.125, 16.615 49.125)"
     filter:
       link_type: trunk
       osm_ref_norm: "52"
     expected_links: 2
-    observed_aadt_all: 25588.0
+    observed_aadt_all: 50911.0
 
-  # Přepis auto_gw_I43_N: trunk I/43 at AOI north boundary (snap 192 m — override locks geometry).
-  # Pentlogram motor_total 26 468 voz/den (car_only 22 064). Matches ODME count_target = motor_total.
+  # I43_N: trunk I/43 north boundary (lat ~49.285), between road 385 junction and Kuřim.
+  # CSD section 6-0350 "mimoúr.x s 385 → vyús.386 do Kuřimi" sv = 22 478.
   - name: "auto_gw_I43_N"
-    description: "I/43 north gateway — manual override; both carriageways at AOI boundary"
+    description: "I/43 north gateway — CSD section 6-0350 (north of road 385 junction)"
     type: radial
-    geometry_wkt: "LINESTRING (16.555 49.291, 16.575 49.291)"
+    geometry_wkt: "LINESTRING (16.548 49.285, 16.582 49.285)"
     filter:
       link_type: trunk
       osm_ref_norm: "43"
     expected_links: 2
-    observed_aadt_all: 26468.0
+    observed_aadt_all: 22478.0
 
-  # Přepis auto_csd_*: CSD průměr sv z validace; řez kolmo k nejvytíženějšímu segmentu v síti.
+  # CSD screenlines — řez kolmo k nejvytíženějšímu segmentu v síti.
+
+  # III/15278 Sokolova/Kšírova: pentlogram sv = 12 495 (CSD split dává jen 7 409).
+  - name: "auto_csd_15278"
+    description: "III/15278 Sokolova — pentlogram sv = 12 495"
+    type: radial
+    filter:
+      osm_ref_norm: "15278"
+    expected_links: 2
+    observed_aadt_all: 12495.0
+
+  # III/15283 Tuřanka: pentlogram sv = 15 845 (CSD split dává jen 11 876).
+  - name: "auto_csd_15283"
+    description: "III/15283 Tuřanka — pentlogram sv = 15 845"
+    type: radial
+    filter:
+      osm_ref_norm: "15283"
+    expected_links: 2
+    observed_aadt_all: 15845.0
+
   - name: "auto_csd_640"
-    description: "II/640 trunk (normalized) — CSD mean sv ≈29 301 voz/den"
+    description: "II/640 trunk — CSD 2 JMK sections LW mean sv = 29 301"
     type: radial
     geometry_wkt: "LINESTRING (16.5945026812 49.2058647109, 16.5934291776 49.2053044372)"
     filter:
@@ -93,13 +96,3 @@ screenlines:
       osm_ref_norm: "640"
     expected_links: 1
     observed_aadt_all: 29301.0
-
-  - name: "auto_csd_50"
-    description: "I/50 trunk — CSD mean sv ≈27 624 voz/den; full cross-section (both carriageways)"
-    type: radial
-    geometry_wkt: "LINESTRING (16.6538768078 49.1891762232, 16.6531206684 49.1884258629)"
-    filter:
-      link_type: trunk
-      osm_ref_norm: "50"
-    expected_links: 2
-    observed_aadt_all: 27624.0

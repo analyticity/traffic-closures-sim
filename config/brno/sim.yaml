@@ -25,7 +25,17 @@ zoning:
       admin_level: "9"
   external_gateways:
     enabled: true
-    whitelist: ["D1", "D2", "I/43", "I/52"]
+    max_anchor_distance_m: 5000
+    whitelist:
+      - "D1"
+      # Main D2 carriageway (~49.124°N); default snap lands on low-flow spur near boundary.
+      - ref: "D2"
+        anchor_latlon: [49.123847, 16.644072]
+      - "I/43"
+      # I/52 anchor at ~49.123°N between NB node 158734 and SB node 158735;
+      # north of the trunk_link 1147 ramp at node 13769 that bypassed the screenline filter.
+      - ref: "I/52"
+        anchor_latlon: [49.122980, 16.604120]
     auto_discover:
       enabled: false
 
@@ -33,35 +43,35 @@ demand:
   segments:
     external_local:
       total_daily_trips: 130000
-  distribution:
-    min_gravity_beta: 0.000001
   sldb:
     external_processing:
       through_traffic_scale: 0.30
 
 calibration:
   gateway_calibration:
-    damping: 0.18
-    min_factor: 0.70
-    max_factor: 1.40
+    damping: 0.08
+    min_factor: 0.85
+    max_factor: 1.20
   auto_screenlines:
     gateway_count_target: "motor_total"
   odme:
-    max_outer_iterations: 32
-    entropy_step_size: 0.18
+    max_outer_iterations: 48
+    entropy_step_size: 0.15
     convergence_tol: 0.0008
-    assign_max_iter: 80
-    class_residual_ratio_caps:
-      tertiary: 1.05
+    stall_patience: 20
+    global_residual_damping: 0.10
+    assign_max_iter: 120
+    assign_rgap_target: 0.004
     stages:
       - name: "stabilize"
-        max_iterations: 15
+        max_iterations: 20
       - name: "refine"
-        max_iterations: 25
+        max_iterations: 35
   screenlines_path: "config/brno/screenlines.yaml"
   matching:
     require_csd_road_ref_match: true
-    csd_validation_exclude_sil: ["23"]
+    csd_validation_exclude_sil: ["52", "602", "430", "380", "37445", "41614", "15272", "385", "373"]
+    exclude_csd_roads: ["3846", "386", "15272", "602", "430", "380", "37445", "41614", "385", "373"]
 
 datasets:
   enabled: true

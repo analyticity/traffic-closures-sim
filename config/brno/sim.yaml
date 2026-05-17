@@ -71,7 +71,7 @@ calibration:
   matching:
     require_csd_road_ref_match: true
     csd_validation_exclude_sil: ["52", "602", "430", "380", "37445", "41614", "15272", "385", "373"]
-    exclude_csd_roads: ["3846", "386", "15272", "602", "430", "380", "37445", "41614", "385", "373"]
+    exclude_csd_roads: ["3846", "386", "15272", "602", "430", "380", "37445", "41614", "385", "373", "15278", "15283"]
 
 datasets:
   enabled: true

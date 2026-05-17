@@ -637,6 +637,50 @@ class TestMatchCsdToLinks:
         assert summary.get("n_roads") == 2
         assert summary.get("n_ratio_excluded") == 1
 
+    def test_divided_highway_bidir_correction(self):
+        """Two opposing one-way links should report bidirectional (summed) volume."""
+        csd = pd.DataFrame({
+            "sil": ["150"],
+            "sv": [20000.0],
+            "o": [18000.0],
+            "tv": [2000.0],
+            "delka": [5.0],
+        })
+        links = gpd.GeoDataFrame([
+            {"link_id": 1, "osm_ref": "150", "link_type": "secondary",
+             "distance": 5000, "total_vehicles_tot": 9000, "direction": 1,
+             "geometry": LineString([(0, 0), (1, 0)])},
+            {"link_id": 2, "osm_ref": "150", "link_type": "secondary",
+             "distance": 5000, "total_vehicles_tot": 11000, "direction": -1,
+             "geometry": LineString([(1, 0), (0, 0)])},
+        ], geometry="geometry", crs="EPSG:5514")
+        result = match_csd_to_links(csd, links)
+        row = result[result["road"] == "150"].iloc[0]
+        assert bool(row["divided_highway"])
+        assert row["model_lw_mean"] == pytest.approx(20000.0, rel=0.01)
+
+    def test_divided_highway_not_triggered_without_direction(self):
+        """Without a direction column, bidirectional correction must not apply."""
+        csd = pd.DataFrame({
+            "sil": ["150"],
+            "sv": [20000.0],
+            "o": [18000.0],
+            "tv": [2000.0],
+            "delka": [5.0],
+        })
+        links = gpd.GeoDataFrame([
+            {"link_id": 1, "osm_ref": "150", "link_type": "secondary",
+             "distance": 5000, "total_vehicles_tot": 9000,
+             "geometry": LineString([(0, 0), (1, 0)])},
+            {"link_id": 2, "osm_ref": "150", "link_type": "secondary",
+             "distance": 5000, "total_vehicles_tot": 11000,
+             "geometry": LineString([(1, 0), (0, 0)])},
+        ], geometry="geometry", crs="EPSG:5514")
+        result = match_csd_to_links(csd, links)
+        row = result[result["road"] == "150"].iloc[0]
+        assert not bool(row["divided_highway"])
+        assert row["model_lw_mean"] == pytest.approx(10000.0, rel=0.01)
+
 
 # ---------------------------------------------------------------------------
 # _classify_csd_road (used internally by the split)

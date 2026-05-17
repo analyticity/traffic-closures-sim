@@ -62,10 +62,13 @@ from sim.io_project import get_metric_epsg, get_nested, load_config
 
 logger = logging.getLogger(__name__)
 
-# CSD divided-highway: only motorway/trunk when a large share of matched length
-# is one-way (dual carriageway). Avoids false positives from a few urban
-# one-way segments on secondary/tertiary refs sharing the same osm_ref.
-_DH_ROAD_CLASSES_FOR_CSD = frozenset({"motorway", "trunk"})
+# CSD divided-highway: detect for ALL road classes when a large share of
+# matched length is one-way (dual carriageway).  Earlier versions restricted
+# this to motorway/trunk, but secondary/tertiary divided highways (e.g.
+# Sokolova, Tuřanka) were systematically under-reported (~50% of real flow).
+_DH_ROAD_CLASSES_FOR_CSD = frozenset({
+    "motorway", "trunk", "primary", "secondary", "tertiary",
+})
 _DH_MIN_ONEWAY_SHARE = 0.5
 
 # CSD per-road coverage: compare modeled link-km to CSD subset km used for the
@@ -605,6 +608,7 @@ def match_csd_to_links(
 
         has_direction = "direction" in car_links.columns
         is_divided = False
+        oneway_share = 0.0
         if has_direction and str(road_class) in _DH_ROAD_CLASSES_FOR_CSD:
             dirs = pd.to_numeric(car_links["direction"], errors="coerce").fillna(0).astype(int)
             oneway_mask = dirs != 0
@@ -635,6 +639,12 @@ def match_csd_to_links(
                 model_lw_mean = float(vols.mean())
         else:
             model_lw_mean = float(vols.mean())
+
+        if is_divided and oneway_share > 0:
+            # One-way links each carry one direction; the LW mean under-
+            # reports bidirectional AADT by a factor of (1 − S/2) where
+            # S = oneway length share.  Correct back to bidirectional.
+            model_lw_mean /= (1.0 - oneway_share / 2.0)
 
         if csd_mean_sv <= 0:
             continue

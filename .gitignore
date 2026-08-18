@@ -247,3 +247,11 @@ DP_Kankovsky/
 .tmp_metric_principle_configs/
 .tmp_tuning_configs/
 audit.md
+
+# --- fork (analyticity) ---
+.DS_Store
+
+# Ťažké výstupy a podklady k článku — držané mimo gitu, aby repo zostalo ľahké.
+# Ak ich bude treba verzovať, prejsť na Git LFS (viď NOTICE).
+simulation_for_article/
+clanok/

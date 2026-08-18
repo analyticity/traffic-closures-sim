@@ -4,6 +4,35 @@ Simulation pipeline for building, calibrating, and validating macroscopic transp
 
 Developed as part of a diploma thesis at Brno University of Technology, Faculty of Information Technology.
 
+> ## ⑂ This is a fork
+>
+> The pipeline was originally written by **[Adam Kaňkovský](https://github.com/adamkankovsky)**
+> for his diploma thesis at BUT FIT — upstream:
+> **[adamkankovsky/Trafic-sim-backend](https://github.com/adamkankovsky/Trafic-sim-backend)**.
+>
+> This fork is maintained by **Magdalena Ondrušková** under the *analyticity*
+> organisation. It branches at commit `7ed13e2`; the complete upstream history is
+> preserved, so every original commit keeps its authorship. See **[NOTICE](NOTICE)**
+> for authorship and licence details.
+>
+> ```bash
+> git log --oneline 7ed13e2..HEAD    # what this fork changed
+> ```
+>
+> **What this fork adds**
+>
+> | | |
+> |---|---|
+> | [popis_simulacie.md](popis_simulacie.md) | Model explained from scratch + where the input vehicle count comes from |
+> | [pipeline_detail.md](pipeline_detail.md) | Per-step technical review: inputs, algorithms, risks, defects found |
+> | [PLAN_ZLEPSENIA.md](PLAN_ZLEPSENIA.md) | Prioritised improvement plan (P0–P2) with measurable milestones |
+> | [KAMDOJIZDIME_PLAN.md](KAMDOJIZDIME_PLAN.md) | Plan for folding kamdojizdime.cz mobile-location data into the model |
+>
+> Model changes so far: gateways for the four boundary radials that previously had
+> none (I/50, II/602, II/380, II/430), removal of the manual CSD exclusion lists,
+> population mapping for zones that are themselves municipal parts, and
+> `external_local` derived from mobile-location data instead of an unsupported estimate.
+
 ## Project Structure
 
 ```

@@ -1,0 +1,52 @@
+NOTICE
+======
+
+This repository is a **fork**. The traffic simulation pipeline it contains was
+originally developed by **Adam Kaňkovský** as part of a diploma thesis at the
+Brno University of Technology, Faculty of Information Technology (FIT VUT).
+
+    Upstream repository : https://github.com/adamkankovsky/Trafic-sim-backend
+    Fork point          : 7ed13e2  "feat(network): per-class HCM speed factors
+                                    and minimum speed enforcement"
+    Fork maintained by  : Magdalena Ondrušková (analyticity)
+
+
+Authorship
+----------
+
+The full Git history of the upstream project is preserved in this repository.
+All 137 commits up to and including the fork point are the work of the original
+author and retain his authorship in the commit metadata. Commits after the fork
+point are the work of this fork's maintainer unless their metadata says
+otherwise.
+
+To list them:
+
+    git log --oneline 7ed13e2..HEAD          # changes made in this fork
+    git log --oneline 7ed13e2                # original work
+
+
+Licence
+-------
+
+The upstream repository does not carry an explicit licence file. Under default
+copyright rules all rights to the original work therefore remain with its
+author. This fork exists with the original author's consent.
+
+    TODO (pred zverejnením doplniť): odkaz na súhlas Adama Kaňkovského
+    (e-mail / issue / dátum), prípadne licenciu dohodnutú pre tento fork.
+
+Anyone wishing to reuse this code should contact both the original author and
+the maintainer of this fork.
+
+
+Third-party components
+----------------------
+
+The pipeline builds on AequilibraE (https://www.aequilibrae.com/) and uses data
+from OpenStreetMap (ODbL), the Czech Statistical Office (SLDB 2021), the Road
+and Motorway Directorate (CSD 2025) and NDIC / Police ČR closure feeds. Each of
+these carries its own licence and attribution requirements.
+
+The `frontend/` submodule points at `analyticity/bp_ux_ui` and is governed by
+that repository's terms.

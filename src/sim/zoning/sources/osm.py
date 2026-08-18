@@ -26,6 +26,11 @@ def load_zones_osm_source(
     except ImportError as e:
         raise RuntimeError("osmnx is required for OSM zone sources: pip install osmnx") from e
 
+    from sim.osm_settings import apply_osmnx_settings
+
+    # Honour OVERPASS_URL / OVERPASS_TIMEOUT, or a per-source override.
+    apply_osmnx_settings(src.get("overpass_url"))
+
     place = src.get("place")
     if not place:
         raise ValueError("OSM zone source requires 'place'")

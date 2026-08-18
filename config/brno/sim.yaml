@@ -21,6 +21,9 @@ network:
   normalization_config: "config/brno/network_normalization.yaml"
 
 zoning:
+  # Zóny sa sťahujú z Overpassu; s cache sa to spraví raz a ďalšie behy
+  # build-zones sú offline a reprodukovateľné. Zmazať pri zmene `sources`.
+  cache_file: "data/brno/cache/zones_osm.gpkg"
   sources:
     - type: osm
       place: "Okres Brno-město, Czechia"

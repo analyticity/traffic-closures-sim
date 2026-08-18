@@ -147,6 +147,10 @@ def download_osm_drive_edges(
     except ImportError as e:
         raise RuntimeError("Missing osmnx. Install: pip install osmnx") from e
 
+    from sim.osm_settings import apply_osmnx_settings
+
+    apply_osmnx_settings()
+
     common = dict(network_type="drive", simplify=False, retain_all=True, truncate_by_edge=True)
 
     if bbox_cfg:

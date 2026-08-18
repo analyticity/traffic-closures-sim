@@ -111,6 +111,7 @@ def preprocess_population_sldb2021(
     )
     city_mc = total[mc_filter]
     mc_pop = {str(r["nazev"]).strip(): int(r["hodnota"]) for _, r in city_mc.iterrows()}
+    mc_norm = {norm(k): k for k in mc_pop}
 
     obce = total[pd.to_numeric(total["uzemi_cis"], errors="coerce") == 43][["uzemi_kod", "nazev", "hodnota"]].copy()
     obce = obce.sort_values("hodnota", ascending=False).drop_duplicates(subset="nazev", keep="first")
@@ -168,6 +169,14 @@ def preprocess_population_sldb2021(
             share = min(zone_area.get(zid, 0.0) / total_area, max_zone_mc_share)
             pop = int(round(mc_pop.get(mc, 0) * share))
             result_rows.append({"zone_id": zid, "zone_name": zname, "population": pop, "match": f"mc_area:{mc}"})
+            continue
+        # @author: Magdalena Ondruskova 
+        # Zone *is* a municipal part (name matches the SLDB uzemi_cis=44 row), so the
+        # whole population belongs to it -- no area split and no max_zone_mc_share cap,
+        # both of which only apply when several cadastral zones divide one municipal part.
+        if znorm in mc_norm:
+            original = mc_norm[znorm]
+            result_rows.append({"zone_id": zid, "zone_name": zname, "population": mc_pop[original], "match": f"mc_name:{original}"})
             continue
 
         if znorm in obec_norm:

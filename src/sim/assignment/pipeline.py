@@ -295,13 +295,16 @@ def run_warm_skim_assignment(config_path: str | Path = "config/brno/sim.yaml", c
         warnings.filterwarnings("default", message="Assignment did NOT converge", category=RuntimeWarning)
         warnings.simplefilter("always", RuntimeWarning)
 
+        old_showwarning = warnings.showwarning
+
         def _warn_to_print(message, category, filename, lineno, file=None, line=None):
             if "Assignment did NOT converge" in str(message):
                 logger.info(f"  [info] Warm skim: {message} (acceptable for preliminary pass)")
             else:
-                warnings.showwarning(message, category, filename, lineno, file, line)
+                # Must call the *saved* handler: ``warnings.showwarning`` is
+                # rebound to this function below, so calling it here recurses.
+                old_showwarning(message, category, filename, lineno, file, line)
 
-        old_showwarning = warnings.showwarning
         warnings.showwarning = _warn_to_print
         try:
             _run_assignment_pass(

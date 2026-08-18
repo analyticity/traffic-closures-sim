@@ -3,11 +3,16 @@ project_path: "project/brno_aeq"
 # External gateways and supernetwork: motorways and trunk roads only.
 # Corridor details at AOI boundary: see latest gateway_diagnostics.csv in outputs/brno/…
 supernetwork:
+  # Filtruje LEN auto-objavené brány (whitelist ich obchádza, viď
+  # supernetwork/pipeline.py: mask = type_ok | is_whitelist).
+  # secondary je tu preto, aby sa správanie nezmenilo, keby sa auto_discover zaplo.
   eligible_gateway_types:
     - motorway
     - motorway_link
     - trunk
     - trunk_link
+    - secondary
+    - secondary_link
 
 osm:
   place_name: "Brno, Czechia"
@@ -26,6 +31,18 @@ zoning:
   external_gateways:
     enabled: true
     max_anchor_distance_m: 5000
+    # II. trieda je v OSM `secondary` — bez rozšírenia tohto zoznamu by
+    # select_gateway_target_nodes na nej nenašiel žiadne uzly (default je len
+    # motorway/trunk/primary).
+    allowed_link_types:
+      - motorway
+      - motorway_link
+      - trunk
+      - trunk_link
+      - primary
+      - primary_link
+      - secondary
+      - secondary_link
     whitelist:
       - "D1"
       # Main D2 carriageway (~49.124°N); default snap lands on low-flow spur near boundary.
@@ -36,13 +53,27 @@ zoning:
       # north of the trunk_link 1147 ramp at node 13769 that bypassed the screenline filter.
       - ref: "I/52"
         anchor_latlon: [49.122980, 16.604120]
+      # --- P0-1: radiály, ktoré prekračujú hranicu Brna a doteraz nemali bránu.
+      # AADT na hranici okresu Brno-město / Brno-venkov podľa CSD 2025 (v2):
+      - "I/50"      # východ (Slatina → Šlapanice), 24 271 voz/deň
+      - "II/602"    # západ (Bosonohy → Troubsko), 18 523
+      - "II/380"    # juhovýchod (Tuřany → Sokolnice), 12 348
+      - "II/430"    # východ (Slatina → Šlapanice), 10 115
+      # Ďalšie kandidátky (III. trieda, vyžadujú aj `tertiary` v allowed_link_types):
+      #   6401  sever, 10 998   |   15286  Šlapanice, 9 977
     auto_discover:
       enabled: false
 
 demand:
   segments:
     external_local:
-      total_daily_trips: 130000
+      # Odvodené z kamdojizdime.cz (MV ČR), stĺpec pocet_osob_pd (Po–Pá 6–18 h),
+      # priemer 4 sezón 2021–2023, typy T2 + T3 + N pri MINIMÁLNEJ frekvencii
+      # pobytov podľa metodiky INTENS (T2 >=4, T3 >=2, N >=1 pobyt / 28 dní).
+      # Konverzia osoby -> vozidlá: car_share 0.48, occupancy 1.20, 2 cesty/deň.
+      # Je to DOLNÁ HRANICA, nie bodový odhad — skutočná frekvencia je vyššia.
+      # Predchádzajúca hodnota 130000 bola odhad bez opory v dátach.
+      total_daily_trips: 35334
   sldb:
     external_processing:
       through_traffic_scale: 0.30
@@ -70,8 +101,15 @@ calibration:
   screenlines_path: "config/brno/screenlines.yaml"
   matching:
     require_csd_road_ref_match: true
-    csd_validation_exclude_sil: ["52", "602", "430", "380", "37445", "41614", "15272", "385", "373"]
-    exclude_csd_roads: ["3846", "386", "15272", "602", "430", "380", "37445", "41614", "385", "373", "15278", "15283"]
+    # P0-2: ručné vylúčenia zrušené. 7 z 12 pôvodne vylúčených ciest
+    # (602, 430, 380, 373, 3846, 41614, 15278) sú hraničné radiály, ktoré do
+    # tejto zmeny nemali bránu — model na nich nemohol mať pravdu. Vylúčenie
+    # teda maskovalo dôsledok návrhu brán, nie chybu párovania geometrie.
+    # Pôvodné hodnoty (pre prípad návratu):
+    #   csd_validation_exclude_sil: ["52","602","430","380","37445","41614","15272","385","373"]
+    #   exclude_csd_roads: ["3846","386","15272","602","430","380","37445","41614","385","373","15278","15283"]
+    csd_validation_exclude_sil: []
+    exclude_csd_roads: []
 
 datasets:
   enabled: true

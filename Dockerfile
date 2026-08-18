@@ -28,26 +28,47 @@ FROM base AS pipeline
 ARG CITY=brno
 ENV PYTHONDONTWRITEBYTECODE=1
 
+# Overpass endpoint for osmnx (build-network enrichment, build-zones boundaries).
+# `docker build` does NOT inherit shell environment variables, so this has to be
+# passed explicitly when the public instance rate-limits you:
+#   docker build --build-arg OVERPASS_URL=https://overpass.kumi.systems/api ...
+ARG OVERPASS_URL=""
+ARG OVERPASS_TIMEOUT=180
+ENV OVERPASS_URL=${OVERPASS_URL}
+ENV OVERPASS_TIMEOUT=${OVERPASS_TIMEOUT}
+
+ENV CFG="config/${CITY}/sim.yaml"
+
 # Pre-downloaded sources from build context (CI pre-fetches & caches them).
 # For local builds: mkdir -p data/sources before docker build.
 COPY data/sources/ /app/data/sources/
 
-RUN python run.py --config "config/${CITY}/sim.yaml" check \
-    && python run.py --config "config/${CITY}/sim.yaml" build-network \
-    && python run.py --config "config/${CITY}/sim.yaml" fetch-data \
-    && python run.py --config "config/${CITY}/sim.yaml" normalize-network \
-    && python run.py --config "config/${CITY}/sim.yaml" build-zones \
-    && python run.py --config "config/${CITY}/sim.yaml" build-supernetwork \
-    && python run.py --config "config/${CITY}/sim.yaml" build-demand \
-    && python run.py --config "config/${CITY}/sim.yaml" assign-warm-skims \
-    && python run.py --config "config/${CITY}/sim.yaml" distribute \
-    && python run.py --config "config/${CITY}/sim.yaml" assign \
-    && python run.py --config "config/${CITY}/sim.yaml" audit-supply \
-    && python run.py --config "config/${CITY}/sim.yaml" calibrate \
-    && python run.py --config "config/${CITY}/sim.yaml" validate \
-    && python run.py --config "config/${CITY}/sim.yaml" learn-profile
+# One RUN per step: when a step fails, the build log names it directly instead
+# of only reporting that a 14-command chain exited 1.
+RUN python run.py --config "$CFG" check
+RUN python run.py --config "$CFG" build-network
+RUN python run.py --config "$CFG" fetch-data
+RUN python run.py --config "$CFG" normalize-network
+RUN python run.py --config "$CFG" build-zones
+RUN python scripts/check_gateways.py --config "$CFG"
+RUN python run.py --config "$CFG" build-supernetwork
+RUN python run.py --config "$CFG" build-demand
+RUN python run.py --config "$CFG" assign-warm-skims
+RUN python run.py --config "$CFG" distribute
+RUN python run.py --config "$CFG" assign
+RUN python run.py --config "$CFG" audit-supply
+RUN python run.py --config "$CFG" calibrate
+RUN python run.py --config "$CFG" validate
+RUN python run.py --config "$CFG" learn-profile
 
-RUN python experiments/run_all.py --config "config/${CITY}/sim.yaml"
+# Experiments take a while and are not needed for a baseline/scenario run.
+#   docker build --build-arg RUN_EXPERIMENTS=0 ...
+ARG RUN_EXPERIMENTS=1
+RUN if [ "$RUN_EXPERIMENTS" = "1" ]; then \
+        python experiments/run_all.py --config "$CFG"; \
+    else \
+        echo "RUN_EXPERIMENTS=0 — experiments skipped"; \
+    fi
 
 # ---- Stage 3: Final image ----
 FROM base AS final

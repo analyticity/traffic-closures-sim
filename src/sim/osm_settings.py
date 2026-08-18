@@ -20,12 +20,11 @@ from __future__ import annotations
 
 import logging
 import os
-import time
-from typing import Callable, Optional, TypeVar
+
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
 
 _applied = False
 
@@ -76,82 +75,3 @@ def _apply_timeout(ox) -> None:
         timeout = 0
     if timeout > 0 and hasattr(ox.settings, "timeout"):
         ox.settings.timeout = timeout
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        return default
-
-
-def cool_off(what: str = "next Overpass query") -> None:
-    """Pause before a query that follows another heavy one on the same server.
-
-    ``OVERPASS_COOLOFF_S`` (default 20) — set to 0 to disable.
-    """
-    seconds = _env_float("OVERPASS_COOLOFF_S", 20.0)
-    if seconds <= 0:
-        return
-    logger.info("Waiting %.0f s %s (Overpass slot cool-off).", seconds, what)
-    time.sleep(seconds)
-
-
-def overpass_retry(fn: Callable[[], T], *, what: str = "Overpass query") -> T:
-    """Call *fn*, retrying on connection errors with exponential backoff.
-
-    ``overpass-api.de`` allows only a couple of concurrent slots per IP. When a
-    big query has just finished, the next one can be refused at the TCP level
-    (``ConnectionRefusedError``/``Errno 111``) rather than answered with an HTTP
-    status, which osmnx's own rate-limit handling does not cover. A short wait
-    is normally enough for a slot to free up.
-
-    Tunable via ``OVERPASS_RETRIES`` (default 4) and ``OVERPASS_BACKOFF_S``
-    (default 30 — first wait; each further attempt doubles it).
-    """
-    attempts = max(int(_env_float("OVERPASS_RETRIES", 4)), 1)
-    backoff = max(_env_float("OVERPASS_BACKOFF_S", 30.0), 1.0)
-
-    last: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            return fn()
-        except Exception as exc:  # noqa: BLE001 - re-raised below
-            if not _is_connection_error(exc):
-                raise
-            last = exc
-            if attempt == attempts:
-                break
-            wait = backoff * (2 ** (attempt - 1))
-            logger.warning(
-                "%s refused by the Overpass server (attempt %d/%d): %s. "
-                "Waiting %.0f s for a slot to free up.",
-                what, attempt, attempts, type(exc).__name__, wait,
-            )
-            time.sleep(wait)
-
-    raise RuntimeError(
-        f"{what} failed after {attempts} attempts — the Overpass server kept refusing "
-        f"the connection. Either wait a few minutes, or point the pipeline at a mirror:\n"
-        f"    OVERPASS_URL=https://overpass.osm.ch/api\n"
-        f"    (docker build --build-arg OVERPASS_URL=...)"
-    ) from last
-
-
-def _is_connection_error(exc: BaseException) -> bool:
-    """True for the connection-level failures that are worth retrying."""
-    seen: set[int] = set()
-    while exc is not None and id(exc) not in seen:
-        seen.add(id(exc))
-        if isinstance(exc, (ConnectionError, OSError, TimeoutError)):
-            return True
-        if type(exc).__name__ in {
-            "ConnectionError",          # requests.exceptions.ConnectionError
-            "ConnectTimeout",
-            "ReadTimeout",
-            "MaxRetryError",
-            "NewConnectionError",
-        }:
-            return True
-        exc = exc.__cause__ or exc.__context__
-    return False

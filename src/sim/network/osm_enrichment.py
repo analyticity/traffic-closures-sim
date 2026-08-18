@@ -147,29 +147,19 @@ def download_osm_drive_edges(
     except ImportError as e:
         raise RuntimeError("Missing osmnx. Install: pip install osmnx") from e
 
-    from sim.osm_settings import apply_osmnx_settings, cool_off, overpass_retry
+    from sim.osm_settings import apply_osmnx_settings
 
     apply_osmnx_settings()
-
-    # AequilibraE has just pulled the same area through Overpass a few seconds
-    # ago (create_from_osm). Going straight back for a second large query
-    # exhausts the per-IP slots and the server refuses the connection outright,
-    # so give it a moment before asking again.
-    cool_off("before OSM enrichment download")
 
     common = dict(network_type="drive", simplify=False, retain_all=True, truncate_by_edge=True)
 
     if bbox_cfg:
         west, south, east, north = [float(x) for x in bbox_cfg]
-        poly = box(*[float(x) for x in bbox_cfg])
-        G = overpass_retry(lambda: ox.graph_from_polygon(poly, **common),
-                           what="OSM enrichment download (bbox)")
+        G = ox.graph_from_polygon(box(west, south, east, north), **common)
     elif polygon is not None:
-        G = overpass_retry(lambda: ox.graph_from_polygon(polygon, **common),
-                           what="OSM enrichment download (polygon)")
+        G = ox.graph_from_polygon(polygon, **common)
     elif place_name:
-        G = overpass_retry(lambda: ox.graph_from_place(place_name, **common),
-                           what="OSM enrichment download (place)")
+        G = ox.graph_from_place(place_name, **common)
     else:
         raise ValueError("Need either bbox_cfg, polygon, or place_name to download OSM edges")
 

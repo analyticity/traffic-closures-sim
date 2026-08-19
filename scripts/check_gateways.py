@@ -70,7 +70,15 @@ def main() -> int:
                     help="override zoning.output_dir (default: read from config)")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
+    # Prefer the merged config (zoning.output_dir is filled in by load_config,
+    # not present in sim.yaml), fall back to raw YAML outside the pipeline env.
+    try:
+        from sim.io_project import load_config
+
+        cfg = load_config(args.config)
+    except Exception:
+        cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
+
     city = Path(args.config).parent.name
     zones_dir = Path(
         args.zones_dir
@@ -80,7 +88,35 @@ def main() -> int:
     diag_path = zones_dir / "gateway_diagnostics.csv"
 
     if not diag_path.exists():
-        print(f"CHYBA: {diag_path} neexistuje — spusti najprv build-zones.")
+        zones_geojson = zones_dir / "zones.geojson"
+        print(f"CHYBA: {diag_path} neexistuje.\n")
+        if zones_dir.exists():
+            found = sorted(p.name for p in zones_dir.iterdir())
+            print(f"Adresár {zones_dir} existuje a obsahuje {len(found)} položiek:")
+            for name in found[:25]:
+                print(f"    {name}")
+            if len(found) > 25:
+                print(f"    ... a ďalších {len(found) - 25}")
+        else:
+            print(f"Adresár {zones_dir} vôbec neexistuje — build-zones nedobehol.")
+            return 2
+
+        print()
+        if zones_geojson.exists():
+            print("zones.geojson JE na mieste, takže build-zones prebehol.")
+            print("gateway_diagnostics.csv sa nezapisuje, keď sa nenájde ANI JEDNA brána")
+            print("(export_gateway_diagnostics() končí hneď pri prázdnom gateway_meta).")
+            print()
+            print("V logu build-zones hľadaj:")
+            print("    'Discover whitelist token ...'      ktoré refy sa vôbec skúšali")
+            print("    'no ref match in whole network'     ref sa nenašiel v sieti")
+            print("    'no boundary-near matched links'    ref sa našiel, ale nie pri hranici AOI")
+            print("    'synthetic external gateway zones added: N'")
+            print()
+            print("Najčastejšia príčina: zoning.external_gateways.allowed_link_types")
+            print("nezahŕňa typ cesty, na ktorej ten ref v OSM je.")
+        else:
+            print("Chýba aj zones.geojson — build-zones spadol skôr, než čokoľvek zapísal.")
         return 2
 
     gw = pd.read_csv(diag_path)

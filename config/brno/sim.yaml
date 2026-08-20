@@ -25,9 +25,18 @@ zoning:
   # build-zones sú offline a reprodukovateľné. Zmazať pri zmene `sources`.
   cache_file: "data/brno/cache/zones_osm.gpkg"
   sources:
-    - type: osm
-      place: "Okres Brno-město, Czechia"
-      admin_level: "9"
+    # Mestské časti NEČÍTAME cez osmnx. features_from_place() z 29 relácií vráti
+    # len 26 — bez varovania vypadne Brno-střed, Brno-Komín a Brno-Chrlice, hoci
+    # v OSM majú identické tagy ako zvyšok (type=boundary, place=borough,
+    # admin_level=9). Overené na osmnx 2.1.1 tromi variantmi dotazu (okres, mesto,
+    # 20x max_query_area_size) — všetky tri vrátia tých istých 26. Brno-střed je
+    # najväčší cieľ ciest v modeli, takže tá diera skresľovala všetky radiály.
+    # GeoJSON ťahá scripts/fetch_zone_boundaries.py priamo z Overpassu
+    # (29 hraníc, spolu 230,2 km² = presná rozloha Brna).
+    - type: file
+      path: "config/brno/zones_admin9.geojson"
+      id_column: "zone_id"
+      name_column: "name"
     - type: osm
       place: "Okres Brno-venkov, Czechia"
       admin_level: "9"

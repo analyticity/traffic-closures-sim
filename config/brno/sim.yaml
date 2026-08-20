@@ -108,6 +108,38 @@ demand:
       #     zhoršuje — I/52 klesne na pomer 0.65, D1_E na 0.74, kým 15286 a 15270
       #     prestrelia na 1.78 a 1.68. To je samostatná chyba v distribúcii.
       total_daily_trips: 90000
+      # Rozdelenie medzi brány. BEZ tohto kľúča ho _normalize_named_weights()
+      # odvodí z triedy cesty (_LINK_TYPE_WEIGHT_SCALE: motorway 1.0, trunk 0.9,
+      # primary 0.7, secondary 0.4), čo je jediná informácia o veľkosti koridoru,
+      # ktorú model inak má — a je hrubá: I43_N tak dostávala 12,1 % dopytu proti
+      # reálnym 8,2 % (model/CSD = 1.38), zatiaľ čo D1_E a I52_S dostávali menej,
+      # než im patrí (0.69 a 0.65).
+      #
+      # Váhy nižšie sú z kamdojizdime (T2+T3+N, pocet_osob_pd, priemer 4 sezón),
+      # rozpočítané na brány cez external_gateway_lookup.parquet váhami podľa
+      # inverznej cesty. Odvodenie: scripts/kamdojizdime_gateway_weights.py
+      #
+      # Prečo nie z CSD: `external_local` je NEDOCHÁDZKOVÁ externá vrstva, kým
+      # CSD sčítanie je všetky vozidlá vrátane tranzitu, takže podiel diaľnic je
+      # v ňom nafúknutý. Oba zdroje sa na diaľničných bránach zhodujú do 1–3 p.b.,
+      # ale na cestách II. triedy do blízkych obcí dáva kamdojizdime dvoj- až
+      # trojnásobok (602_W 15,2 % proti 6,3 %; 430_E 10,0 % proti 4,7 %) — a to je
+      # vecne správne, služby a návštevy chodia práve tadiaľ. Druhý dôvod: CSD
+      # čísla používajú gateway screenliny na validáciu, takže vážiť nimi seed by
+      # znamenalo ladiť model na tie isté dáta, proti ktorým sa meria.
+      #
+      # Výhrady: napárovalo sa 87,3 % objemu (zvyšné obce nie sú v lookupe) a
+      # ~63 % relácií je pod prahom anonymizácie 7 osôb. 380_SE s 1,4 % je
+      # najpodozrivejšia hodnota — ak model na 380 začne podstreľovať, začni tam.
+      corridor_weights:
+        D1_W: 0.1829
+        D1_E: 0.1772
+        I52_S: 0.1658
+        602_W: 0.1524
+        D2_S: 0.1368
+        430_E: 0.1004
+        I43_N: 0.0704
+        380_SE: 0.0140
   sldb:
     external_processing:
       through_traffic_scale: 0.30

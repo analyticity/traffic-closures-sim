@@ -53,7 +53,7 @@ def _employment_needs_remap(emp_path: Path, zones_geojson: Optional[Path] = None
             return True
         if bool((df["zone_id"] == 0).all()):
             return True
-        if "match_engine_version" not in df.columns or int(df["match_engine_version"].min()) < 2:
+        if "match_engine_version" not in df.columns or int(df["match_engine_version"].min()) < 3:
             return True
         if zones_geojson is not None and zones_geojson.exists():
             z = gpd.read_file(zones_geojson)

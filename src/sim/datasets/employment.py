@@ -6,6 +6,7 @@ then mapping to zone IDs via the same fuzzy matching used for population.
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -31,6 +32,101 @@ logger = logging.getLogger(__name__)
 
 def _norm(text: Any) -> str:
     return _strip_diacritics(text).lower().strip()
+
+
+def _split_municipality_employment(
+    result_rows: List[Dict[str, Any]],
+    emp_lookup: Dict[str, int],
+    emp_norm: Dict[str, str],
+    out_parquet: Path,
+    cfg: Optional[Dict[str, Any]],
+) -> None:
+    """Spread a municipality's employment over the zones that subdivide it.
+
+    Commuting destinations are municipalities, so a city that is split into
+    districts has its jobs filed under the city name — ``BRNO`` — which matches
+    no zone (``Brno-střed``, ``Brno-sever``, …).  Name matching cannot fix this:
+    an exact match does not exist, and a fuzzy match would hand *every* district
+    the whole city's employment, which is why the >5000 guard above rejects it.
+
+    The result was that all 29 Brno districts carried employment 0 while the
+    surrounding villages carried theirs, making Modřice (9 058) the largest
+    attractor in the model.  Attractions are proportional to employment
+    (``distribution/pa_vectors.py``), so the gravity model sent the ``other``
+    segment out of the city instead of into it.
+
+    Split key, in order of preference:
+
+    1. ``datasets.employment.city_split_weights`` — JSON ``{zone_id: weight}``,
+       for a real workplace proxy (POI or land-use counts per district).
+    2. zone population from ``zone_population.parquet`` — available and correct,
+       but a weak proxy: it puts jobs where people sleep, so a city centre gets
+       far less than it should.
+    3. equal split — last resort.
+
+    Modifies *result_rows* in place.
+    """
+    assigned = {_norm(str(r.get("match", "")).split(":", 1)[-1])
+                for r in result_rows if str(r.get("match", "")) not in ("unmatched", "fuzzy_rejected")}
+    assigned |= {_norm(r["zone_name"]) for r in result_rows if int(r["employment"]) > 0}
+
+    empty = [r for r in result_rows if int(r["employment"]) == 0]
+    if not empty:
+        return
+
+    weights = _load_split_weights(out_parquet, cfg)
+
+    for dest_norm, dest_name in emp_norm.items():
+        if dest_norm in assigned:
+            continue
+        members = [r for r in empty
+                   if _norm(r["zone_name"]).startswith(dest_norm)
+                   and _norm(r["zone_name"]) != dest_norm]
+        if len(members) < 2:
+            continue  # a single zone is a naming coincidence, not a subdivision
+
+        total = int(emp_lookup[dest_name])
+        w = {int(r["zone_id"]): float(weights.get(int(r["zone_id"]), 0.0)) for r in members}
+        key = "weights"
+        if sum(w.values()) <= 0:
+            w = {zid: 1.0 for zid in w}
+            key = "rovnomerne"
+        w_sum = sum(w.values())
+
+        for r in members:
+            share = w[int(r["zone_id"])] / w_sum
+            r["employment"] = int(round(total * share))
+            r["match"] = f"split:{dest_name}"
+        logger.info(
+            "Employment split: '%s' (%d) spread over %d zones by %s",
+            dest_name, total, len(members), key,
+        )
+
+
+def _load_split_weights(out_parquet: Path, cfg: Optional[Dict[str, Any]]) -> Dict[int, float]:
+    """Weights for the municipality split: configured file, else zone population."""
+    emp_cfg = ((cfg or {}).get("datasets") or {}).get("employment") or {}
+    path = emp_cfg.get("city_split_weights")
+    if path:
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            weights = {int(k): float(v) for k, v in data.items()}
+            logger.info("Employment split weights from %s (%d zones)", path, len(weights))
+            return weights
+        except Exception as e:  # noqa: BLE001 — fall through to population
+            logger.warning("Could not read city_split_weights %s: %s", path, e)
+
+    pop_path = out_parquet.parent / "zone_population.parquet"
+    if pop_path.exists():
+        try:
+            pop = pd.read_parquet(pop_path)
+            col = next((c for c in ("population", "obyvatel", "pop") if c in pop.columns), None)
+            if col:
+                logger.info("Employment split weights from zone population (proxy)")
+                return {int(r["zone_id"]): float(r[col]) for _, r in pop.iterrows()}
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not read %s", pop_path, exc_info=True)
+    return {}
 
 
 def derive_zone_employment(
@@ -186,9 +282,11 @@ def derive_zone_employment(
                 "employment": 0, "match": "unmatched",
             })
 
+    _split_municipality_employment(result_rows, emp_lookup, emp_norm, out_parquet, cfg)
+
     result = coerce_object_columns_for_parquet(pd.DataFrame(result_rows))
     # Bump when employment matching rules change so zoning can invalidate stale parquet.
-    result["match_engine_version"] = 2
+    result["match_engine_version"] = 3
     ensure_dir(out_parquet.parent)
     result.to_parquet(out_parquet, index=False)
 

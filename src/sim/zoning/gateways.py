@@ -129,14 +129,6 @@ def road_ref_token_variants(raw_token: str, norm_token: str) -> set[str]:
                 num = t[1:]
                 vals.add(num)
                 vals.add("I" + num)
-            else:
-                # Class-prefixed refs (II/602, III/41614, R52): OSM in CZ mostly
-                # tags these as a bare number, so add the numeric variant too.
-                # "III" must be tested before "II".
-                for prefix in ("III", "II", "R"):
-                    if t.startswith(prefix) and t[len(prefix):].isdigit():
-                        vals.add(t[len(prefix):])
-                        break
     return vals
 
 

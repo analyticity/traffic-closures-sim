@@ -28,15 +28,6 @@ FROM base AS pipeline
 ARG CITY=brno
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Overpass endpoint for osmnx (build-network enrichment, build-zones boundaries).
-# `docker build` does NOT inherit shell environment variables, so this has to be
-# passed explicitly when the public instance rate-limits you:
-#   docker build --build-arg OVERPASS_URL=https://overpass.kumi.systems/api ...
-ARG OVERPASS_URL=""
-ARG OVERPASS_TIMEOUT=180
-ENV OVERPASS_URL=${OVERPASS_URL}
-ENV OVERPASS_TIMEOUT=${OVERPASS_TIMEOUT}
-
 ENV CFG="config/${CITY}/sim.yaml"
 
 # Pre-downloaded sources from build context (CI pre-fetches & caches them).

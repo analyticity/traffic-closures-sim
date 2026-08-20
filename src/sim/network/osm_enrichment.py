@@ -147,10 +147,6 @@ def download_osm_drive_edges(
     except ImportError as e:
         raise RuntimeError("Missing osmnx. Install: pip install osmnx") from e
 
-    from sim.osm_settings import apply_osmnx_settings
-
-    apply_osmnx_settings()
-
     common = dict(network_type="drive", simplify=False, retain_all=True, truncate_by_edge=True)
 
     if bbox_cfg:
@@ -165,48 +161,6 @@ def download_osm_drive_edges(
 
     _, edges = ox.graph_to_gdfs(G, nodes=True, edges=True, fill_edge_geometry=True)
     return edges.reset_index()
-
-
-def read_osm_edges_from_pbf(
-    pbf_path: Path,
-    bbox_wgs84: Optional[Iterable[float]] = None,
-) -> gpd.GeoDataFrame:
-    """Read way-level ``ref``/``name``/``highway`` tags from a local ``.osm.pbf``.
-
-    Offline alternative to :func:`download_osm_drive_edges`. Uses the same
-    reader as the supernetwork extraction, so the columns and semantics match.
-    Returned frame mimics the osmnx edge frame: an ``osmid`` column plus the
-    three tag columns.
-    """
-    cols = ["osm_id", "name", "ref", "highway", "geometry"]
-    bbox = tuple(float(x) for x in bbox_wgs84) if bbox_wgs84 else None
-
-    gdf = None
-    try:
-        import pyogrio
-
-        gdf = pyogrio.read_dataframe(
-            pbf_path, layer="lines", columns=cols,
-            bbox=bbox, where="highway IS NOT NULL",
-        )
-    except Exception:
-        logger.debug("pyogrio read of %s failed, falling back to geopandas", pbf_path, exc_info=True)
-
-    if gdf is None or len(gdf) == 0:
-        gdf = gpd.read_file(pbf_path, layer="lines", bbox=bbox)
-        keep = [c for c in cols if c in gdf.columns]
-        gdf = gdf[keep].copy()
-        if "highway" in gdf.columns:
-            gdf = gdf[gdf["highway"].notna()].copy()
-
-    if "osm_id" in gdf.columns and "osmid" not in gdf.columns:
-        gdf = gdf.rename(columns={"osm_id": "osmid"})
-    for col in ("ref", "name", "highway"):
-        if col not in gdf.columns:
-            gdf[col] = None
-
-    logger.info("OSM enrichment from PBF: %d ways read from %s", len(gdf), pbf_path)
-    return gdf.reset_index(drop=True)
 
 
 def aggregate_osm_edge_attributes(
@@ -412,20 +366,12 @@ def enrich_links_from_osm(
     place_name: Optional[str] = None,
     bbox_cfg: Optional[Iterable[float]] = None,
     buffered_polygon: Optional[Any] = None,
-    pbf_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Enrich AequilibraE links with OSM tags (ref, name, highway) via ``osm_id`` join.
 
     Performs two passes:
-    1. Direct match via ``osm_id`` against a local ``.osm.pbf`` when one is
-       available, otherwise a fresh OSMnx download.
+    1. Direct match via ``osm_id`` against a fresh OSMnx download.
     2. Fill remaining ref gaps along named major-road corridors.
-
-    Source selection is controlled by ``OSM_ENRICH_SOURCE``:
-    ``auto`` (default — PBF when present, else Overpass), ``pbf``, ``overpass``.
-    Preferring the PBF avoids a second heavy Overpass query seconds after
-    AequilibraE's import (which the public instance refuses), and makes the
-    step reproducible.
     """
     _empty_stats = {
         "total_links": 0,
@@ -476,32 +422,11 @@ def enrich_links_from_osm(
     else:
         logger.info("OSM enrichment download area: place_name=%s", place_name)
 
-    # --- Pick the tag source: local PBF (offline) or Overpass ---
-    import os as _os
-
-    mode = str(_os.environ.get("OSM_ENRICH_SOURCE", "auto")).strip().lower()
-    pbf = Path(pbf_path) if pbf_path else None
-    use_pbf = mode == "pbf" or (mode == "auto" and pbf is not None and pbf.exists())
-
-    if mode == "pbf" and (pbf is None or not pbf.exists()):
-        raise RuntimeError(
-            f"OSM_ENRICH_SOURCE=pbf but the PBF was not found: {pbf}. "
-            "Set supernetwork.pbf_path, or run fetch-data to download it."
-        )
-
-    if use_pbf:
-        bbox_for_pbf = effective_bbox
-        if bbox_for_pbf is None and enrich_polygon is not None:
-            bbox_for_pbf = tuple(enrich_polygon.bounds)
-        edges = read_osm_edges_from_pbf(pbf, bbox_for_pbf)
-        download_source = f"pbf:{pbf.name}"
-    else:
-        edges = download_osm_drive_edges(
-            place_name=place_name if (effective_bbox is None and enrich_polygon is None) else None,
-            bbox_cfg=effective_bbox,
-            polygon=enrich_polygon,
-        )
-
+    edges = download_osm_drive_edges(
+        place_name=place_name if (effective_bbox is None and enrich_polygon is None) else None,
+        bbox_cfg=effective_bbox,
+        polygon=enrich_polygon,
+    )
     osm_map = aggregate_osm_edge_attributes(edges)
 
     # --- Match links to OSM attributes ---

@@ -57,11 +57,14 @@ zoning:
       - ref: "I/52"
         anchor_latlon: [49.122980, 16.604120]
       # --- P0-1: radiály, ktoré prekračujú hranicu Brna a doteraz nemali bránu.
-      # AADT na hranici okresu Brno-město / Brno-venkov podľa CSD 2025 (v2):
+      # AADT na hranici okresu Brno-město / Brno-venkov podľa CSD 2025 (v2).
+      # POZOR na formát: road_ref_token_variants() rozširuje na holé číslo iba
+      # prefixy I/ a D/ (I/50 -> {I50, 50, D50}). Cesty II. a III. triedy sa
+      # preto píšu holým číslom tak, ako ich má OSM v tagu `ref`.
       - "I/50"      # východ (Slatina → Šlapanice), 24 271 voz/deň
-      - "II/602"    # západ (Bosonohy → Troubsko), 18 523
-      - "II/380"    # juhovýchod (Tuřany → Sokolnice), 12 348
-      - "II/430"    # východ (Slatina → Šlapanice), 10 115
+      - "602"       # II/602, západ (Bosonohy → Troubsko), 18 523
+      - "380"       # II/380, juhovýchod (Tuřany → Sokolnice), 12 348
+      - "430"       # II/430, východ (Slatina → Šlapanice), 10 115
       # Ďalšie kandidátky (III. trieda, vyžadujú aj `tertiary` v allowed_link_types):
       #   6401  sever, 10 998   |   15286  Šlapanice, 9 977
     auto_discover:

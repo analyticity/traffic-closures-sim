@@ -430,20 +430,13 @@ def build_network_from_osm(
     )
     bbox_native = compute_bbox_from_links_raw(project)
 
-    # 7. OSM enrichment (prefers the local PBF over a second Overpass query)
-    from sim.io_project import as_path, get_nested
-
-    pbf_path = as_path(
-        get_nested(cfg, ["supernetwork", "pbf_path"],
-                   "data/sources/osm/czech-republic-latest.osm.pbf")
-    )
+    # 7. OSM enrichment
     enrich_stats = enrich_links_from_osm(
         project, project_dir,
         crs_epsg_hint=crs_epsg_hint,
         place_name=area.place_name,
         bbox_cfg=area.bbox_cfg,
         buffered_polygon=area.buffered_polygon,
-        pbf_path=pbf_path,
     )
     logger.info("OSM enrichment: %s", enrich_stats)
 

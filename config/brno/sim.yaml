@@ -51,7 +51,13 @@ zoning:
       # Main D2 carriageway (~49.124°N); default snap lands on low-flow spur near boundary.
       - ref: "D2"
         anchor_latlon: [49.123847, 16.644072]
-      - "I/43"
+      # I/43 sa pri Českej (~49.2865°N) v OSM reálne zužuje z `trunk` 2+2 na
+      # `primary` 1+1 (kapacita 3600 -> 1400/pruh). Bez kotvy brána sadne na ten
+      # úzky úsek (uzly 15858/15859, 818 a 5 752 voz/deň) a celý externý dopyt
+      # sa cez neho nepretlačí — modelovaných 15 118 voz/deň proti 40 582 z CSD.
+      # Kotva na 2+2 úseku južne od zúženia.
+      - ref: "I/43"
+        anchor_latlon: [49.282600, 16.567400]
       # I/52 anchor at ~49.123°N between NB node 158734 and SB node 158735;
       # north of the trunk_link 1147 ramp at node 13769 that bypassed the screenline filter.
       - ref: "I/52"

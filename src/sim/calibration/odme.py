@@ -477,12 +477,23 @@ def run_odme_calibration(
             best_final, max_sl_best, sl_for_conv
         )
 
-    # Seed-deviation analysis
+    # Seed-deviation analysis.  An empty report here means the "how far did ODME
+    # have to bend the seed matrix" comparison is unavailable, so every branch
+    # that skips it says why — silence used to make it look like a config choice.
     seed_deviation_report: Dict[str, Any] = {}
-    if ctx.best_demand is not None:
+    if ctx.best_demand is None:
+        logger.warning(
+            "Seed deviation analysis skipped: no improved demand matrix was kept "
+            "(best_demand is None); calibration_report.seed_deviation stays empty"
+        )
+    else:
         try:
             backup_path = ctx.matrix_path.with_suffix(".aem.orig")
-            if backup_path.exists():
+            if not backup_path.exists():
+                logger.warning(
+                    "Seed deviation analysis skipped: seed backup %s not found", backup_path
+                )
+            else:
                 from aequilibrae.matrix import AequilibraeMatrix as _AEM
                 seed_mat = _AEM()
                 seed_mat.load(str(backup_path))
@@ -491,7 +502,12 @@ def run_odme_calibration(
 
                 final_data = ctx.best_demand.astype(np.float64)
                 nonzero = seed_data > 1.0
-                if nonzero.any():
+                if not nonzero.any():
+                    logger.warning(
+                        "Seed deviation analysis skipped: seed matrix %s has no cell above 1.0",
+                        backup_path,
+                    )
+                else:
                     ratios = np.where(nonzero, final_data / seed_data, 1.0)
                     max_ratio = float(np.max(ratios[nonzero]))
                     min_ratio = float(np.min(ratios[nonzero]))
@@ -540,8 +556,8 @@ def run_odme_calibration(
                             n_suspicious, ctx.max_deviation, max_ratio, min_ratio,
                             prior_drift_pct,
                         )
-        except Exception:
-            logger.debug("Seed deviation analysis failed", exc_info=True)
+        except Exception as e:
+            logger.warning("Seed deviation analysis failed: %s", e, exc_info=True)
 
     # Write calibration section hashes for validation holdout guard
     calib_section_hash = ""

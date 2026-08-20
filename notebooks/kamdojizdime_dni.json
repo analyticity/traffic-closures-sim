@@ -1,0 +1,13 @@
+{
+  "zdroj": "kamdojizdime denni_chod, priemer 4 sezón, nerezidenti (dojizdejici_prace+intenzivne+obcasne+navstevnici)",
+  "normalizacia": "priemer Po–Pá = 1.0",
+  "faktory": {
+    "pondelok": 0.989,
+    "utorok": 1.0455,
+    "streda": 1.0706,
+    "štvrtok": 1.0047,
+    "piatok": 0.8902,
+    "sobota": 0.5066,
+    "nedeľa": 0.4301
+  }
+}

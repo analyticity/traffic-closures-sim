@@ -18,6 +18,7 @@ from aequilibrae import Project
 from shapely.geometry import box
 
 from sim.io_project import get_metric_epsg, load_config
+from sim.overpass import configure_aequilibrae
 from sim.network.crs import (
     as_gdf,
     compute_bbox_from_links_raw,
@@ -156,6 +157,10 @@ def _import_osm_network(
     """Import OSM into the project if it is empty.  Returns True when import ran."""
     if links_before > 0 and nodes_before > 0:
         return False
+
+    # AequilibraE má vlastný Overpass endpoint v parameters.yml (a v HTTP verzii);
+    # zosúladiť ho s tým, čo používa zvyšok pipeline.
+    configure_aequilibrae()
 
     if area.bbox_cfg:
         west, south, east, north = [float(x) for x in area.bbox_cfg]

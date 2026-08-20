@@ -31,7 +31,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-ENDPOINT = "https://overpass-api.de/api/interpreter"
+# Rovnaký prepínač ako zvyšok pipeline (sim/overpass.py): OVERPASS_ENDPOINT.
+ENDPOINT = os.environ.get("OVERPASS_ENDPOINT", "https://overpass-api.de/api").rstrip("/") \
+    + "/interpreter"
 
 Point = Tuple[float, float]
 

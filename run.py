@@ -339,6 +339,16 @@ def main() -> None:
     cfg = args.config
     step = args.step
 
+    # Overpass endpoint z configu do prostredia, nech ho vidia aj miesta bez cfg
+    # (osmnx v zoning) — overpass-api.de opakovane odmieta spojenie na jednom
+    # z dvoch A záznamov, takže sa musí dať prepnúť bez zásahu do kódu.
+    try:
+        from sim.overpass import export_to_env
+
+        export_to_env(load_config(cfg) if Path(str(cfg)).exists() else None)
+    except Exception:  # noqa: BLE001 — nikdy nezhodiť beh kvôli endpointu
+        logging.getLogger(__name__).debug("Overpass endpoint resolution failed", exc_info=True)
+
     # --- Preflight: unified prerequisite & staleness checks ---
     _no_preflight = {"init-city", "clean", "check", "build-network", "fetch-data", "serve"}
     if step not in _no_preflight:

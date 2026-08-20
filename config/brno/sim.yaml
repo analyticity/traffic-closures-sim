@@ -16,6 +16,23 @@ supernetwork:
 
 osm:
   place_name: "Brno, Czechia"
+  # overpass-api.de má dva A záznamy a opakovane sa stáva, že jeden z nich
+  # odmieta spojenie (build padne na `[Errno 111] Connection refused`).
+  # AequilibraE ho navyše volá cez plain HTTP (parameters.yml), takže
+  # `docker build --add-host` na jeden port nestačí. Endpoint sa preto dá
+  # prepnúť tu alebo premennou OVERPASS_ENDPOINT, ktorá má prednosť:
+  #
+  #     OVERPASS_ENDPOINT=https://maps.mail.ru/osm/tools/overpass/api
+  #
+  # POZOR pri výbere mirrorov — overené 20. 8. 2026:
+  #   maps.mail.ru ....... má české dáta, ale na hromadné dotazy je príliš
+  #                        pomalý (osmnx dotaz na okres nedobehol do 10 min)
+  #   overpass.osm.ch .... odpovedá rýchlo, ale obsahuje LEN švajčiarske dáta
+  #                        — dotaz prejde a vráti 0 featurov, čo je horšie než
+  #                        chyba, lebo to vyzerá ako prázdna oblasť
+  #   kumi.systems, private.coffee ... vracali 502 / timeout
+  # Preto tu ostáva upstream; prepínaj len vedome a výsledok si skontroluj.
+  overpass_endpoint: "https://overpass-api.de/api"
 
 network:
   normalization_config: "config/brno/network_normalization.yaml"

@@ -23,6 +23,10 @@ def load_zones_osm_source(
 ) -> gpd.GeoDataFrame:
     try:
         import osmnx as ox
+
+        from sim.overpass import configure_osmnx
+
+        configure_osmnx()
     except ImportError as e:
         raise RuntimeError("osmnx is required for OSM zone sources: pip install osmnx") from e
 

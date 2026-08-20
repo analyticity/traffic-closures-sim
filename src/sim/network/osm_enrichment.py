@@ -112,6 +112,10 @@ def geocode_place(place_name: str) -> Any:
     """Return the WGS-84 boundary polygon for *place_name* via osmnx."""
     try:
         import osmnx as ox
+
+        from sim.overpass import configure_osmnx
+
+        configure_osmnx()
     except ImportError as e:
         raise RuntimeError("osmnx is required for place buffering: pip install osmnx") from e
     gdf = ox.geocode_to_gdf(place_name)
@@ -144,6 +148,10 @@ def download_osm_drive_edges(
     """Download the ``drive`` network from OSM and return edges as a GeoDataFrame."""
     try:
         import osmnx as ox
+
+        from sim.overpass import configure_osmnx
+
+        configure_osmnx()
     except ImportError as e:
         raise RuntimeError("Missing osmnx. Install: pip install osmnx") from e
 

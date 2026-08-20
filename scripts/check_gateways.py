@@ -130,16 +130,43 @@ def main() -> int:
     gw["_tok"] = gw["whitelist_token"].map(numeric_part)
     gw["_ref"] = gw.get("matched_ref", pd.Series(dtype=str)).map(numeric_part)
 
+    # Co-located gateways of the same road class get merged into one
+    # (gateways.py: _merge_gateway_candidates_on_boundary / _merge_gateways_by_shared_targets);
+    # the absorbed ones survive only in `merged_from`, so a whitelisted road can
+    # have a working entry point and still have no row of its own.
+    merged_into: dict[str, str] = {}
+    if "merged_from" in gw.columns:
+        for _, r in gw.iterrows():
+            survivor = str(r["gateway_name"])
+            for name in str(r.get("merged_from") or "").split("|"):
+                name = name.strip()
+                if name and name != survivor:
+                    merged_into[name] = survivor
+
+    def merged_survivor(token: str) -> str | None:
+        """Gateway that absorbed *token*'s own gateway, if any (name = f'{slug}_{compass}')."""
+        slug = norm_text(token)
+        for name, survivor in merged_into.items():
+            if name.split("_")[0].upper() == slug:
+                return survivor
+        return None
+
     print(f"{'cesta':<10} {'brán':>4}  {'CSD hranica':>11}  {'typ':<16} názvy brán")
     print("-" * 92)
 
     missing: list[str] = []
+    merged: list[str] = []
     for tok in tokens:
         num = numeric_part(tok)
         rows = gw[(gw["_tok"] == num) | (gw["_ref"] == num)]
         aadt = _CSD_BOUNDARY_AADT.get(num)
         aadt_s = f"{aadt:,}".replace(",", " ") if aadt else "-"
         if rows.empty:
+            survivor = merged_survivor(tok)
+            if survivor:
+                merged.append(f"{tok} -> {survivor}")
+                print(f"{tok:<10} {0:>4}  {aadt_s:>11}  {'—':<16} zlúčená do {survivor}")
+                continue
             missing.append(tok)
             print(f"{tok:<10} {0:>4}  {aadt_s:>11}  {'—':<16} *** NENAŠLA SA ***")
             continue
@@ -175,13 +202,26 @@ def main() -> int:
             print(f"  ! {w}")
 
     print()
+    if merged:
+        print(f"Zlúčené brány ({len(merged)}) — vstupný bod existuje, len ho zdedila iná brána:")
+        for m in merged:
+            print(f"  {m}")
+        print("Nastáva, keď dva refy pretnú hranicu AOI bližšie než "
+              "zoning.external_gateways.min_gateway_separation_m (default 800 m)")
+        print("a sú v rovnakej triede (motorway/trunk = jedna skupina). Víťazí ref,")
+        print("ktorý je vo whiteliste vyššie.")
+        print()
+
     if missing:
         print(f"ZLYHALO: {len(missing)} ciest z whitelistu nemá bránu: {', '.join(missing)}")
         print("Pravdepodobná príčina: OSM tá cesta má iný `ref`, alebo jej `link_type`")
         print("nie je v zoning.external_gateways.allowed_link_types.")
+        print("Presnú vetvu ukáže log build-zones: 'no ref match in whole network' /")
+        print("'no boundary-near matched links' / 'cross-token dedup: merged'.")
         return 1
 
-    print(f"OK: všetkých {len(tokens)} ciest z whitelistu má bránu.")
+    print(f"OK: všetkých {len(tokens)} ciest z whitelistu má bránu "
+          f"({len(merged)} z toho zlúčenú do inej).")
     return 0
 
 

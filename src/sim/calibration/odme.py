@@ -521,23 +521,33 @@ def run_odme_calibration(
                         (total_final - total_seed) / max(total_seed, 1.0) * 100
                     )
 
-                    diffs = np.abs(final_data - seed_data)
-                    top_k = 10
-                    flat_idx = np.argsort(diffs.ravel())[-top_k:][::-1]
-                    zone_ids = ctx.mat.index[:]
-                    top_k_cells = []
-                    for idx in flat_idx:
-                        i, j = divmod(int(idx), diffs.shape[1])
-                        d = float(diffs.ravel()[idx])
-                        if d < 1.0:
-                            break
-                        top_k_cells.append({
-                            "origin": int(zone_ids[i]),
-                            "destination": int(zone_ids[j]),
-                            "seed": round(float(seed_data[i, j]), 1),
-                            "final": round(float(final_data[i, j]), 1),
-                            "abs_diff": round(d, 1),
-                        })
+                    # The per-cell listing needs zone ids off the live matrix and
+                    # that is the one part that can fail late (a closed handle
+                    # raises "No such method or matrix core! --> index").  Keep it
+                    # in its own try so it cannot take the drift numbers with it —
+                    # those are the whole point of the report.
+                    top_k_cells: List[Dict[str, Any]] = []
+                    try:
+                        diffs = np.abs(final_data - seed_data)
+                        flat_idx = np.argsort(diffs.ravel())[-10:][::-1]
+                        zone_ids = ctx.mat.index[:]
+                        for idx in flat_idx:
+                            i, j = divmod(int(idx), diffs.shape[1])
+                            d = float(diffs.ravel()[idx])
+                            if d < 1.0:
+                                break
+                            top_k_cells.append({
+                                "origin": int(zone_ids[i]),
+                                "destination": int(zone_ids[j]),
+                                "seed": round(float(seed_data[i, j]), 1),
+                                "final": round(float(final_data[i, j]), 1),
+                                "abs_diff": round(d, 1),
+                            })
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            "Seed deviation: per-cell listing unavailable (%s); "
+                            "drift numbers below are still valid", e,
+                        )
 
                     seed_deviation_report = {
                         "max_cell_ratio": round(max_ratio, 3),

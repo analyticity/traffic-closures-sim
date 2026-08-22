@@ -45,7 +45,11 @@ logger = logging.getLogger(__name__)
 # Population helpers
 # ---------------------------------------------------------------------------
 
-def _employment_needs_remap(emp_path: Path, zones_geojson: Optional[Path] = None) -> bool:
+def _employment_needs_remap(
+    emp_path: Path,
+    zones_geojson: Optional[Path] = None,
+    cfg: Optional[dict] = None,
+) -> bool:
     """Return True when zone_employment.parquet is missing, stale, or out of sync with zones."""
     try:
         df = pd.read_parquet(emp_path)
@@ -55,6 +59,12 @@ def _employment_needs_remap(emp_path: Path, zones_geojson: Optional[Path] = None
             return True
         if "match_engine_version" not in df.columns or int(df["match_engine_version"].min()) < 3:
             return True
+        if cfg is not None:
+            from sim.datasets.employment import split_key_id
+
+            expected = split_key_id(emp_path, cfg)
+            if "split_key" not in df.columns or str(df["split_key"].iloc[0]) != expected:
+                return True
         if zones_geojson is not None and zones_geojson.exists():
             z = gpd.read_file(zones_geojson)
             zids = {int(x) for x in z["zone_id"].astype(int).tolist()}
@@ -424,7 +434,7 @@ def build_zones_and_connectors(
         emp_path = Path(cfg.get("datasets", {}).get("cache_dir", "data/cache")) / "zone_employment.parquet"
         _emp_needs_regen = (
             not emp_path.exists()
-            or _employment_needs_remap(emp_path, output_dir / "zones.geojson")
+            or _employment_needs_remap(emp_path, output_dir / "zones.geojson", cfg)
         )
         if _emp_needs_regen:
             reason = "missing" if not emp_path.exists() else "stale zone_id=0"

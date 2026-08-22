@@ -6,6 +6,7 @@ then mapping to zone IDs via the same fuzzy matching used for population.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -101,6 +102,24 @@ def _split_municipality_employment(
             "Employment split: '%s' (%d) spread over %d zones by %s",
             dest_name, total, len(members), key,
         )
+
+
+def split_key_id(out_parquet: Path, cfg: Optional[Dict[str, Any]]) -> str:
+    """Identity of the split key, so a config change invalidates the parquet.
+
+    Without this, switching datasets.employment.city_split_weights left the old
+    zone_employment.parquet in place — the run recomputed demand over the
+    previous key and reproduced the previous numbers exactly, which looks like
+    "the change had no effect" rather than "the change never applied".
+    """
+    emp_cfg = ((cfg or {}).get("datasets") or {}).get("employment") or {}
+    path = emp_cfg.get("city_split_weights")
+    if path and Path(path).exists():
+        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()[:8]
+        return f"weights:{digest}"
+    if (out_parquet.parent / "zone_population.parquet").exists():
+        return "population"
+    return "equal"
 
 
 def _load_split_weights(out_parquet: Path, cfg: Optional[Dict[str, Any]]) -> Dict[int, float]:
@@ -287,6 +306,7 @@ def derive_zone_employment(
     result = coerce_object_columns_for_parquet(pd.DataFrame(result_rows))
     # Bump when employment matching rules change so zoning can invalidate stale parquet.
     result["match_engine_version"] = 3
+    result["split_key"] = split_key_id(out_parquet, cfg)
     ensure_dir(out_parquet.parent)
     result.to_parquet(out_parquet, index=False)
 

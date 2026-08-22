@@ -111,20 +111,28 @@ demand:
       #
       # 35 334 zodpovedá MINIMÁLNEJ frekvencii pobytov podľa metodiky INTENS
       # (T2 >=4, T3 >=2, N >=1 pobyt / 28 dní) — je to dolná hranica, nie odhad.
-      # 90 000 je ~2x minimálna frekvencia a zo sweepu (scripts/sweep_demand.py,
-      # hodnoty 35334 / 45000 / 90000 / 130000 / auto) vyšlo ako jediný bod, ktorý
-      # prekonáva pôvodný model vo všetkých štyroch holdout metrikách naraz:
-      #   R² 0.699 (base 0.627), sklon 0.797 (0.744), %RMSE 42.3 (47.0),
-      #   bias 3.5 % (11.8 %).
       #
-      # POZOR, dve výhrady k tomuto číslu:
-      #  1. Sweep bežal na zónovaní, ktorému chýbalo Brno-střed — po oprave zón
-      #     sa optimum posunie a treba ho premerať znova (užší rozsah 45k-110k).
-      #  2. Screenline max odchýlka pri 90k vyskočila na 77,6 % (pri 35 334 bola
-      #     14,8 %). Celkový objem sedí lepšie, ale rozdelenie medzi brány sa
-      #     zhoršuje — I/52 klesne na pomer 0.65, D1_E na 0.74, kým 15286 a 15270
-      #     prestrelia na 1.78 a 1.68. To je samostatná chyba v distribúcii.
-      total_daily_trips: 90000
+      # 110 000 pochádza zo sweepu (scripts/sweep_demand.py) na opravenom modeli
+      # (29 mestských častí, zamestnanosť miest, váhy brán z kamdojizdime) a je
+      # to prvá hodnota, ktorá prekonáva pôvodný model vo VŠETKÝCH štyroch
+      # holdout metrikách naraz:
+      #   R² 0.777 (base 0.627) | sklon 1.005 (0.744)
+      #   %RMSE 36.4 (47.0)     | bias 9.3 % (11.8 %)
+      # Sklon 1.005 je prakticky presný — celkový objem dopytu sedí.
+      #
+      # Rozhodla až tretia úroveň porovnania z KAMDOJIZDIME_PLAN.md, teda o koľko
+      # musí ODME maticu pokriviť (seed_deviation v calibration_report.json):
+      #   110 000 -> drift -12,0 %, 0 buniek nad 4x prahom, max pomer 3.92
+      #    90 000 -> drift -28,1 %, 461 buniek nad prahom, max pomer 8.69
+      # Lepší holdout teda nie je vyrobený kalibráciou, ale lepším vstupom.
+      # (Staršie sweepy dávali iné čísla — bežali s poškodenou seed zálohou,
+      # viď commit 6920636. Porovnateľné sú až behy po ňom.)
+      #
+      # Zostáva výhrada: pri tejto hodnote ODME maticu takmer nemení, takže sa
+      # zviditeľnila chyba v rozdelení medzi brány, ktorú predtým prekrývala —
+      # D1_E má pomer 0.62, 602_W 0.64. Ladiť treba corridor_weights nižšie,
+      # nie tento objem.
+      total_daily_trips: 110000
       # Rozdelenie medzi brány. BEZ tohto kľúča ho _normalize_named_weights()
       # odvodí z triedy cesty (_LINK_TYPE_WEIGHT_SCALE: motorway 1.0, trunk 0.9,
       # primary 0.7, secondary 0.4), čo je jediná informácia o veľkosti koridoru,

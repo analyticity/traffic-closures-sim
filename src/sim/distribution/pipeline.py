@@ -304,6 +304,19 @@ def run_distribution(config_path: str | Path = "config/brno/sim.yaml", cfg: dict
     mat.close()
     logger.info("Updated matrix: %s", matrix_path)
 
+    # Move the ODME seed reference forward to the distributed matrix.
+    # build-demand writes it too, so a config with distribution disabled still
+    # has one — but when distribution runs, IT produces the final uncalibrated
+    # demand.  Leaving the reference on the build-demand output made calibrate's
+    # reset_matrix_before_run restore the pre-distribution matrix and throw the
+    # distribution away, which is invisible in the logs: every run still writes
+    # a distribution report.
+    import shutil as _shutil
+
+    _seed_backup = Path(matrix_path).with_suffix(".aem.orig")
+    _shutil.copy2(matrix_path, _seed_backup)
+    logger.info("Seed matrix reference moved to distributed matrix: %s", _seed_backup)
+
     skim_method = "unknown"
     warm_skim_provenance: Dict[str, Any] = {}
     if imp_source == "skim":

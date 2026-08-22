@@ -351,9 +351,10 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml", cf
     logger.info("Writing AEM matrix: %s", bcfg.matrix_path)
     _write_aem(bcfg.matrix_path, centroid_ids, all_cores, matrix_name=bcfg.matrix_name)
 
-    # Seed reference for ODME's drift report.  It has to be anchored here,
-    # because the only moment the matrix is provably uncalibrated is right after
-    # build-demand writes it.  Calibration used to refresh .aem.orig whenever the
+    # Seed reference for ODME's drift report.  Anchored here because this is a
+    # moment the matrix is provably uncalibrated; when distribution runs it
+    # moves the reference forward to its own output, which is the real
+    # uncalibrated demand.  Calibration used to refresh .aem.orig whenever the
     # working matrix differed from it — which is exactly what its own previous run
     # caused — so the "seed" silently became the last calibrated matrix and
     # prior_drift_pct measured zero by construction.

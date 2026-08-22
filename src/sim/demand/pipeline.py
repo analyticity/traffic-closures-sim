@@ -350,6 +350,18 @@ def load_or_build_od_matrix(config_path: str | Path = "config/brno/sim.yaml", cf
 
     logger.info("Writing AEM matrix: %s", bcfg.matrix_path)
     _write_aem(bcfg.matrix_path, centroid_ids, all_cores, matrix_name=bcfg.matrix_name)
+
+    # Seed reference for ODME's drift report.  It has to be anchored here,
+    # because the only moment the matrix is provably uncalibrated is right after
+    # build-demand writes it.  Calibration used to refresh .aem.orig whenever the
+    # working matrix differed from it — which is exactly what its own previous run
+    # caused — so the "seed" silently became the last calibrated matrix and
+    # prior_drift_pct measured zero by construction.
+    import shutil as _shutil
+
+    _seed_backup = Path(bcfg.matrix_path).with_suffix(".aem.orig")
+    _shutil.copy2(bcfg.matrix_path, _seed_backup)
+    logger.info("Seed matrix reference: %s", _seed_backup)
     _mark("write_aem_matrix")
 
     _ensure_dir(bcfg.output_dir)

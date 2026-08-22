@@ -330,13 +330,16 @@ class _CalibrationContext:
         if backup.exists():
             backup_hash = _file_hash(backup)
             if backup_hash != current_hash:
-                logger.warning(
-                    "Seed matrix changed since last backup "
-                    "(backup hash=%s, current hash=%s). "
-                    "Updating .aem.orig to new seed.",
+                # Do NOT refresh the backup here.  A difference means the working
+                # matrix was already calibrated by a previous run; overwriting the
+                # seed with it is what made seed_deviation report zero drift.
+                # build-demand owns this file and rewrites it with every new seed.
+                logger.info(
+                    "Working matrix differs from the seed reference "
+                    "(seed=%s, current=%s) — calibrated by an earlier run; "
+                    "keeping .aem.orig as written by build-demand.",
                     backup_hash, current_hash,
                 )
-                shutil.copy2(self.matrix_path, backup)
         else:
             shutil.copy2(self.matrix_path, backup)
             logger.info("Created seed matrix backup: %s", backup)

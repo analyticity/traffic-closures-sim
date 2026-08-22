@@ -214,11 +214,30 @@ datasets:
     # mestskú časť, generuje ho scripts/zone_workplace_weights.py. Centrum tak
     # vychádza na 42,1 %, Královo Pole 11,9 %, Brno-sever 9,1 %.
     #
-    # VÝHRADA: počet POI berie továreň a kaderníctvo rovnako, takže priemyselné
-    # časti sú podhodnotené. Skript preto vypisuje aj plochu priemyselnej pôdy —
-    # Brno-jih má 284 ha priemyslu, ale len 4,4 % pracovísk, Brno-Černovice
-    # 159 ha a 1,6 %. Ak sa ukáže, že model tie dve podstreľuje, začni tu.
-    city_split_weights: "config/brno/zone_employment_weights.json"
+    # VYPNUTÉ — zmerané A/B na inak identickej konfigurácii (external_local
+    # 110 000), menil sa len tento kľúč:
+    #
+    #                     populačný kľúč   POI kľúč
+    #   holdout R²             0.777         0.587
+    #   holdout sklon          1.005         0.715
+    #   holdout bias           9.3 %         25.7 %
+    #   drift od seedu        -12.0 %       -29.2 %
+    #   buniek nad prahom          0           431   (max pomer 3.92 vs 10.16)
+    #   screenline max          98.6 %        20.1 %
+    #
+    # POI kľúč dá centru 42,1 % pracovných miest namiesto 17,8 % a screenliny
+    # tým sadnú — ale len preto, že ODME musí maticu prekrútiť dvakrát viac.
+    # Podľa toho istého kritéria, ktorým sme vybrali 110 000 (menší drift =
+    # lepší vstup), je to zhoršenie.
+    #
+    # Zaujímavé je, že 92 634 pracovných miest v centre je pravdepodobne
+    # REALISTICKEJŠIE než 39 153 z populácie. Ak realistickejší vstup validuje
+    # horšie, chyba je inde — najskôr v deterrence funkcii gravitačného modelu
+    # (demand.distribution: beta, pa_trip_rate). To je ďalší experiment: zapnúť
+    # tento kľúč späť a ladiť beta, nie ho zahodiť.
+    #
+    # Váhy generuje scripts/zone_workplace_weights.py; súbor nechávam v repe.
+    # city_split_weights: "config/brno/zone_employment_weights.json"
   sources:
     commuting_sldb2021:
       filter:

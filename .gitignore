@@ -255,3 +255,10 @@ audit.md
 # Ak ich bude treba verzovať, prejsť na Git LFS (viď NOTICE).
 simulation_for_article/
 clanok/
+
+# Pracovné poznámky v markdowne sa neverzujú; v gite sú len tieto.
+*.md
+!README.md
+!CLAUDE.md
+!pipeline_detail.md
+!popis_simulacie.md

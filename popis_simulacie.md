@@ -4,6 +4,31 @@
 > o dopravnom modelovaní nič nevie. Technická dokumentácia (inštalácia, príkazy,
 > Docker) je v [README.md](README.md).
 
+> **Stav k 28. 8. 2026.** Všetky konkrétne čísla v tomto dokumente sú z behu
+> [`simulation_for_article/updated_version_6/`](simulation_for_article/updated_version_6/)
+> (commit `1f19c7a`, config `d31f767a476c1743`, 24. 8. 2026). Porovnanie so
+> staršími variantmi je v [POROVNANIE.md](simulation_for_article/POROVNANIE.md),
+> stav opráv v [PLAN_ZLEPSENIA.md](PLAN_ZLEPSENIA.md), návrh vyhodnotenia
+> v [plan_vyhodnotenia.md](plan_vyhodnotenia.md).
+>
+> **Aktualizácia 28. 8. poobede:** referenčným behom je teraz
+> [`updated_version_9`](simulation_for_article/updated_version_9/) — holdout
+> R² 0,734 · sklon 0,874 ✅ · %RMSE 39,8 · bias −11,4 % ✅ · 96 % screenlinov
+> v ±20 %. Kalibrácia dostala kumulatívny strop na drift, ODME sa zastavuje na
+> 8 iteráciách, parametre segmentu `other` sú zjednotené a vedľajšia sieť má
+> nižší denný kapacitný faktor. Rozbor v [PLAN_ZLEPSENIA.md](PLAN_ZLEPSENIA.md).
+>
+> **VHT a VKT sú od `updated_version_10` použiteľné** (23,5 min a 12,6 km na
+> priemernú cestu). Vo verziách v6–v9 tvorila 96,8 % VHT jedna opravná spojka
+> siete — tam sa VHT čítať nedá.
+>
+> Čo sa od verzie z 18. 8. zmenilo najvýraznejšie: **8 brán namiesto 5**
+> (pribudli I/50, II/602, II/380, II/430), **75 zón namiesto 69**
+> (doplnené Brno-střed, Brno-Komín, Brno-Chrlice), `external_local`
+> **110 000 namiesto 35 334** voz/deň s váhami brán z kamdojizdime,
+> zamestnanosť mestských častí z OSM pracovísk, a **zrušené ručné vylúčenia
+> CSD úsekov** z kalibrácie aj validácie.
+
 ---
 
 ## Obsah
@@ -87,8 +112,9 @@ modelu**. Pre Brno má stovky riadkov a stĺpcov.
 počty ciest). „Ako dlho trvá z Bohuníc do Líšne."
 
 **Gateway (brána)** — miesto, kde diaľnica/cesta preteká hranicou modelu
-(D1, D2, I/43, I/52 pri Brne). Doprava zvonku sa musí niekde „naliať" dnu. Kód pre
-ne vyrába **umelé zóny** s ID od 8 000 000 000.
+(pri Brne D1 × 2, D2, I/43, I/52, I/50, II/602, II/380, II/430 — spolu 8).
+Doprava zvonku sa musí niekde „naliať" dnu. Kód pre ne vyrába **umelé zóny**
+s ID od 8 000 000 000.
 
 **Screenline** — pomyselná čiara naprieč mestom. Sčíta sa, koľko áut ju v modeli
 prekročí, a porovná sa s realitou. Kontrolný bod kalibrácie.
@@ -231,9 +257,14 @@ asymetrické počty pruhov).
 2. Odfiltrujú sa tie, ktorých ťažisko je mimo modelovanej oblasti.
 3. Odstránia sa prekryvy (dva zdroje môžu popisovať to isté územie).
 4. **Vytvoria sa umelé „gateway" zóny**
-   ([gateways.py](src/sim/zoning/gateways.py)) na miestach, kde D1/D2/I/43/I/52
-   pretínajú hranicu. V configu Brna sú niektoré kotvené na presné súradnice,
-   lebo automatika trafila vedľajšiu vetvu.
+   ([gateways.py](src/sim/zoning/gateways.py)) na miestach, kde hlavné cesty
+   pretínajú hranicu. Brno má dnes **8 brán**: D1 západ, D1 východ, D2 juh,
+   I/52 juh, I/43 sever a (od 20. 8. 2026) I/50 východ, II/602 západ,
+   II/380 juhovýchod, II/430 východ. Pôvodných 5 brán pokrývalo len ~63 %
+   hraničnej dopravy podľa CSD — 37 % (137 tis. voz/deň) nemalo kadiaľ vojsť.
+   Niektoré brány sú kotvené na presné súradnice (`anchor_latlon`), lebo
+   automatika trafila vedľajšiu vetvu alebo úsek za zúžením — najmä I/43,
+   kde sa `trunk` 2+2 mení na `primary` 1+1 a brána cez to nepretlačila dopyt.
 5. Vypočítajú sa **centroidy** a **konektory** — pre každú zónu až 6 spojok na
    najbližšie vhodné cesty. Interné zóny sa zámerne nenapájajú priamo na diaľnicu.
 6. Priradí sa **populácia** ku každej zóne.
@@ -277,7 +308,7 @@ Skladá sa niekoľko vrstiev („segmentov") dopravy:
 |---|---|---|
 | `commuting` | SLDB dochádzka | osoby → autá: `osoby × podiel_áut / obsadenosť × ciest_na_osobu` |
 | `other` | populácia | gravitačný model — [`_build_gravity_seed`](src/sim/demand/seeds.py#L21) |
-| `external_local` | brány ↔ mesto | pevný denný objem z configu (Brno: 35 334), rozdelený podľa populácie zón |
+| `external_local` | brány ↔ mesto | pevný denný objem z configu (Brno: 110 000), rozdelený medzi brány podľa `corridor_weights` z kamdojizdime a medzi zóny podľa populácie |
 | `external_through` | supernetwork | tranzit z kroku 5, škálovaný ×0.30 |
 
 **Gravitačný model** je fyzikálna analógia: cesty medzi dvoma zónami sú úmerné
@@ -488,18 +519,23 @@ výpočet z arbitrárne zvolených konštánt.
 ### Ako sa to číslo mení krok za krokom (reálny beh, Brno)
 
 Čísla nižšie sú z reálneho behu uloženého v
-[simulation_for_article/updated_version_1/](simulation_for_article/updated_version_1/)
+[simulation_for_article/updated_version_6/](simulation_for_article/updated_version_6/)
 (`od_summary.json`, `calibration_report.json`):
 
 | Po kroku | Celkový počet vozidlojázd / deň | Zmena |
 |---|---:|---|
-| `build-demand` (surová OD matica) | **461 374** | — |
-| `distribute` (gravitácia + IPF + blend) | **532 412** | +15,4 % |
-| `calibrate` (ODME, iterácia 36 z 48) | **384 869** | −27,7 % oproti distribúcii |
+| `build-demand` (surová OD matica) | **559 940** | — |
+| `distribute` (gravitácia + IPF + blend) | **645 964** | +15,4 % |
+| `calibrate` (ODME, 14 iterácií) | **451 866** | −30,1 % oproti distribúcii |
 
 Čiže: číslo, ktoré vojde do modelu, sa medzi prvým a posledným krokom zmení
-o desiatky percent — a to bez jediného náhodného čísla. To je jadro toho, čo
-myslel Adam.
+o desiatky percent — a to bez jediného náhodného čísla.
+
+Pre porovnanie, ten istý reťazec v staršej verzii (`updated_version_1`,
+`external_local` 35 334): 461 374 → 532 412 → 384 869. Pomer +15,4 % / −28 %
+sa teda **nezmenil** ani po tom, čo sa vstup zdvihol o 100 tisíc ciest — čo je
+samo o sebe informácia: `distribute` a ODME posúvajú objem *relatívne*,
+nezávisle od toho, s čím začnú.
 
 ### Krok po kroku: čo určuje počet áut a koľko voľnosti tam je
 
@@ -544,7 +580,9 @@ Navyše sa dochádzka **cez hranicu modelu** (externá obec ↔ Brno) násobí
 ([defaults.py:219](src/sim/defaults.py#L219)) — predpoklad, že nie každý dochádzajúci
 z celej ČR jazdí denne. Ďalší voľný parameter.
 
-**b) `other` (nákup, voľný čas, služobné cesty) — 93 035 vozidiel/deň**
+**b) `other` (nákup, voľný čas, služobné cesty) — 112 274 vozidiel/deň**
+*(93 035 pred doplnením Brno-střed / Komín / Chrlice do zón — segment je
+priamo úmerný populácii, takže chýbajúce tri mestské časti ho podstreľovali)*
 
 Nemá dátový zdroj vôbec, generuje sa gravitačným modelom z populácie
 ([`_build_gravity_seed`](src/sim/demand/seeds.py#L21)):
@@ -559,18 +597,32 @@ s `trip_rate = 1.0`, `car_share = 0.35`, `occupancy = 1.50`, `beta = 0.00030`
 teda **čistý predpoklad** — zmena `trip_rate` z 1,0 na 1,5 pridá do modelu
 ~46 500 áut denne.
 
-**c) `external_local` (brána ↔ mesto) — 35 334 vozidiel/deň**
+**c) `external_local` (brána ↔ mesto) — 110 000 vozidiel/deň**
 
 Buď pevné číslo z configu, alebo `total_daily_trips: auto`, kedy sa odhadne ako
 súčet CSD AADT na cestách, na ktorých ležia brány, delený pokrytím
 ([`_estimate_total_daily_trips_from_csd`](src/sim/demand/seeds.py#L132)).
 
-Toto je najlepšia ilustrácia typu A: v [config/brno/sim.yaml](config/brno/sim.yaml)
-je komentár, že predchádzajúca hodnota **130 000** bola odhad bez opory v dátach
-a nahradila ju hodnota **35 334** odvodená z kamdojizdime.cz. To je zmena vstupu
-o −95 000 áut denne — bez zmeny jediného riadku kódu.
+Toto je najlepšia ilustrácia typu A. História tohto jedného čísla:
 
-**d) `external_through` (tranzit) — 35 891 vozidiel/deň**
+| hodnota | odkiaľ | výsledok |
+|---:|---|---|
+| 130 000 | pôvodný odhad bez opory v dátach | holdout R² 0,627 |
+| 35 334 | kamdojizdime, **minimálna** frekvencia pobytov podľa INTENS (dolná hranica) | holdout R² 0,466 — horšie |
+| 90 000 | sweep | drift ODME −28 %, 461 buniek nad prahom |
+| **110 000** | sweep, prvá hodnota lepšia vo všetkých 4 holdout metrikách naraz | holdout R² 0,685, sklon 0,794 |
+
+Rozhodlo až tretie kritérium: **o koľko musí ODME maticu pokriviť**
+(`seed_deviation` v `calibration_report.json`). Lepší vstup ⇒ menšia korekcia.
+Detaily aj výhrady sú v komentári priamo v
+[config/brno/sim.yaml](config/brno/sim.yaml#L107).
+
+Objem sa medzi brány už nedelí podľa triedy cesty, ale podľa `corridor_weights`
+odvodených z kamdojizdime (`scripts/kamdojizdime_gateway_weights.py`) — D1_W
+18,3 %, D1_E 17,7 %, I52_S 16,6 %, 602_W 15,2 %, D2_S 13,7 %, 430_E 10,0 %,
+I43_N 7,0 %, 380_SE 1,4 %.
+
+**d) `external_through` (tranzit) — 40 552 vozidiel/deň**
 
 Zo supernetworku (krok 5), vynásobené `through_traffic_scale`
 — v Brne **0,30**, default v kóde **0,50**
@@ -593,8 +645,13 @@ parametrov: `pa_trip_rate = 1.8`, `pa_car_share = 0.40`, `pa_occupancy = 1.3`
 ([defaults.py:288](src/sim/defaults.py#L288)). Výsledok sa mieša so seedom
 (`blend_alpha = 0.55`) a stropuje (`max_total_multiplier = 3.5`).
 
-Kombinácia „vlastné P/A vektory + blend + strop" je dôvod, prečo z 461 374
-vyjde 532 412. Aj tu je všetko deterministické — a všetko sú zvolené konštanty.
+Kombinácia „vlastné P/A vektory + blend + strop" je dôvod, prečo z 559 940
+vyjde 645 964. Aj tu je všetko deterministické — a všetko sú zvolené konštanty.
+
+⚠️ Toto je **nález č. 1** z [pipeline_detail.md](pipeline_detail.md): segment
+`other` sa fakticky modeluje dvakrát dvomi rôznymi sadami parametrov
+(0,233 vs. 0,554 cesty na obyvateľa) a IPF ten prvý ticho prepíše. Stále to
+platí — viď položku P0-3 v [PLAN_ZLEPSENIA.md](PLAN_ZLEPSENIA.md).
 
 #### 4. `assign` — počet áut sa nemení, mení sa ich rozloženie
 
@@ -650,7 +707,7 @@ road_info = road_info.sample(frac=1.0, random_state=rng)
 Seed je fixný, takže rozdelenie je reprodukovateľné. **Ale je arbitrárne** —
 so `random_seed: 7` by do kalibrácie išli iné úseky, ODME by dostalo iné ciele
 a celkový počet áut v modeli by vyšiel iný. Pri 14 použiteľných úsekoch (viď
-[Prečo je použiteľných len 14 z desiatok CSD úsekov](#prečo-je-použiteľných-len-14-z-desiatok-csd-úsekov))
+[Prečo je použiteľných len pár z desiatok CSD úsekov](#prečo-je-použiteľných-len-pár-z-desiatok-csd-úsekov))
 je táto citlivosť nezanedbateľná — je to najmenšie miesto v pipeline s najväčším
 pákovým efektom. Ak treba obhájiť robustnosť, správna odpoveď je prebehnúť
 kalibráciu s viacerými seedmi a ukázať rozptyl výsledných metrík.
@@ -725,7 +782,7 @@ blízko 1.
 | záporné | model je **horší** než priemer |
 
 **Prah:** ≥ 0.80 ([defaults.py:357](src/sim/defaults.py#L357))
-**Váš holdout:** 0.700 ❌
+**Váš holdout:** 0.685 ❌ (kalibračná časť 0.824 ✅)
 
 **Na čo si dať pozor:** R² je slepé voči systematickému posunu. Keby model všade
 predpovedal presne polovicu reality, R² by bolo stále vysoké — poradie úsekov by
@@ -746,13 +803,13 @@ M = slope × O + intercept
 | slope | Význam |
 |---|---|
 | 1.0 | ideál |
-| 0.71 | model rastie **pomalšie** — čím väčší úsek, tým väčšie podhodnotenie |
+| 0.79 | model rastie **pomalšie** — čím väčší úsek, tým väčšie podhodnotenie |
 | 1.3 | model preháňa rozdiely medzi úsekmi |
 
 **Prah:** 0.85 – 1.15
-**Váš holdout:** 0.715 ❌
+**Váš holdout:** 0.794 ❌ (kalibračná časť 0.873 ✅) — zlepšenie z 0.715
 
-**Čo to prakticky znamená:** slope 0.715 s interceptom −1218 hovorí, že na
+**Čo to prakticky znamená:** slope pod 1 hovorí, že na
 frekventovaných úsekoch model chýba viac než na tichých. Typická príčina je, že
 model nedostatočne koncentruje dopravu na hlavné ťahy — buď je v OD matici málo
 dlhých ciest, alebo sú kapacity hlavných ťahov nastavené príliš nízko, takže
@@ -771,10 +828,16 @@ bias = (ΣM − ΣO) / ΣO × 100
 | bias | Význam |
 |---|---|
 | 0 % | model má správne celkové množstvo dopravy |
-| −18.9 % | model má **o 19 % menej** dopravy než realita |
+| −18.6 % | model má **o 19 % menej** dopravy než realita |
 
 **Prah:** |bias| ≤ 15 %
-**Váš holdout:** −18.9 % ❌
+**Váš holdout:** −18.6 % ❌ (kalibračná časť −18.7 %)
+
+Pozor na znamienko: `metrics.json` a `benchmarks` uvádzajú `bias_abs_pct`
+(absolútnu hodnotu, 18.6), `csd_summary.bias_pct` má znamienko (−18.6).
+Model teda stále **podhodnocuje**, napriek tomu, že sa vstupný dopyt
+medzitým zdvihol z 461 tis. na 560 tis. ciest — ODME ten prírastok znovu
+odobrala (−30 %).
 
 **Ako sa to opravuje:** nedostatok objemu sa opravuje na strane dopytu — viac
 ciest do OD matice. Presne preto je zaujímavý parameter
@@ -800,10 +863,10 @@ váži rovnako ako 400 úsekov s omylom 1 000.
 | %RMSE | Význam |
 |---|---|
 | 0 % | dokonalé |
-| 42.2 % | typický omyl je 42 % priemerného úseku |
+| 43.3 % | typický omyl je 43 % priemerného úseku |
 
 **Prah:** ≤ 35 %
-**Váš holdout:** 42.2 % ❌ (RMSE 6 583 vozidiel)
+**Váš holdout:** 43.3 % ❌ (kalibračná časť 38.0 ❌)
 
 **Rozdiel oproti biasu:** bias je *smerový* (plus a mínus sa vyrušia), %RMSE je
 *absolútny*. Model s biasom 0 % môže mať %RMSE 60 %, ak sa polovica úsekov mýli
@@ -824,7 +887,7 @@ Veľké úseky teda vážia viac, čo je vecne správne.
 
 **Prah wMAPE:** varovanie nad 47 %
 ([validation.py:1496](src/sim/calibration/validation.py#L1496))
-**Vaše MAPE:** 36.5 %
+**Váš stav:** warning `wmape` sa v behu v6 nespustil (`warnings: []`).
 
 ---
 
@@ -853,10 +916,13 @@ percentuálna presnosť dá pri dennom modeli ~3× vyšší GEH.
 
 Preto:
 
-- **`geh_lt5_pct: 0.0` vo vašom reporte nie je katastrofa** — je to očakávané.
+- **Nízke `geh_lt5_pct` vo vašom reporte nie je katastrofa** — je to očakávané.
+  V behu v6 je `geh_lt5_pct = 12.5 %`.
 - Kód počíta aj **upravený prah** `daily_geh_threshold = 5 × √K`, kde K je
   `daily_capacity_factor` ([metrics.py:92](src/sim/calibration/metrics.py#L92)).
-  U vás `daily_geh_threshold = 15.8`, a `daily_geh_lt_adj_pct = 21.4 %`.
+  V v6 je `daily_geh_lt_adj_pct` **33.3 %** na kalibračnej časti, ale
+  **0.0 %** na holdoute — čo je samo o sebe silný signál, že holdout obsahuje
+  systematicky iné (menšie, horšie trafené) úseky než kalibračná časť.
 - **GEH je zámerne vylúčený z konvergenčných kritérií** pre denný model
   ([context.py:765](src/sim/calibration/context.py#L765)). Verdikt PASS/FAIL stojí
   na R², slope, %RMSE, bias a screenlinoch.
@@ -874,15 +940,22 @@ To je robustnejšie: ak model pošle dopravu vedľajšou paralelnou ulicou, na �
 linkov to vyzerá ako dve chyby, ale screenline to zachytí správne.
 
 ```
-screenline_max_error_pct = najhorší koridor z 21 porovnávaných
+screenline_max_error_pct = najhorší koridor z 26 porovnávaných
 ```
 
 **Prah:** ≤ 15 %
-**Váš stav:** 58.4 % ❌ (21 porovnávaných, 0 vylúčených)
+**Váš stav:** 67.9 % ❌ (26 porovnávaných, 0 vylúčených)
 
 Screenline, ktoré vyjdú extrémne (pomer model/realita mimo 0.2–5.0), sa
 **automaticky vylúčia** z hodnotenia — obvykle to znamená chybu v napárovaní, nie
-chybu modelu. U vás sa nevylúčila žiadna, takže tá 58 % odchýlka je reálna.
+chybu modelu. U vás sa nevylúčila žiadna, takže tá odchýlka je reálna.
+
+⚠️ **Toto je dnes najhoršia metrika a zároveň tá najmenej stabilná** — naprieč
+variantmi v6…v1 skáče medzi 8.7 % a 88.6 % bez toho, aby to korelovalo
+s holdoutom. Je to *maximum* z 26 koridorov, takže ho určuje jeden najhorší
+screenline; ako súhrnná metrika je preto skoro nepoužiteľná. Do článku patrí
+skôr **podiel screenlinov v ±20 %** (to je aj to, čo tvrdí abstrakt), nie
+maximum. Zmena je na strane reportu, nie modelu.
 
 ---
 
@@ -906,35 +979,46 @@ Report ukazuje **dve sady tých istých metrík**:
 |---|---|---|
 | dáta | 65 % CSD úsekov | 35 % CSD úsekov |
 | ODME ich videla? | **áno** | **nie** |
-| R² u vás | 0.839 | **0.700** |
-| slope | 0.932 | **0.715** |
-| %RMSE | 38.9 | **42.2** |
-| bias | −14.0 % | **−18.9 %** |
+| n ciest | 24 (26 spárovaných) | 9 |
+| R² u vás | 0.824 | **0.685** |
+| slope | 0.873 | **0.794** |
+| %RMSE | 38.0 | **43.3** |
+| bias | −18.7 % | **−18.6 %** |
+
+Zaujímavý detail v6: bias je na oboch vzorkách **rovnaký** (−18.7 vs −18.6),
+zatiaľ čo predtým sa líšil o 5 p.b. To znamená, že podhodnotenie už nie je
+artefakt fitu na kalibračnú vzorku — je to skutočná systematická vlastnosť
+modelu. Rozdiel medzi vzorkami zostal len v R² a %RMSE, teda v rozptyle.
 
 **Verdikt sa berie z holdoutu** (`verdict_source: "holdout"`), a to je správne.
 Kalibračné číslo je vždy optimistickejšie — ODME sa na tie dáta priamo fitovala.
-Rozdiel medzi 0.839 a 0.700 je presne miera toho, koľko z „úspechu" je fit
+Rozdiel medzi 0.824 a 0.685 je presne miera toho, koľko z „úspechu" je fit
 a koľko skutočná schopnosť modelu.
 
-**`holdout_adequacy: "thin"`** = holdout má len 14 použiteľných bodov. Pri takom
+**`holdout_adequacy: "thin"`** = holdout má len 9 použiteľných ciest. Pri takom
 počte je jedno-dve odľahlé merania schopné pohnúť R² o desatiny. Preto pri
 porovnávaní dvoch verzií modelu vždy uvádzajte aj `n` a neinterpretujte malé
 rozdiely.
 
 ---
 
-### Prečo je použiteľných len 14 z desiatok CSD úsekov
+### Prečo je použiteľných len pár z desiatok CSD úsekov
 
-`csd_summary` ukazuje, koľko sa ich cestou vyradilo:
+`csd_summary` (holdout, v6) ukazuje, koľko sa ich cestou vyradilo:
 
 ```
-n_roads: 8
+n_roads: 9
 n_partial_excluded:         6   ← model pokrýva < 70 % dĺžky CSD úseku
 n_minimal_excluded:         3   ← pokrýva < 30 %
 n_over_aggregated_excluded: 2   ← model má > 2× viac km než CSD úsek
 n_zero_flow_excluded:       1   ← model tam predpovedal nulu
 n_ratio_excluded:           1   ← pomer mimo pásma 0.2–5.0
 ```
+
+Kalibračná časť má po pridaní brán a zrušení ručných vylúčení **24 ciest**
+(z 26 spárovaných) — pred zmenami to bolo 14. To je zatiaľ najväčšie zlepšenie
+dôveryhodnosti, aké sa v modeli podarilo dosiahnuť, a **nestálo to žiadnu
+zmenu metodiky** — len prestať vyhadzovať dáta.
 
 Toto **nie sú chyby modelu, ale chyby napárovania.** CSD úsek „I/42 od km 12.3 po
 14.1" nemusí zodpovedať tomu, čo model považuje za tú istú cestu. Porovnávať
@@ -955,7 +1039,7 @@ v [config/brno/sim.yaml](config/brno/sim.yaml).
   "warn_wmape_pct": 47.0,
   "warn_geh_lt5_pct": 7.0,
   "hard_reject": false,
-  "warnings": ["geh_lt5_pct<7"]
+  "warnings": []
 }
 ```
 
@@ -968,22 +1052,36 @@ v [config/brno/sim.yaml](config/brno/sim.yaml).
 
 ### Zhrnutie vášho aktuálneho stavu
 
-| Metrika | Holdout | Cieľ | |
-|---|---|---|---|
-| R² | 0.700 | ≥ 0.80 | ❌ |
-| slope | 0.715 | 0.85–1.15 | ❌ |
-| %RMSE | 42.2 | ≤ 35 | ❌ |
-| bias | −18.9 % | ≤ 15 % | ❌ |
-| screenline max | 58.4 % | ≤ 15 % | ❌ |
-| hard_reject | false | false | ✅ |
+| Metrika | **Holdout v9** | Holdout v6 | Holdout (18. 8.) | Cieľ | |
+|---|---|---|---|---|---|
+| R² | **0.734** | 0.685 | 0.700 | ≥ 0.80 | ❌ |
+| slope | **0.874** | 0.794 | 0.715 | 0.85–1.15 | ✅ |
+| %RMSE | **39.8** | 43.3 | 42.2 | ≤ 35 | ❌ |
+| bias | **−11.4 %** | −18.6 % | −18.9 % | ≤ 15 % | ✅ |
+| screenline max | 22.6 % | 67.9 % | 58.4 % | ≤ 15 % | ❌ |
+| screenliny v ±20 % | **96 %** (25/26) | — | — | — | |
+| n (holdout) | 9 | 9 | 14 | — | |
+| n (kalibrácia) | 23 | 24 | 14 | — | |
+| hard_reject | false | false | false | false | ✅ |
 
-**Čo to hovorí dohromady:** model **systematicky podhodnocuje dopravu** (bias −19 %)
-a to podhodnotenie **rastie s veľkosťou úseku** (slope 0.715). To je konzistentný
-obraz, nie náhodný šum — a znamená to, že chyba je s najväčšou pravdepodobnosťou
-v **objeme a štruktúre OD matice**, nie v priraďovaní.
+**Pozor pri porovnávaní tých dvoch stĺpcov:** nie sú to tie isté vzorky.
+Starý beh mal 14 bodov s ručne vylúčenými hraničnými radiálami; nový má 24
+kalibračných a 9 holdout bodov *vrátane* tých najťažších ciest, ktoré predtým
+vypadli. Čísla sú preto **prísnejšie**, nie horšie — a slope sa aj tak zlepšil
+z 0.715 na 0.794.
 
-Presne to je dôvod, prečo majú kamdojizdime dáta zmysel: dávajú nezávislý odhad
-externých objemov namiesto dnešného hádaného čísla.
+**Čo to hovorí dohromady:** model **stále systematicky podhodnocuje dopravu**
+(bias −19 %) a to podhodnotenie **rastie s veľkosťou úseku** (slope 0.79).
+To je konzistentný obraz, nie náhodný šum — chyba je s najväčšou
+pravdepodobnosťou v **objeme a štruktúre OD matice**, nie v priraďovaní.
+
+Dôležitá zmena interpretácie oproti augustu: hypotéza „chýba objem
+v `external_local`" sa **otestovala a nepotvrdila ako celé vysvetlenie**.
+Vstup sa zdvihol z 35 tis. na 110 tis. ciest, holdout sa zlepšil (R² 0.466 →
+0.685, slope 0.542 → 0.794), ale bias zostal na −19 %, lebo ODME prírastok
+znovu zoškrtala (drift −30 %, 425 buniek narazilo na 4× strop). To posúva
+podozrenie z „málo dopytu" na **„ODME sťahuje maticu nadol, lebo ju
+k tomu tlačí niekoľko málo screenlinov"** — a to je iná oprava.
 
 ---
 
@@ -1006,6 +1104,34 @@ Kód potom:
 
 Výsledok je mapa, kde vidíte, **kam sa doprava presunie**, keď zavriete konkrétnu
 ulicu. Beží to v background threade, frontend polluje stav.
+
+### ⚠️ Šumové dno scenárov — čo treba vedieť pred interpretáciou
+
+V behu v6 sa spustil aj **„null" scenár**: zavrela sa jedna linka s **nulovým
+objemom**, teda zásah, ktorý nemôže mať žiadny efekt. Výsledok:
+
+| | null (žiadny zásah) | Jihlavská (75 liniek, 414 tis. voz/deň) |
+|---|---:|---:|
+| hrán so zmenou > 500 voz/deň | **753** | 2 421 |
+| celková redistribúcia Σ\|Δ\| | **1 299 568** | 4 639 901 |
+| ΔVHT | **−1 424** | −1 079 |
+| ΔVKT | −1 473 | +18 655 |
+
+Čítať to treba takto:
+
+- **Δ objemov na linkoch je použiteľné.** Signál je ~3,6× nad šumom
+  (4,64 mil. vs 1,30 mil.), a na jednotlivých linkoch v okolí uzávierky ešte
+  výrazne viac. Ale „počet ovplyvnených hrán" je bez uvedenia null scenára
+  bezcenné číslo — tretina z nich je numerika.
+- **ΔVHT je dnes nepoužiteľné.** Obe hodnoty sú záporné (zavretie hlavnej
+  ulice by malo VHT *zvýšiť*) a null scenár má väčšiu odchýlku než reálny
+  zásah. Príčinou je tolerancia konvergencie BFW (`rgap` 0.002) — VHT je súčet
+  cez 36 tis. liniek, takže sa v ňom nazbiera viac šumu, než koľko robí samotný
+  zásah. Riešenie: buď rovnaký, výrazne prísnejší `rgap` pre baseline aj scenár
+  (napr. 1e-4), alebo VHT počítať len na podmnožine liniek v okolí zásahu.
+
+**Bez null scenára sa žiadne scenárové číslo nemá publikovať.** Návrh, ako to
+zabudovať do vyhodnotenia, je v [plan_vyhodnotenia.md](plan_vyhodnotenia.md).
 
 ---
 

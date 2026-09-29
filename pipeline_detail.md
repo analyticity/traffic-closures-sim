@@ -44,6 +44,71 @@ Nálezy sú označené:
 
 ---
 
+## Stav nálezov k 28. 8. 2026
+
+> Dokument bol napísaný 18. 8. 2026. Odvtedy prišlo ~20 commitov. Táto tabuľka
+> hovorí, čo z neho ešte platí. Referenčný beh je
+> [`updated_version_6`](simulation_for_article/updated_version_6/) (commit `1f19c7a`).
+
+| # | Nález | Stav | Poznámka |
+|---|---|---|---|
+| 1 | `other` sa generuje dvakrát | 🔴 **platí** | `defaults.py:231` (1.0/0.35/1.50) vs `defaults.py:288` (1.8/0.40/1.3) — nezmenené |
+| 2 | Vylúčenie podľa pomeru mimo [0.2, 5] aj z metrík | 🟠 **čiastočne** | Ručné `exclude_csd_roads` a `csd_validation_exclude_sil` sú prázdne (n vyskočilo z 14 na 24). Automatické vylúčenie podľa pomeru v `matching.py` je **stále jeden flag `_excluded`**, nerozdelený na geom/objem |
+| 3 | „Corridor" split nie je náhodný | 🔴 **platí** | `observed.py:555` stále `sort_values("n_sections", ascending=False)` |
+| 4 | Globálny reziduál škáluje celú maticu podľa ~14 úsekov | 🟠 **zmiernené** | Už 24 úsekov, ale mechanizmus rovnaký. `global_residual_damping` znížený na 0.10 (config) |
+| 5 | Nespárovaná zóna dostane medián populácie ČR | 🔴 **platí** | `population.py:215` `default_median` |
+| 6 | Zamestnanosť = len dochádzajúci zvonku | 🟠 **čiastočne** | Filter `lokalizace=0` stále aktívny (`employment.py:212`), ale pribudol `city_split_weights` — rozdelenie zamestnanosti Brna na 29 MČ podľa OSM pracovísk namiesto podľa populácie (centrum 42,1 % namiesto 17,8 %) |
+| 7 | Kapacita z CSD AADT → cirkularita | 🔴 **platí** | nezmenené |
+| 8 | `geometry.length` vracia stupne | 🔴 **platí** | `normalization.py:722` nezmenené |
+| 9 | Tiché fallbacky v gravitácii/IPF | 🔴 **platí** | `gravity.py:46`, `gravity.py:93` — stále `except Exception` |
+| 10 | „Spiess" nie je Spiess | 🔴 **platí, a je to horšie** | viď nižšie |
+
+### Nález 10 sa medzitým zdvojil
+
+Referenčný beh v6 má v `calibration_report.json` `"method": "entropy_odme"` —
+teda **nebežal Spiess vôbec**. Default v [defaults.py:314](src/sim/defaults.py#L314)
+je `entropy_odme`, zatiaľ čo docstring v [run.py:18](run.py#L18) tvrdí
+„Spiess gradient ODME (default)" a oba popisné dokumenty opisujú Spiessa.
+
+Do práce aj do článku teda treba:
+
+1. opísať **entropy-maximization** vetvu (`entropy_step_size = 0.15` v Brne), nie Spiessa;
+2. buď zosúladiť docstring `run.py`, alebo default prepnúť späť;
+3. ak sa Spiess spomína, tak ako *alternatívna* implementovaná metóda.
+
+### Čo pribudlo a v dokumente ešte nie je rozobrané
+
+| Zmena | Kde | Dopad |
+|---|---|---|
+| 8 brán namiesto 5 (I/50, 602, 380, 430) | `config/brno/sim.yaml:96-99` | pokrylo ~47 % predtým chýbajúcej hraničnej dopravy |
+| Kotva brány I/43 južne od zúženia | `sim.yaml:85` | modelovaných 15 118 → dopyt cez bránu prejde |
+| 29 mestských častí z Overpassu namiesto osmnx | `sim.yaml:53` + `zones_admin9.geojson` | doplnené Brno-střed, Komín, Chrlice (osmnx ich ticho vynechával) |
+| `external_local` 110 000 + `corridor_weights` z kamdojizdime | `sim.yaml:135-167` | holdout R² 0.466 → 0.685 |
+| `city_split_weights` (zamestnanosť z OSM POI) | `sim.yaml:238` | holdout slope 0.715 → 0.794 |
+| Zrušené ručné vylúčenia CSD | `sim.yaml:202-203` | n z 14 na 24 |
+| Null scenár (zavretie linky s nulovým objemom) | notebook | odhalil šumové dno priradenia — viď nižšie |
+
+### Nový nález: šumové dno scenárov **[M]**
+
+V behu v6 sa zavrela jedna linka s nulovým objemom. Výsledok: **753 hrán**
+zmenilo objem o viac než 500 voz/deň, Σ|Δ| = **1,30 mil. voz/deň** (2,5 %
+celkového objemu siete), ΔVHT = **−1 424 voz·h**. Reálny scenár (Jihlavská,
+75 liniek, 414 tis. voz/deň) dá Σ|Δ| = 4,64 mil. a ΔVHT = **−1 079**.
+
+Dôsledky:
+
+- **Δ objemov je použiteľné** (signál/šum ≈ 3,6), ale každé scenárové číslo sa
+  musí uvádzať proti null scenáru.
+- **ΔVHT a ΔVKT sú dnes pod šumovým dnom** a nesmú sa publikovať tak, ako sú.
+  Príčina je tolerancia BFW (`rgap_target` 0.002 pri baseline,
+  `scenario_rgap` pri scenári) — dve nezávislé aproximácie toho istého
+  ekvilibria sa odčítavajú.
+- Oprava je lacná: baseline aj scenár spustiť s rovnakým, prísnym `rgap`
+  (1e-4) a z rovnakého štartu, alebo KPI počítať len na linkách v okolí zásahu.
+  Detail v [plan_vyhodnotenia.md](plan_vyhodnotenia.md), krok E1.
+
+---
+
 ## 0. Orchestrácia — `run.py`
 
 **Vstupy:** `config/<mesto>/sim.yaml` (deep-merge nad `SIM_DEFAULTS`

@@ -170,6 +170,24 @@ def _detect_cross_screenline_collisions(
     logger.warning(msg)
 
 
+def _drop_withheld_roads(
+    csd: Optional[pd.DataFrame],
+    withheld_roads: set[str],
+) -> Optional[pd.DataFrame]:
+    """Remove every section of a withheld road (CSD ``sil``).
+
+    Screenlines are what ODME fits the matrix to, so no count of a road in the
+    withheld share may reach one -- otherwise the road is no longer withheld.
+    """
+    if csd is None or not withheld_roads or "sil" not in csd.columns:
+        return csd
+    keep = ~csd["sil"].astype(str).isin(withheld_roads)
+    n_dropped = int((~keep).sum())
+    if n_dropped:
+        logger.info("  Screenline counts: dropped %d sections of withheld roads", n_dropped)
+    return csd[keep].copy()
+
+
 def _sr_val(sr: Any, key: str) -> float:
     """Extract a numeric value from a screenline result (dict or dataclass)."""
     if isinstance(sr, dict):
@@ -381,18 +399,22 @@ class _CalibrationContext:
             )
             logger.info(f"  Pentlogram: {len(self.pent)} observed segments")
 
-        # Screenlines (manual YAML + auto-generated from gateways/CSD)
+        # Screenlines (manual YAML + auto-generated from gateways/CSD).  ODME
+        # fits the matrix to them, so under ``csd_split`` they may only use the
+        # calibration share.  The CSD screenlines used to be built from the
+        # whole count, which made four of the nine validation roads of the
+        # Brno build of 4 Sep 2026 ODME targets.
         csd_for_auto = None
         csd_full_for_gw = None
+        withheld_roads: set[str] = set()
         if self.count_source == "csd_split":
-            try:
-                csd_for_auto = load_csd(cfg)
-            except Exception:
-                pass
+            csd_for_auto = calib_csd
+            withheld_roads = set(_valid_csd["sil"].astype(str))
         try:
             csd_full_for_gw = load_csd_unfiltered(cfg)
         except Exception:
             pass
+        csd_full_for_gw = _drop_withheld_roads(csd_full_for_gw, withheld_roads)
         self.screenlines = load_screenlines_with_auto(
             cfg, csd_df=csd_for_auto, csd_df_full=csd_full_for_gw,
         )
@@ -450,6 +472,27 @@ class _CalibrationContext:
 
         # Seed matrix for elasticity bounds
         seed = self.mat.matrix[self.core_name][:, :].copy().astype(np.float64)
+
+        # Cumulative drift guard.  Elasticity bounds constrain each *cell*
+        # (seed/4 .. seed*4) and `max_iter_change_pct` constrains each
+        # *iteration* (+-12%), but nothing constrained the *total* -- so ODME
+        # could walk the whole matrix down a few percent per iteration
+        # indefinitely.  Measured on Brno: the reduction was ~30% regardless of
+        # where it started (seed 645,963 -> 451,097 and seed 560,445 ->
+        # 401,767, both ~0.70x), while the model was already under-predicting
+        # observed counts by 19%.  The demand being removed is demand that
+        # crosses no count post, so it costs nothing in the objective.
+        self.seed_total = float(seed.sum())
+        self.max_total_drift_pct = float(calib_cfg.get("max_total_drift_pct", 0.0) or 0.0)
+        if self.max_total_drift_pct > 0:
+            lo = self.seed_total * (1 - self.max_total_drift_pct / 100.0)
+            hi = self.seed_total * (1 + self.max_total_drift_pct / 100.0)
+            logger.info(
+                f"  Cumulative drift guard: total demand held within "
+                f"±{self.max_total_drift_pct:.0f}% of seed "
+                f"({lo:,.0f} .. {hi:,.0f})"
+            )
+
         self.seed_lower = seed / self.max_deviation
         self.seed_upper = seed * self.max_deviation
         self.seed_lower[seed <= 0] = 0.0
@@ -900,6 +943,22 @@ class _CalibrationContext:
                     f"  Iter demand cap: {change_pct:+.1f}% exceeds "
                     f"±{max_change_pct:.0f}%, clamped to {demand.sum():,.0f}"
                 )
+
+        # Cumulative guard: the per-iteration cap above bounds the step, not the
+        # walk.  Without this, ~0.4%/iteration of unmeasured demand bleeds away
+        # for as long as the loop runs.
+        if self.max_total_drift_pct > 0 and self.seed_total > 0:
+            drift_pct = (float(demand.sum()) - self.seed_total) / self.seed_total * 100
+            if abs(drift_pct) > self.max_total_drift_pct:
+                target = self.seed_total * (
+                    1.0 + np.sign(drift_pct) * self.max_total_drift_pct / 100.0
+                )
+                demand *= target / max(float(demand.sum()), 1.0)
+                logger.info(
+                    f"  Total drift guard: {drift_pct:+.1f}% from seed exceeds "
+                    f"±{self.max_total_drift_pct:.0f}%, rescaled to {demand.sum():,.0f}"
+                )
+
         self.mat.matrix[self.core_name][:, :] = demand
         self.mat.save()
         logger.info(f"  Matrix saved. Total demand: {demand.sum():,.0f}")

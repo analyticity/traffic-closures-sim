@@ -364,6 +364,15 @@ SIM_DEFAULTS: Dict[str, Any] = {
         "max_iterations": 50,
         "reset_matrix_before_run": True,
 
+        # Cumulative cap on how far ODME may rewrite the TOTAL demand, in % of
+        # the seed.  Per-cell elasticity (max_deviation) and the per-iteration
+        # cap (max_iter_change_pct) both existed; the total was unconstrained,
+        # so the loop could walk demand down ~0.4%/iteration indefinitely --
+        # removing exactly the demand that crosses no count post, which costs
+        # nothing in the objective.  0 disables the guard (historical
+        # behaviour).  See plan_vyhodnotenia.md, experiment C.
+        "max_total_drift_pct": 0.0,
+
         "convergence": {
             "geh_lt5_target_pct": 85.0,
             "min_improvement_pct": -5.0,

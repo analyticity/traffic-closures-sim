@@ -25,8 +25,6 @@ Developed as part of a diploma thesis at Brno University of Technology, Faculty 
 > |---|---|
 > | [popis_simulacie.md](popis_simulacie.md) | Model explained from scratch + where the input vehicle count comes from |
 > | [pipeline_detail.md](pipeline_detail.md) | Per-step technical review: inputs, algorithms, risks, defects found |
-> | [PLAN_ZLEPSENIA.md](PLAN_ZLEPSENIA.md) | Prioritised improvement plan (P0–P2) with measurable milestones |
-> | [KAMDOJIZDIME_PLAN.md](KAMDOJIZDIME_PLAN.md) | Plan for folding kamdojizdime.cz mobile-location data into the model |
 >
 > Model changes so far: gateways for the four boundary radials that previously had
 > none (I/50, II/602, II/380, II/430), removal of the manual CSD exclusion lists,

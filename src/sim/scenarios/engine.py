@@ -110,6 +110,7 @@ class ScenarioJob:
     finished_at: Optional[float] = None
     geojson_path: Optional[Path] = None
     scenario_links: List[Dict[str, Any]] = field(default_factory=list)
+    delta_summary: Dict[str, Any] = field(default_factory=dict)
     _future: Optional[Future] = field(default=None, repr=False)
 
     def elapsed(self) -> float:
@@ -126,13 +127,16 @@ class ScenarioJob:
             api_status = "running"
         else:
             api_status = "running"  # QUEUED — keep polling / same UX as running
-        return {
+        status = {
             "id": self.id,
             "status": api_status,
             "error": self.error,
             "started_at": self.started_at,
             "elapsed_seconds": self.elapsed(),
         }
+        if self.delta_summary:
+            status["delta_summary"] = self.delta_summary
+        return status
 
     def load_geojson(self) -> Optional[dict]:
         """Load result GeoJSON from disk (not kept in RAM)."""
@@ -149,6 +153,11 @@ _jobs_lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=1)
 
 JOB_TTL_SECONDS = 3600
+
+# Null-run baseline cache: one unmodified assignment per (project, matrix,
+# assignment settings).  See `_null_baseline_results`.
+_null_baseline_cache: Dict[tuple, pd.DataFrame] = {}
+_null_baseline_lock = threading.Lock()
 
 
 def _prune_old_jobs() -> None:
@@ -167,6 +176,190 @@ def _prune_old_jobs() -> None:
                     pass
 
 
+# --- Assignment execution ---
+
+def _assignment_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve every knob that affects an assignment run, in one place.
+
+    Both the scenario run and the null-run baseline read from this, so the two
+    cannot silently drift apart -- which is the whole point of the null run.
+    """
+    demand_cfg = cfg.get("demand") or {}
+    calib_cfg = cfg.get("calibration") or {}
+    assign_cfg = cfg.get("assignment") or {}
+    mc_cfg = assign_cfg.get("multi_class") or {}
+    gc_cfg = assign_cfg.get("generalized_cost") or {}
+    gc_enabled = bool(gc_cfg.get("enabled", False))
+
+    return {
+        "project_dir": Path(cfg["project_path"]),
+        "matrix_path": Path(demand_cfg.get("matrix_path", "data/demand/od_matrix.aem")),
+        "core_name": str(calib_cfg.get("core_name", "wd_daily")),
+        "bpr_params": dict(assign_cfg.get("bpr") or {}) or None,
+        "assign_cfg": assign_cfg,
+        "multi_classes": (
+            list(mc_cfg["classes"])
+            if mc_cfg.get("enabled") and "classes" in mc_cfg
+            else None
+        ),
+        "algorithm": str(calib_cfg.get("algorithm", "bfw")),
+        "cores": int(assign_cfg.get("cores", 0)),
+        "max_iter": int(assign_cfg.get("scenario_max_iter", calib_cfg.get("max_iter", 100))),
+        "rgap": float(assign_cfg.get("scenario_rgap", calib_cfg.get("rgap_target", 0.001))),
+        "gc_field": (
+            str(gc_cfg["fixed_cost_field"])
+            if gc_enabled and "fixed_cost_field" in gc_cfg
+            else None
+        ),
+        "gc_mult": float(gc_cfg.get("fixed_cost_multiplier", 0.0)) if gc_enabled else 0.0,
+        "gc_vot": float(gc_cfg.get("vot", 1.0)),
+    }
+
+
+def run_assignment_with_scenario(
+    cfg: Dict[str, Any],
+    scenario_links: List[Dict[str, Any]],
+) -> pd.DataFrame:
+    """Run one assignment with *scenario_links* applied in memory.
+
+    Passing an empty list produces the **null run**: the untouched network,
+    solved by exactly the same code path with exactly the same settings.
+    """
+    s = _assignment_settings(cfg)
+
+    fix_node_ids(s["project_dir"])
+
+    mat = AequilibraeMatrix()
+    mat.load(str(s["matrix_path"]))
+    mat.computational_view([s["core_name"]])
+
+    project = Project()
+    project.open(str(s["project_dir"]))
+    try:
+        graph = build_graph(
+            project, mat,
+            bpr_parameters=s["bpr_params"],
+            assignment_cfg=s["assign_cfg"],
+        )
+
+        apply_scenario_to_graph(graph, scenario_links)
+
+        df, _skims, _sl, _conv = execute_assignment(
+            project,
+            mat,
+            algorithm=s["algorithm"],
+            cores=s["cores"],
+            max_iter=s["max_iter"],
+            rgap_target=s["rgap"],
+            bpr_parameters=s["bpr_params"],
+            multi_class=s["multi_classes"],
+            fixed_cost_field=s["gc_field"],
+            fixed_cost_multiplier=s["gc_mult"],
+            vot=s["gc_vot"],
+            graph=graph,
+        )
+    finally:
+        project.close()
+        mat.close()
+
+    return df
+
+
+def _null_baseline_key(cfg: Dict[str, Any]) -> tuple:
+    """Cache key: everything that would make the null run come out different."""
+    s = _assignment_settings(cfg)
+
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    project_db = s["project_dir"] / "project_database.sqlite"
+    return (
+        str(s["project_dir"]), _mtime(project_db),
+        str(s["matrix_path"]), _mtime(s["matrix_path"]),
+        s["core_name"], s["algorithm"], s["max_iter"], s["rgap"], s["cores"],
+        json.dumps(s["bpr_params"], sort_keys=True, default=str),
+        json.dumps(s["multi_classes"], sort_keys=True, default=str),
+        s["gc_field"], s["gc_mult"], s["gc_vot"],
+    )
+
+
+def null_baseline_results(cfg: Dict[str, Any]) -> pd.DataFrame:
+    """Assignment of the untouched network, computed once and cached.
+
+    Why this exists: scenario deltas used to be taken against the stored
+    ``assignment_results.parquet`` from the ``assign`` step.  That is a
+    *different run* -- different iteration budget, possibly a different config
+    revision -- so subtracting the two mixed the scenario effect with the gap
+    between two independent approximations of the same equilibrium.  Measured
+    on Brno v6: closing a single link carrying **zero** vehicles still moved
+    753 links by >500 veh/day and shifted VHT by -1 424 veh*h, which is larger
+    than the effect of closing a real arterial.
+
+    Diffing against a null run computed here removes that asymmetry by
+    construction.  What remains is genuine effect plus BFW path-dependence,
+    which shrinks as ``assignment.scenario_rgap`` is tightened -- measure it
+    with a placebo scenario (close a link with no traffic) rather than
+    assuming it is negligible.
+    """
+    key = _null_baseline_key(cfg)
+    with _null_baseline_lock:
+        cached = _null_baseline_cache.get(key)
+    if cached is not None:
+        logger.info("Null-run baseline: using cached result")
+        return cached
+
+    logger.info("Null-run baseline: running unmodified assignment (cached afterwards)")
+    started = time.time()
+    df = run_assignment_with_scenario(cfg, [])
+    logger.info("Null-run baseline: done in %.1f s", time.time() - started)
+
+    with _null_baseline_lock:
+        _null_baseline_cache[key] = df
+    return df
+
+
+def clear_null_baseline_cache() -> None:
+    """Drop the cached null run (call after re-running ``assign``)."""
+    with _null_baseline_lock:
+        _null_baseline_cache.clear()
+
+
+def _overlay_assignment(
+    gdf: gpd.GeoDataFrame,
+    assignment_df: pd.DataFrame,
+) -> gpd.GeoDataFrame:
+    """Put the volumes of *assignment_df* onto the geometry frame *gdf*."""
+    vol_cols = [c for c in assignment_df.columns if c != "link_id"]
+    synth = [c for c in ("wd_daily_tot", "wd_daily_ab", "wd_daily_ba") if c in gdf.columns]
+    drop_cols = list({*(c for c in vol_cols if c in gdf.columns), *synth})
+
+    out = gdf.drop(columns=drop_cols) if drop_cols else gdf.copy()
+    out = out.merge(assignment_df[["link_id"] + vol_cols], on="link_id", how="left")
+    aggregate_daily_volumes(out)
+    return out
+
+
+def _delta_summary(geojson: dict) -> Dict[str, float]:
+    """Headline numbers for the scenario, for logs and the job status."""
+    deltas = [
+        float(f["properties"].get("delta_vol") or 0.0)
+        for f in geojson.get("features", [])
+    ]
+    if not deltas:
+        return {}
+    abs_deltas = [abs(d) for d in deltas]
+    return {
+        "sum_abs_delta_vol": round(sum(abs_deltas), 1),
+        "links_over_500": int(sum(1 for d in abs_deltas if d > 500)),
+        "links_over_100": int(sum(1 for d in abs_deltas if d > 100)),
+        "max_increase": round(max(deltas), 1),
+        "max_decrease": round(min(deltas), 1),
+    }
+
+
 # --- Background worker ---
 
 def _run_scenario_worker(
@@ -179,65 +372,35 @@ def _run_scenario_worker(
         with _jobs_lock:
             job._set_status(JobStatus.RUNNING)
 
-        project_dir = Path(cfg["project_path"])
-        demand_cfg = cfg.get("demand") or {}
-        calib_cfg = cfg.get("calibration") or {}
         assign_cfg = cfg.get("assignment") or {}
-        matrix_path = Path(demand_cfg.get("matrix_path", "data/demand/od_matrix.aem"))
-        core_name = str(calib_cfg.get("core_name", "wd_daily"))
-        bpr_params = dict(assign_cfg.get("bpr") or {}) or None
-        mc_cfg = assign_cfg.get("multi_class") or {}
-        multi_classes = (
-            list(mc_cfg["classes"])
-            if mc_cfg.get("enabled") and "classes" in mc_cfg
-            else None
-        )
+        baseline_mode = str(assign_cfg.get("scenario_baseline", "null_run")).strip().lower()
 
-        algorithm = str(calib_cfg.get("algorithm", "bfw"))
-        max_iter = int(assign_cfg.get("scenario_max_iter", calib_cfg.get("max_iter", 100)))
-        rgap = float(assign_cfg.get("scenario_rgap", calib_cfg.get("rgap_target", 0.001)))
-
-        fix_node_ids(project_dir)
-
-        mat = AequilibraeMatrix()
-        mat.load(str(matrix_path))
-        mat.computational_view([core_name])
-
-        project = Project()
-        project.open(str(project_dir))
-        try:
-            graph = build_graph(project, mat, bpr_parameters=bpr_params, assignment_cfg=assign_cfg)
-
-            apply_scenario_to_graph(graph, job.scenario_links)
-
-            gc_cfg = assign_cfg.get("generalized_cost") or {}
-            gc_enabled = bool(gc_cfg.get("enabled", False))
-            gc_field = (
-                str(gc_cfg["fixed_cost_field"])
-                if gc_enabled and "fixed_cost_field" in gc_cfg
-                else None
+        # The null run must be computed *before* the scenario so a failure here
+        # is reported as a scenario failure rather than a silent fallback to
+        # the stored (non-comparable) baseline.
+        if baseline_mode == "null_run":
+            null_df = null_baseline_results(cfg)
+            baseline_for_delta = _overlay_assignment(baseline_links_gdf, null_df)
+        elif baseline_mode == "stored":
+            logger.warning(
+                "scenario_baseline='stored': deltas are taken against "
+                "assignment_results.parquet, i.e. against a different run. "
+                "Expect a large noise floor -- see null_baseline_results()."
             )
-            gc_mult = float(gc_cfg.get("fixed_cost_multiplier", 0.0)) if gc_enabled else 0.0
-            gc_vot = float(gc_cfg.get("vot", 1.0))
-
-            df, _skims, _sl, _conv = execute_assignment(
-                project,
-                mat,
-                algorithm=algorithm,
-                max_iter=max_iter,
-                rgap_target=rgap,
-                bpr_parameters=bpr_params,
-                multi_class=multi_classes,
-                fixed_cost_field=gc_field,
-                fixed_cost_multiplier=gc_mult,
-                vot=gc_vot,
-                graph=graph,
+            baseline_for_delta = baseline_links_gdf
+        else:
+            raise ValueError(
+                f"assignment.scenario_baseline must be 'null_run' or 'stored', "
+                f"got {baseline_mode!r}"
             )
-        finally:
-            project.close()
-            mat.close()
 
-        geojson = _build_scenario_geojson(baseline_links_gdf, df)
+        df = run_assignment_with_scenario(cfg, job.scenario_links)
+
+        geojson = _build_scenario_geojson(baseline_for_delta, df)
+
+        job.delta_summary = _delta_summary(geojson)
+        job.delta_summary["baseline_mode"] = baseline_mode
+        logger.info("Scenario job %s deltas: %s", job.id, job.delta_summary)
 
         _SCENARIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         out_path = _SCENARIO_OUTPUT_DIR / f"{job.id}.geojson"

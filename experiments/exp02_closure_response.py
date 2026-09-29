@@ -25,10 +25,10 @@ from _common import (
     compute_scenario_kpis,
     ensure_metric_links,
     init_experiment,
-    load_assignment_results,
     load_baseline_links,
     load_closures,
     match_links_near_point,
+    null_baseline_assignment,
     run_scenario_assignment,
     save_csv,
     save_figure,
@@ -157,7 +157,11 @@ def main() -> None:
 
     closures = load_closures(cfg)
     links = load_baseline_links(cfg)
-    baseline_assign = load_assignment_results(cfg)
+
+    # Deltas are taken against a null run — the untouched network solved by the
+    # same code path as the scenarios — not against assignment_results.parquet,
+    # which comes from a different run and carries a large noise floor.
+    baseline_assign = null_baseline_assignment(cfg)
 
     from sim._metrics import aggregate_daily_volumes
 

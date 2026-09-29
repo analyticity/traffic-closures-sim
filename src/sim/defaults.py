@@ -127,6 +127,28 @@ SIM_DEFAULTS: Dict[str, Any] = {
         "cores": 0,
         "blocked_centroid_flows": True,
 
+        # What a scenario is compared against.
+        #   "null_run" – re-solve the untouched network through the same code
+        #                path and the same settings as the scenario, then diff.
+        #   "stored"   – diff against assignment_results.parquet from `assign`.
+        #
+        # "stored" was the historical behaviour and it compares two *different*
+        # runs, so the gap between two approximations of the same equilibrium
+        # leaks into the result.  Measured on Brno v6: closing one link with
+        # zero traffic still moved 753 links by >500 veh/day (sum |delta| =
+        # 1.30M) and changed VHT by -1 424 veh*h — a larger effect than closing
+        # a real arterial.  Keep "null_run" unless reproducing an older run.
+        "scenario_baseline": "null_run",
+
+        # Residual noise after the null-run fix is BFW path-dependence and
+        # scales with this tolerance.  Tighten (e.g. 1e-4) when a scenario
+        # effect is small, and verify with a placebo scenario — close a link
+        # carrying no traffic and check that sum |delta| collapses toward zero.
+        # Left at the calibration tolerance by default so run times do not
+        # change silently; see plan_vyhodnotenia.md, step E1.
+        # "scenario_rgap": 0.002,
+        # "scenario_max_iter": 200,
+
         "warm_skim_pass": {
             "algorithm": "bfw",
             "max_iter": 80,

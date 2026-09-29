@@ -250,7 +250,25 @@ def compute_scenario_kpis(
     b_overloaded = int((baseline.get("VOC_max", pd.Series(dtype=float)).fillna(0) > 1.0).sum())
     s_overloaded = int((scenario.get("VOC_max", pd.Series(dtype=float)).fillna(0) > 1.0).sum())
 
+    # Total redistribution: the scale of the effect, and the quantity a null /
+    # placebo scenario has to be compared against before any of this is read
+    # as signal (plan_vyhodnotenia.md, step E1).
+    redistribution: Dict[str, float] = {}
+    vol_col = "wd_daily_tot"
+    if vol_col in baseline.columns and vol_col in scenario.columns:
+        merged = baseline[["link_id", vol_col]].merge(
+            scenario[["link_id", vol_col]], on="link_id", how="inner",
+            suffixes=("_base", "_scen"),
+        )
+        delta = (merged[f"{vol_col}_scen"].fillna(0) - merged[f"{vol_col}_base"].fillna(0)).abs()
+        redistribution = {
+            "sum_abs_delta_vol": round(float(delta.sum()), 1),
+            "links_over_500": int((delta > 500).sum()),
+            "links_over_100": int((delta > 100).sum()),
+        }
+
     return {
+        **redistribution,
         "baseline_vht": round(b_vht, 1),
         "scenario_vht": round(s_vht, 1),
         "delta_vht": round(s_vht - b_vht, 1),
@@ -268,6 +286,34 @@ def compute_scenario_kpis(
 # Scenario assignment runner
 # ---------------------------------------------------------------------------
 
+def null_baseline_assignment(cfg: Dict[str, Any], *, force: bool = False) -> pd.DataFrame:
+    """Assignment of the untouched network, run the same way a scenario is.
+
+    Scenario deltas must not be taken against ``assignment_results.parquet``:
+    that is a *different* run with its own iteration budget, so subtracting it
+    mixes the scenario effect with the gap between two approximations of the
+    same equilibrium.  On Brno v6 that gap moved 753 links by >500 veh/day for
+    a closure that removed **zero** vehicles.  See ``plan_vyhodnotenia.md``,
+    step E1, and :func:`sim.scenarios.engine.null_baseline_results`.
+
+    Cached to ``<demand_dir>/null_baseline_assignment.parquet`` so repeated
+    experiment runs pay for it once.  Delete that file (or pass ``force``)
+    after re-running ``assign`` or changing assignment settings.
+    """
+    cache = _demand_dir(cfg) / "null_baseline_assignment.parquet"
+    if cache.exists() and not force:
+        logger.info("Using cached null-run baseline %s", cache)
+        df = pd.read_parquet(cache)
+        aggregate_daily_volumes(df)
+        return df
+
+    logger.info("Running null-run baseline assignment (no scenario applied)")
+    df = run_scenario_assignment(cfg, [])
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache, index=False)
+    return df
+
+
 def run_scenario_assignment(
     cfg: Dict[str, Any],
     scenario_links: List[Dict[str, Any]],
@@ -281,6 +327,9 @@ def run_scenario_assignment(
     Opens project/matrix, builds graph, applies scenario modifications
     in-memory, runs BFW, returns enriched results. Does NOT write to disk
     or modify the on-disk project.
+
+    An empty *scenario_links* gives the null run — see
+    :func:`null_baseline_assignment`.
     """
     from aequilibrae import Project
     from aequilibrae.matrix import AequilibraeMatrix
@@ -327,6 +376,7 @@ def run_scenario_assignment(
         df, _skims, _sl, _conv = execute_assignment(
             project, mat,
             algorithm=_algorithm,
+            cores=int(assign_cfg.get("cores", 0)),
             max_iter=_max_iter,
             rgap_target=_rgap,
             bpr_parameters=bpr_params,

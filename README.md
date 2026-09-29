@@ -10,7 +10,7 @@ Developed as part of a diploma thesis at Brno University of Technology, Faculty 
 > for his diploma thesis at BUT FIT — upstream:
 > **[adamkankovsky/Trafic-sim-backend](https://github.com/adamkankovsky/Trafic-sim-backend)**.
 >
-> This fork is maintained by **Magdalena Ondrušková** under the *analyticity*
+> This fork is maintained by **Magdaléna Ondrušková** under the *analyticity*
 > organisation. It branches at commit `7ed13e2`; the complete upstream history is
 > preserved, so every original commit keeps its authorship. See **[NOTICE](NOTICE)**
 > for authorship and licence details.
@@ -267,4 +267,20 @@ CI runs unit tests on Python 3.11 and 3.12 on every push; integration tests run 
 
 ## License
 
-This software was developed as part of a diploma thesis. See the thesis text for full terms.
+Copyright (C) 2026 Adam Kaňkovský (original pipeline) and Magdaléna Ondrušková (this fork)
+
+This program is free software: you can redistribute it and/or
+modify it under the terms of the
+[GNU Affero General Public License](LICENSE) as published by
+the Free Software Foundation, either version 3 of the License,
+or (at your option) any later version. It is the same licence as the
+[analyticity](https://github.com/analyticity/analyticity) platform;
+see [NOTICE](NOTICE) for authorship.
+
+**What this means in practice.** You are free to use, study,
+modify and redistribute this software, including for research
+and teaching. If you modify it and make it available to others
+over a network — for example by running your own instance of
+the API — you must offer those users the complete
+corresponding source code of your modified version, under the
+same license.

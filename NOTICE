@@ -8,7 +8,7 @@ Brno University of Technology, Faculty of Information Technology (FIT VUT).
     Upstream repository : https://github.com/adamkankovsky/Trafic-sim-backend
     Fork point          : 7ed13e2  "feat(network): per-class HCM speed factors
                                     and minimum speed enforcement"
-    Fork maintained by  : Magdalena Ondrušková (analyticity)
+    Fork maintained by  : Magdaléna Ondrušková (analyticity)
 
 
 Authorship
@@ -29,15 +29,23 @@ To list them:
 Licence
 -------
 
-The upstream repository does not carry an explicit licence file. Under default
-copyright rules all rights to the original work therefore remain with its
-author. This fork exists with the original author's consent.
+    Copyright (C) 2026 Adam Kaňkovský       (original pipeline, up to 7ed13e2)
+    Copyright (C) 2026 Magdaléna Ondrušková  (this fork)
 
-    TODO (pred zverejnením doplniť): odkaz na súhlas Adama Kaňkovského
-    (e-mail / issue / dátum), prípadne licenciu dohodnutú pre tento fork.
+With the consent of the original author, this program is free software: you
+can redistribute it and/or modify it under the terms of the GNU Affero General
+Public License as published by the Free Software Foundation, either version 3
+of the License, or (at your option) any later version. The full text is in
+LICENSE. It is the same licence as the analyticity platform
+(https://github.com/analyticity/analyticity).
 
-Anyone wishing to reuse this code should contact both the original author and
-the maintainer of this fork.
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>.
 
 
 Third-party components

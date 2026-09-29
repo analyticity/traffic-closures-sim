@@ -21,8 +21,14 @@ def _build_hub_group(
     hub_name: str,
     hub_source_rank: Optional[int],
     zone_population: Optional[Dict[int, int]] = None,
+    weight_label: str = "population",
 ) -> Dict[str, List[Tuple[int, float]]]:
-    """Build a synthetic 'hub' group for the main multi-zone core city."""
+    """Build a synthetic 'hub' group for the main multi-zone core city.
+
+    ``zone_population`` holds the zone weights; pass employment instead to
+    build the group for the work ends of trips (``weight_label`` only names
+    the weights in the log).
+    """
     hub_norm = _norm_name(hub_name)
     if not hub_norm:
         return {}
@@ -70,7 +76,7 @@ def _build_hub_group(
     w = np.array(weights, dtype=np.float64)
     w = w / w.sum()
 
-    method = "population" if use_population else "area"
+    method = weight_label if use_population else "area"
     logger.info("Hub group %r: %d zones, weighted by %s", hub_name, len(members), method)
 
     return {hub_norm: [(zid, float(wi)) for zid, wi in zip(ids, w)]}

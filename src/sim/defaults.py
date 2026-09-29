@@ -205,8 +205,22 @@ SIM_DEFAULTS: Dict[str, Any] = {
         "matrix_name": "demand",
         "od_global_scale": 1.0,
 
+        # The core city is a single place in the census; its trip ends are split
+        # among its zones by population at home and, with "employment", by
+        # zone employment (zone_employment.parquet) at work or school.
+        "hub_group": {
+            "destination_weights": "employment",
+        },
+
         "sldb": {
-            "include_lokalizace": ["0_na_adrese_OP", "1_meziobecni"],
+            # SLDB 2021 workplace location (``lokalizace``): 0 = at the home
+            # address (works at home, no daily commute), 1 = another
+            # municipality, 2 = abroad, 3 = within the home municipality,
+            # 4 = no fixed workplace, 99 = unknown.  Commuting is 1 and 3.
+            # Category 0 used to stand in for 3, which put Brno's 39 537 home
+            # workers into the matrix instead of its 176 890 intra-city
+            # commuters.
+            "include_lokalizace": ["1_meziobecni", "3_v_ramci_obce"],
             "only_internal_pairs": False,
             "external_processing": {
                 "enabled": True,

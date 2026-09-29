@@ -65,7 +65,14 @@ def _build_od_cores(
     gateways: Dict[str, List[Tuple[int, float]]],
     external_lookup: Dict[str, List[Tuple[int, float]]],
     external_lookup_out: Optional[Dict[str, List[Tuple[int, float]]]] = None,
+    groups_work: Optional[Dict[str, List[Tuple[int, float]]]] = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+    """Build the commuting cores.
+
+    ``groups`` splits a multi-zone place (the core city) among its zones at the
+    home end of a trip; ``groups_work``, when given, does so at the work or
+    school end, so that jobs are not placed where people live.
+    """
     _validate_shares(bcfg.periods, bcfg.shares_work, "weekday.work")
     _validate_shares(bcfg.periods, bcfg.shares_school, "weekday.school")
 
@@ -120,6 +127,23 @@ def _build_od_cores(
         )
     logger.info("Pre-cached %d unique place-name resolutions (directional)", len(name_cache_dir))
 
+    # Destinations (work/school ends) resolve like origins except for groups.
+    name_cache_work = name_cache_dir
+    if groups_work is not None and groups_work is not groups:
+        name_cache_work = dict(name_cache_dir)
+        for name, entry in name_cache_dir.items():
+            if entry[2] == "group":
+                name_cache_work[name] = _resolve_place_candidates_directional(
+                    name,
+                    primary=primary,
+                    stripped=stripped,
+                    groups=groups_work,
+                    inbound_lookup=external_lookup,
+                    outbound_lookup=external_lookup_out,
+                    gateways=gateways,
+                    allow_legacy_fallback=bcfg.external.allow_legacy_fallback,
+                )
+
     work_col_name = "dojizdka_prace"
     school_col_name = "dojizdka_skola"
     work_raw = (
@@ -131,12 +155,17 @@ def _build_od_cores(
         if school_col_name in df.columns else np.zeros(len(df))
     )
 
+    # ``trips_per_person`` counts both legs of a commuter's day.  Every row is
+    # written twice below -- the outbound leg (``fwd``) and the return leg
+    # (``ret``) -- so each leg carries half of it.  Passing the full value
+    # counted each commuter's day twice: 1.6 instead of 0.8 vehicle trips per
+    # worker at car share 0.48 and occupancy 1.2.
     w_conv = persons_to_vehicles(1.0, car_share=bcfg.conv_work.car_share,
                                 occupancy=bcfg.conv_work.occupancy,
-                                trips_per_person=bcfg.conv_work.trips_per_person)
+                                trips_per_person=bcfg.conv_work.trips_per_person / 2.0)
     s_conv = persons_to_vehicles(1.0, car_share=bcfg.conv_school.car_share,
                                 occupancy=bcfg.conv_school.occupancy,
-                                trips_per_person=bcfg.conv_school.trips_per_person)
+                                trips_per_person=bcfg.conv_school.trips_per_person / 2.0)
     work_v_all = np.maximum(work_raw, 0.0) * w_conv
     school_v_all = np.maximum(school_raw, 0.0) * s_conv
 
@@ -170,7 +199,7 @@ def _build_od_cores(
             continue
 
         o_entry = name_cache_dir.get(on, _EMPTY_DIR)
-        d_entry = name_cache_dir.get(dn, _EMPTY_DIR)
+        d_entry = name_cache_work.get(dn, _EMPTY_DIR)
         o_in_cands, o_out_cands, o_mode, o_kind = o_entry
         d_in_cands, d_out_cands, d_mode, d_kind = d_entry
 

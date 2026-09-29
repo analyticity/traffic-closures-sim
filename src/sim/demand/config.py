@@ -95,9 +95,9 @@ def _build_cfg(cfg: Dict[str, Any]) -> DemandBuildCfg:
     csv_path, filtered_parquet, full_cr_parquet = _resolve_commuting_paths(cfg)
     fmt = get_nested(cfg, ["datasets", "sources", "commuting_sldb2021", "format"], {}) or {}
 
-    include_lok = get_nested(demand, ["sldb", "include_lokalizace"], ["0_na_adrese_OP", "1_meziobecni"])
+    include_lok = get_nested(demand, ["sldb", "include_lokalizace"], ["1_meziobecni", "3_v_ramci_obce"])
     if not isinstance(include_lok, list):
-        include_lok = ["0_na_adrese_OP", "1_meziobecni"]
+        include_lok = ["1_meziobecni", "3_v_ramci_obce"]
 
     origin_filters = get_nested(
         cfg,

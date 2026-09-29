@@ -13,6 +13,7 @@ except Exception:  # pragma: no cover
     gpd = None
 
 from sim.defaults import SIM_DEFAULTS
+from sim.datasets.csv_source import load_closures_csv, resolve_csv_path
 from sim.datasets.utils import (
     coerce_object_columns_for_parquet,
     ensure_dir,
@@ -49,9 +50,10 @@ def fetch_postgres_closures(
     Produces a parquet file with the same schema consumed by
     :func:`sim.network.closures.load_closures` (``lon``, ``lat``,
     ``severity``, ``start``, ``end``, ``road_ref``, ``description_cs``).
-    """
-    import psycopg2
 
+    Reads from a CSV dump instead when ``csv_path`` (or ``datasets.csv_dir``)
+    is configured -- see :mod:`sim.datasets.csv_source`.
+    """
     if gpd is None:
         raise RuntimeError("geopandas is required for postgres_closures provider")
 
@@ -68,6 +70,13 @@ def fetch_postgres_closures(
             "closures_parquet": str(cache_path),
             "closures_count": int(len(gdf)),
         }
+
+    csv_path = resolve_csv_path(cfg, source_cfg, "restrictions.csv")
+    if csv_path:
+        logger.info("closures: reading CSV dump %s", csv_path)
+        return _finalize_closures(cfg, source_cfg, load_closures_csv(csv_path), cache_path)
+
+    import psycopg2
 
     _db_defaults = SIM_DEFAULTS["datasets"]["closures_db"]
     db_cfg = cfg.get("closures_db") or {}
@@ -121,11 +130,22 @@ def fetch_postgres_closures(
     finally:
         conn.close()
 
+    return _finalize_closures(cfg, source_cfg, df, cache_path)
+
+
+def _finalize_closures(
+    cfg: Dict[str, Any],
+    source_cfg: Dict[str, Any],
+    df: pd.DataFrame,
+    cache_path: Path,
+) -> Dict[str, Any]:
+    """Clip, filter, derive severity/dates/geometry and write the parquet."""
+
     if df.empty:
-        logger.info("PostgreSQL closures: no rows returned")
+        logger.info("closures: no rows returned")
         return {"features": 0, "parquet": str(cache_path), "closures_count": 0}
 
-    logger.info("PostgreSQL closures: fetched %d rows", len(df))
+    logger.info("closures: fetched %d rows", len(df))
 
     bbox = load_aoi_bbox_wgs84(cfg)
     if bbox is not None:
@@ -137,29 +157,29 @@ def fetch_postgres_closures(
             & (df["lat"] >= s - margin) & (df["lat"] <= n + margin)
         )
         df = df[mask].copy()
-        logger.info("PostgreSQL closures: %d total -> %d in model area", before, len(df))
+        logger.info("closures: %d total -> %d in model area", before, len(df))
 
     if df.empty:
-        logger.info("PostgreSQL closures: no features in model area")
+        logger.info("closures: no features in model area")
         return {"features": 0, "parquet": str(cache_path), "closures_count": 0}
 
     if "status" in df.columns:
         unique_statuses = sorted(df["status"].dropna().unique().tolist())
-        logger.info("PostgreSQL closures: status values found: %s", unique_statuses)
+        logger.info("closures: status values found: %s", unique_statuses)
 
     status_whitelist = source_cfg.get("status_whitelist")
     if status_whitelist and "status" in df.columns:
         allowed = {str(s).strip().lower() for s in status_whitelist}
         before_status = len(df)
         df = df[df["status"].fillna("").astype(str).str.strip().str.lower().isin(allowed)].copy()
-        logger.info("PostgreSQL closures: status filter (%s): %d -> %d", ", ".join(sorted(allowed)), before_status, len(df))
+        logger.info("closures: status filter (%s): %d -> %d", ", ".join(sorted(allowed)), before_status, len(df))
 
     min_quality = source_cfg.get("min_quality_score")
     if min_quality is not None and "quality_score" in df.columns:
         threshold = int(min_quality)
         before_q = len(df)
         df = df[df["quality_score"].fillna(0).astype(int) >= threshold].copy()
-        logger.info("PostgreSQL closures: quality_score >= %d: %d -> %d", threshold, before_q, len(df))
+        logger.info("closures: quality_score >= %d: %d -> %d", threshold, before_q, len(df))
 
     min_observed_days = source_cfg.get("min_observed_days")
     if min_observed_days is not None and "first_seen" in df.columns and "last_seen" in df.columns:
@@ -170,10 +190,10 @@ def fetch_postgres_closures(
         before_dur = len(df)
         keep = duration.isna() | (duration >= min_days)
         df = df[keep].copy()
-        logger.info("PostgreSQL closures: min_observed_days=%s: %d -> %d", min_days, before_dur, len(df))
+        logger.info("closures: min_observed_days=%s: %d -> %d", min_days, before_dur, len(df))
 
     if df.empty:
-        logger.info("PostgreSQL closures: no features after filtering")
+        logger.info("closures: no features after filtering")
         return {"features": 0, "parquet": str(cache_path), "closures_count": 0}
 
     df["severity"] = df.apply(
@@ -232,7 +252,7 @@ def fetch_postgres_closures(
         df["line_geom"] = None
 
     n_with_line = int(df["line_geom"].notna().sum())
-    logger.info("PostgreSQL closures: %d/%d have line geometry", n_with_line, len(df))
+    logger.info("closures: %d/%d have line geometry", n_with_line, len(df))
 
     geometry = [Point(lon, lat) for lon, lat in zip(df["lon"], df["lat"])]
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
@@ -241,7 +261,7 @@ def fetch_postgres_closures(
     partial_count = int((gdf["severity"] == "lane_reduction").sum())
     speed_count = int((gdf["severity"] == "speed_limit").sum())
     logger.info(
-        "PostgreSQL closures: %d events in model area (%d full, %d lane_reduction, %d speed_limit)",
+        "closures: %d events in model area (%d full, %d lane_reduction, %d speed_limit)",
         len(gdf), full_count, partial_count, speed_count,
     )
 

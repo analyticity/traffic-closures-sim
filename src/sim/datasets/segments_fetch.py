@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover
     gpd = None
 
 from sim.defaults import SIM_DEFAULTS
+from sim.datasets.csv_source import load_segments_csv, resolve_csv_path
 from sim.datasets.utils import (
     coerce_object_columns_for_parquet,
     ensure_dir,
@@ -40,9 +41,10 @@ def fetch_postgres_segments(
     Produces ``road_segments.parquet`` with columns:
     ``id``, ``osm_id``, ``name``, ``road_ref``, ``road_class``,
     ``city``, ``max_speed``, ``lat``, ``lon``.
-    """
-    import psycopg2
 
+    Reads from a CSV dump instead when ``csv_path`` (or ``datasets.csv_dir``)
+    is configured -- see :mod:`sim.datasets.csv_source`.
+    """
     cache_dir = Path(cfg["datasets"]["cache_dir"])
     ensure_dir(cache_dir)
     cache_path = cache_dir / "road_segments.parquet"
@@ -54,6 +56,13 @@ def fetch_postgres_segments(
             "segments_parquet": str(cache_path),
             "segments_count": int(len(df)),
         }
+
+    csv_path = resolve_csv_path(cfg, source_cfg, "road_segments.csv")
+    if csv_path:
+        logger.info("road_segments: reading CSV dump %s", csv_path)
+        return _finalize_segments(cfg, load_segments_csv(csv_path), cache_path)
+
+    import psycopg2
 
     _db_defaults = SIM_DEFAULTS["datasets"]["closures_db"]
     db_cfg = cfg.get("closures_db") or {}
@@ -91,11 +100,21 @@ def fetch_postgres_segments(
     finally:
         conn.close()
 
+    return _finalize_segments(cfg, df, cache_path)
+
+
+def _finalize_segments(
+    cfg: Dict[str, Any],
+    df: pd.DataFrame,
+    cache_path: Path,
+) -> Dict[str, Any]:
+    """Clip to the model area, coerce types and write the parquet."""
+
     if df.empty:
-        logger.info("PostgreSQL road_segments: no rows returned")
+        logger.info("road_segments: no rows returned")
         return {"segments_count": 0, "segments_parquet": str(cache_path)}
 
-    logger.info("PostgreSQL road_segments: fetched %d rows", len(df))
+    logger.info("road_segments: fetched %d rows", len(df))
 
     bbox = load_aoi_bbox_wgs84(cfg)
     if bbox is not None:
@@ -107,7 +126,7 @@ def fetch_postgres_segments(
             & (df["lat"] >= s - margin) & (df["lat"] <= n + margin)
         )
         df = df[mask].copy()
-        logger.info("PostgreSQL road_segments: %d total -> %d in model area", before, len(df))
+        logger.info("road_segments: %d total -> %d in model area", before, len(df))
 
     for col in ("osm_id", "max_speed"):
         if col in df.columns:

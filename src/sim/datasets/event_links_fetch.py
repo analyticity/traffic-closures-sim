@@ -14,6 +14,7 @@ from typing import Any, Dict
 import pandas as pd
 
 from sim.defaults import SIM_DEFAULTS
+from sim.datasets.csv_source import load_event_links_csv, resolve_csv_path
 from sim.datasets.utils import (
     coerce_object_columns_for_parquet,
     ensure_dir,
@@ -37,9 +38,10 @@ def fetch_postgres_event_links(
     * ``event_links.parquet`` -- raw causal links between events
     * ``restriction_impact.parquet`` -- per-restriction aggregate:
       jam count, total delay, max delay, mean jam speed, etc.
-    """
-    import psycopg2
 
+    Reads from CSV dumps instead when ``csv_path`` (or ``datasets.csv_dir``)
+    is configured -- see :mod:`sim.datasets.csv_source`.
+    """
     cache_dir = Path(cfg["datasets"]["cache_dir"])
     ensure_dir(cache_dir)
     links_path = cache_dir / "event_links.parquet"
@@ -53,6 +55,15 @@ def fetch_postgres_event_links(
             "impact_parquet": str(impact_path),
             "event_links_count": int(len(df)),
         }
+
+    csv_path = resolve_csv_path(cfg, source_cfg, "event_links.csv")
+    if csv_path:
+        jams_csv = resolve_csv_path(cfg, source_cfg, "jams.csv", key="jams_csv_path")
+        logger.info("event_links: reading CSV dump %s", csv_path)
+        df = load_event_links_csv(csv_path, jams_csv_path=jams_csv)
+        return _finalize_event_links(df, links_path, impact_path)
+
+    import psycopg2
 
     _db_defaults = SIM_DEFAULTS["datasets"]["closures_db"]
     db_cfg = cfg.get("closures_db") or {}
@@ -103,15 +114,25 @@ def fetch_postgres_event_links(
     finally:
         conn.close()
 
+    return _finalize_event_links(df, links_path, impact_path)
+
+
+def _finalize_event_links(
+    df: pd.DataFrame,
+    links_path: Path,
+    impact_path: Path,
+) -> Dict[str, Any]:
+    """Coerce types, derive per-restriction impact stats and write parquets."""
+
     if df.empty:
-        logger.info("PostgreSQL event_links: no rows returned")
+        logger.info("event_links: no rows returned")
         return {
             "event_links_count": 0,
             "event_links_parquet": str(links_path),
             "impact_parquet": str(impact_path),
         }
 
-    logger.info("PostgreSQL event_links: fetched %d causal links", len(df))
+    logger.info("event_links: fetched %d causal links", len(df))
 
     for col in ("jam_delay_s", "jam_length_m", "jam_speed_kmh", "jam_speed_normal_kmh"):
         df[col] = pd.to_numeric(df[col], errors="coerce")

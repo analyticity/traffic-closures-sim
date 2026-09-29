@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover
     gpd = None
 
 from sim.defaults import SIM_DEFAULTS
+from sim.datasets.csv_source import load_jams_csv, resolve_csv_path
 from sim.datasets.utils import (
     coerce_object_columns_for_parquet,
     ensure_dir,
@@ -43,9 +44,10 @@ def fetch_postgres_jams(
     * ``jams.parquet`` -- individual jam observations
     * ``jams_segment_stats.parquet`` -- per-segment aggregated statistics
       (median speed, free-flow speed, jam frequency, etc.)
-    """
-    import psycopg2
 
+    Reads from CSV dumps instead when ``csv_path`` (or ``datasets.csv_dir``)
+    is configured -- see :mod:`sim.datasets.csv_source`.
+    """
     if gpd is None:
         raise RuntimeError("geopandas is required for postgres_jams provider")
 
@@ -62,6 +64,17 @@ def fetch_postgres_jams(
             "stats_parquet": str(stats_path),
             "jams_count": int(len(df)),
         }
+
+    csv_path = resolve_csv_path(cfg, source_cfg, "jams.csv")
+    if csv_path:
+        segments_csv = resolve_csv_path(
+            cfg, source_cfg, "road_segments.csv", key="segments_csv_path"
+        )
+        logger.info("jams: reading CSV dump %s", csv_path)
+        df = load_jams_csv(csv_path, segments_csv_path=segments_csv)
+        return _finalize_jams(cfg, df, jams_path, stats_path)
+
+    import psycopg2
 
     _db_defaults = SIM_DEFAULTS["datasets"]["closures_db"]
     db_cfg = cfg.get("closures_db") or {}
@@ -112,11 +125,22 @@ def fetch_postgres_jams(
     finally:
         conn.close()
 
+    return _finalize_jams(cfg, df, jams_path, stats_path)
+
+
+def _finalize_jams(
+    cfg: Dict[str, Any],
+    df: pd.DataFrame,
+    jams_path: Path,
+    stats_path: Path,
+) -> Dict[str, Any]:
+    """Clip to the model area, coerce types and write both parquets."""
+
     if df.empty:
-        logger.info("PostgreSQL jams: no rows returned")
+        logger.info("jams: no rows returned")
         return {"jams_count": 0, "jams_parquet": str(jams_path), "stats_parquet": str(stats_path)}
 
-    logger.info("PostgreSQL jams: fetched %d rows", len(df))
+    logger.info("jams: fetched %d rows", len(df))
 
     bbox = load_aoi_bbox_wgs84(cfg)
     if bbox is not None:
@@ -128,10 +152,10 @@ def fetch_postgres_jams(
             & (df["lat"] >= s - margin) & (df["lat"] <= n + margin)
         )
         df = df[mask].copy()
-        logger.info("PostgreSQL jams: %d total -> %d in model area", before, len(df))
+        logger.info("jams: %d total -> %d in model area", before, len(df))
 
     if df.empty:
-        logger.info("PostgreSQL jams: no features in model area")
+        logger.info("jams: no features in model area")
         return {"jams_count": 0, "jams_parquet": str(jams_path), "stats_parquet": str(stats_path)}
 
     for col in ("delay_seconds", "length_m", "speed_kmh", "speed_normal_kmh"):

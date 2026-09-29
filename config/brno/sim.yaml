@@ -37,6 +37,39 @@ osm:
 network:
   normalization_config: "config/brno/network_normalization.yaml"
 
+assignment:
+  # Jedno vlákno = deterministické poradie sčítania float čísel. Pri `cores: 0`
+  # (všetky jadrá) sa dva behy s identickým vstupom líšili na holdout R² o 0.010
+  # a objemy na jednotlivých linkoch o jednotky percent. Priradenie trvá ~1-2 s,
+  # takže réžia je zanedbateľná a reprodukovateľnosť za to stojí.
+  cores: 1
+
+  # Warm skimy sa zbiehali na rgap 0.0079 (default cieľ 0.02), takže každý beh
+  # dal mierne iné cestovné časy -> iná beta v `distribute` -> iný seed -> iná
+  # trajektória ODME. Zmerané: dva behy s IDENTICKÝM configom dali holdout
+  # R² 0.724 a 0.560. Beh je krátky (6 iterácií), tak si prísnejší cieľ môžeme
+  # dovoliť a je to podmienka reprodukovateľnosti.
+  warm_skim_pass:
+    max_iter: 200
+    rgap_target: 0.0005
+  bpr:
+    # Denný kapacitný faktor prepočítava hodinovú kapacitu na dennú. Defaulty
+    # dávajú vedľajším uliciam skoro to isté čo arteriálam (tertiary 11 proti
+    # motorway 13), takže obslužná ulica "unesie" za deň takmer toľko čo
+    # diaľnica a priradenie dopravu rozteká do bočných ulíc. To je presne obraz,
+    # ktorý dáva sklon < 1: model podstreľuje veľké úseky a nadstreľuje malé.
+    #
+    # Špičkovanie je na vedľajšej sieti výrazne plochejšie než na diaľnici, čo
+    # zodpovedá nižšiemu faktoru.
+    daily_capacity_factor:
+      by_link_type:
+        tertiary: 8.0
+        tertiary_link: 7.0
+        residential: 6.0
+        unclassified: 8.0
+        service: 4.0
+        living_street: 4.0
+
 zoning:
   # Zóny sa sťahujú z Overpassu; s cache sa to spraví raz a ďalšie behy
   # build-zones sú offline a reprodukovateľné. Zmazať pri zmene `sources`.
@@ -168,6 +201,20 @@ demand:
   sldb:
     external_processing:
       through_traffic_scale: 0.30
+  distribution:
+    # P0-3 / nález č. 1 z pipeline_detail.md: segment `other` sa modeloval
+    # dvakrát. build-demand ho vyrobí s trip_rate 1.0 / car_share 0.35 /
+    # occupancy 1.50 = 0,233 cesty na obyvateľa, a `distribute` mu potom vnúti
+    # okraje z pa_* (1.8 / 0.40 / 1.3 = 0,554), teda 2,37x viac. Po blende
+    # 55/45 z toho vyšiel seed 645 963 namiesto 559 939 z build-demand.
+    #
+    # ODME potom musela ten prebytok odobrať — drift -30 %. Zjednotenie oboch
+    # sád znamená, že distribúcia určuje TVAR matice (cez zamestnanosť), nie
+    # jej ÚROVEŇ. Atrakcie sa aj tak preškálujú na súčet produkcií, takže
+    # priestorová štruktúra zostáva nedotknutá; mení sa len mierka.
+    pa_trip_rate: 1.0
+    pa_car_share: 0.35
+    pa_occupancy: 1.50
 
 calibration:
   gateway_calibration:
@@ -176,8 +223,12 @@ calibration:
     max_factor: 1.20
   auto_screenlines:
     gateway_count_target: "motor_total"
+  # Experiment C: ODME smie prepísať celkový dopyt najviac o ±15 %. Bez toho
+  # uberala ~30 % bez ohľadu na štart (seed 646k -> 451k aj 560k -> 402k),
+  # pritom model sčítané úseky podstreľoval o 19 %.
+  max_total_drift_pct: 15.0
   odme:
-    max_outer_iterations: 48
+    max_outer_iterations: 4
     entropy_step_size: 0.15
     convergence_tol: 0.0008
     stall_patience: 20
@@ -186,9 +237,7 @@ calibration:
     assign_rgap_target: 0.004
     stages:
       - name: "stabilize"
-        max_iterations: 20
-      - name: "refine"
-        max_iterations: 35
+        max_iterations: 4
   screenlines_path: "config/brno/screenlines.yaml"
   matching:
     require_csd_road_ref_match: true
@@ -204,6 +253,22 @@ calibration:
 
 datasets:
   enabled: true
+  # Waze/NDIC dáta sa čítajú z CSV dumpov, nie zo živého Postgresu. Sú to
+  # dumpy tých istých tabuliek (`COPY ... TO CSV`), takže fetchery z nich
+  # postavia rovnaké parquety ako zo SQL — viď src/sim/datasets/csv_source.py.
+  #
+  # Dôvody: (1) DB je na dexteri za Docker-internou adresou a z kontajnera
+  # nie je dostupná vôbec, (2) dumpy sú zamrazený stav, takže vyhodnotenie
+  # je reprodukovateľné — DB sa dopĺňa ďalej a to isté query o mesiac vráti
+  # iné čísla.
+  #
+  # Očakávané názvy súborov = názvy tabuliek: jams.csv, road_segments.csv,
+  # restrictions.csv, event_links.csv. Jednotlivo sa dá prebiť `csv_path`
+  # na konkrétnom zdroji. Zmazať kľúč = návrat na Postgres.
+  #
+  # Rozsah dumpu (28. 8. 2026): jamy 2026-04-14 .. 2026-08-28 (283 869 riadkov,
+  # 8 469 segmentov), restrictions 1 504 (z toho 122 NDIC), event_links 103 616.
+  csv_dir: "data/data_vyhodnotenie_brno"
   employment:
     # Zamestnanosť sa odvádza z cieľov dochádzky SLDB, ktoré sú po obciach, takže
     # celé Brno má jeden riadok ("BRNO") a medzi 29 mestských častí sa musí

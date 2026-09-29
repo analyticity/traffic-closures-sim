@@ -139,6 +139,8 @@ def repair_boundary_scc(
 def repair_divided_highway_dead_ends(
     project: Project,
     max_snap_distance_m: float = 600.0,
+    *,
+    inherit_mainline_capacity: bool = False,
 ) -> Dict[str, Any]:
     """Connect dead-end carriageways of divided highways.
 
@@ -161,7 +163,8 @@ def repair_divided_highway_dead_ends(
 
     with project_db(project) as conn:
         rows = conn.execute(
-            "SELECT link_id, a_node, b_node, link_type, osm_ref_norm FROM links"
+            "SELECT link_id, a_node, b_node, link_type, osm_ref_norm, "
+            "capacity_ab, capacity_ba, lanes_ab, lanes_ba FROM links"
         ).fetchall()
 
         node_major: Dict[int, list] = defaultdict(list)
@@ -169,13 +172,21 @@ def repair_divided_highway_dead_ends(
         node_nonmajor_significant: Dict[int, int] = defaultdict(int)
         link_ref: Dict[int, str] = {}
         link_lt: Dict[int, str] = {}
+        link_capacity: Dict[int, float] = {}
+        link_lanes: Dict[int, int] = {}
 
-        for lid, a, b, lt, ref in rows:
+        for lid, a, b, lt, ref, cap_ab, cap_ba, lanes_ab, lanes_ba in rows:
             lt_str = str(lt or "")
             if lt_str in _MAJOR_ROAD_TYPES:
                 node_major[a].append(lid)
                 node_major[b].append(lid)
                 link_lt[int(lid)] = lt_str
+                caps = [float(c) for c in (cap_ab, cap_ba) if c not in (None, 0)]
+                if caps:
+                    link_capacity[int(lid)] = max(caps)
+                lns = [int(n) for n in (lanes_ab, lanes_ba) if n not in (None, 0)]
+                if lns:
+                    link_lanes[int(lid)] = max(lns)
                 if ref:
                     link_ref[lid] = str(ref)
             elif lt_str not in _IGNORE:
@@ -209,6 +220,8 @@ def repair_divided_highway_dead_ends(
     geod = Geod(ellps="WGS84")
     dead_ref = {nid: link_ref.get(lid, "") for nid, lid in dead_ends.items()}
     dead_lt = {nid: link_lt.get(int(lid), "motorway") for nid, lid in dead_ends.items()}
+    dead_cap = {nid: link_capacity.get(int(lid)) for nid, lid in dead_ends.items()}
+    dead_lanes = {nid: link_lanes.get(int(lid)) for nid, lid in dead_ends.items()}
 
     remaining = set(dead_ends.keys()) & set(node_coords.keys())
     pairs_to_create: list = []
@@ -303,9 +316,31 @@ def repair_divided_highway_dead_ends(
         # Penalty values: crossover links represent U-turns or service roads,
         # not mainline carriageways. Low speed + capacity discourages assignment
         # from routing through them unless no alternative exists.
-        spd = 20.0
-        cap_lane = 200.0
-        lanes = 1
+        #
+        # Known trade-off, measured on Brno (see plan_vyhodnotenia.md):
+        # when such a link is a *cut edge* -- the only connection between two
+        # parts of the network -- the assignment has no alternative and pushes
+        # the whole corridor through it.  Link 117202 carried 32,913 veh/day at
+        # capacity 200 (V/C 14.2), which BPR turned into 406,675 s = 113 h of
+        # congested time; that one link produced 96.8 % of the network's VHT and
+        # poisoned the skims `distribute` fits gravity beta on.
+        #
+        # Inheriting the mainline capacity fixes the VHT artefact but makes the
+        # connectors usable as shortcuts: tried on Brno, the model then
+        # over-assigned badly (gateway D1_W 112,415 modelled vs 59,095 observed,
+        # worst screenline 352 %).  So it is OFF by default -- the artefact is
+        # confined to VHT/VKT and the skims, which is the lesser evil, and
+        # `audit-supply` now reports any repair link that carries real flow.
+        if inherit_mainline_capacity:
+            spd = 30.0
+            neighbour_caps = [c for c in (dead_cap.get(n1), dead_cap.get(n2)) if c]
+            neighbour_lanes = [n for n in (dead_lanes.get(n1), dead_lanes.get(n2)) if n]
+            lanes = min(neighbour_lanes) if neighbour_lanes else 1
+            cap_lane = (min(neighbour_caps) / max(lanes, 1)) if neighbour_caps else 200.0
+        else:
+            spd = 20.0
+            cap_lane = 200.0
+            lanes = 1
         tt = (dist / 1000.0) / max(spd, 1.0) * 3600.0 if dist > 0 else 0.01
 
         links_api = project.network.links
@@ -345,8 +380,119 @@ def repair_divided_highway_dead_ends(
 
     refresh_network(project)
 
+    promoted = _promote_structural_repair_links(project, new_link_ids, dead_cap, dead_lanes)
+
     logger.info("Divided highway repair: connected %d carriageway pair(s)", len(connected_pairs))
-    return {"connected_pairs": len(connected_pairs), "new_link_ids": new_link_ids}
+    return {
+        "connected_pairs": len(connected_pairs),
+        "new_link_ids": new_link_ids,
+        "promoted_structural": promoted,
+    }
+
+
+def _promote_structural_repair_links(
+    project: Project,
+    new_link_ids: list,
+    dead_cap: Dict[int, Any],
+    dead_lanes: Dict[int, Any],
+) -> list:
+    """Give mainline attributes to repair links the network cannot route around.
+
+    The penalty values (20 km/h, 200 veh/h) exist to keep *optional* crossovers
+    unused.  Some of these links are not optional: they are the only directed
+    path to a group of nodes, so the assignment must push the full corridor
+    through them regardless of cost.  On Brno, link 117202 was the sole access
+    of gateway zone 8000000003 -- 33,414 veh/day at capacity 200, V/C 14.6, and
+    a congested time of 124 h that alone made up 96 % of the network's VHT.
+
+    The test is structural, not a volume threshold: drop the link and see
+    whether the largest strongly connected component loses nodes.  Only those
+    links are promoted; genuine crossovers keep the penalty and stay unused.
+    """
+    if not new_link_ids:
+        return []
+
+    links = project.network.links.data
+    if links is None or links.empty:
+        return []
+
+    base = _build_digraph(links)
+    base_scc = max(nx.strongly_connected_components(base), key=len, default=set())
+
+    # Nodes where demand actually enters or leaves the network.  Losing nodes
+    # that carry none of these costs the assignment nothing: no OD pair has to
+    # reach them, so the connector is optional and its penalty is doing its job.
+    # Losing a node with a connector is different -- a whole zone's demand has
+    # to squeeze through, and at 200 veh/h that produces the V/C blow-up this
+    # function exists to prevent.
+    connector_nodes: set = set()
+    lt_col = links.get("link_type")
+    if lt_col is not None:
+        conns = links[lt_col.astype(str) == "centroid_connector"]
+        connector_nodes = set(conns["a_node"].astype(int)) | set(conns["b_node"].astype(int))
+
+    id_col = links["link_id"].astype(int)
+    promoted = []
+    for lid in new_link_ids:
+        without = _build_digraph(links[id_col != int(lid)])
+        scc = max(nx.strongly_connected_components(without), key=len, default=set())
+        cut_off = base_scc - scc
+        lost = len(cut_off)
+        if lost <= 0:
+            continue
+
+        stranded_zones = cut_off & connector_nodes
+        if not stranded_zones:
+            logger.info(
+                "Divided highway repair: link %d isolates %d node(s) but none of "
+                "them carries a centroid connector — keeping the penalty",
+                lid, lost,
+            )
+            continue
+
+        row = links[id_col == int(lid)]
+        if row.empty:
+            continue
+        a, b = int(row.iloc[0]["a_node"]), int(row.iloc[0]["b_node"])
+        caps = [c for c in (dead_cap.get(a), dead_cap.get(b)) if c]
+        lns = [n for n in (dead_lanes.get(a), dead_lanes.get(b)) if n]
+        if not caps:
+            logger.warning(
+                "Divided highway repair: link %d is structurally required "
+                "(%d nodes depend on it, %d with a centroid connector) but no "
+                "adjacent mainline capacity was found — it stays penalised and "
+                "will distort VHT",
+                lid, lost, len(stranded_zones),
+            )
+            continue
+
+        capacity = min(caps)
+        lanes = min(lns) if lns else 1
+        # Speed stays below the mainline: the geometry was reconstructed, not
+        # imported, so the link should not become a preferred route.
+        speed = 80.0
+        with project_db(project) as conn:
+            conn.execute(
+                "UPDATE links SET capacity_ab=?, capacity_ba=?, lanes_ab=?, lanes_ba=?, "
+                "speed_ab=?, speed_ba=?, posted_speed_ab=?, posted_speed_ba=?, "
+                "travel_time_ab=distance*3.6/?, travel_time_ba=distance*3.6/? "
+                "WHERE link_id=?",
+                (capacity, capacity, lanes, lanes, speed, speed, speed, speed,
+                 speed, speed, int(lid)),
+            )
+        promoted.append({"link_id": int(lid), "nodes_depending": lost,
+                         "stranded_connector_nodes": len(stranded_zones),
+                         "capacity": capacity, "lanes": lanes})
+        logger.info(
+            "Divided highway repair: promoted link %d to mainline "
+            "(%d nodes depend on it, %d with a centroid connector, "
+            "capacity %.0f, %d lane(s), %.0f km/h)",
+            lid, lost, len(stranded_zones), capacity, lanes, speed,
+        )
+
+    if promoted:
+        refresh_network(project)
+    return promoted
 
 
 # ---------------------------------------------------------------------------

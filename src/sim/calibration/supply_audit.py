@@ -211,6 +211,53 @@ def run_supply_audit(config_path: str | Path = "config/brno/sim.yaml") -> Dict[s
     return report
 
 
+#: Capacity written by ``repair_divided_highway_dead_ends`` to make its
+#: crossover links unattractive.  A link that still carries flow at this
+#: capacity is a *cut edge* the assignment had no way around.
+_REPAIR_LINK_CAPACITY = 200.0
+_REPAIR_LINK_FLOW_WARN = 1000.0
+
+
+def _repair_link_load(merged) -> Dict[str, Any]:
+    """Flag divided-highway repair connectors that ended up carrying traffic.
+
+    These are deliberately given 20 km/h and 200 veh/h so the assignment avoids
+    them.  When one is the only connection between two parts of the network the
+    assignment must use it anyway, and BPR then turns the resulting V/C into an
+    absurd congested time -- on Brno one such link reached V/C 14.2 and 113 h,
+    producing 96.8 % of the whole network's VHT.  Volumes are unaffected, but
+    VHT, delay and the skim matrix are not trustworthy while this is happening.
+    """
+    try:
+        cand = merged[merged["audit_hourly_capacity"].between(1, _REPAIR_LINK_CAPACITY)]
+        loaded = cand[cand["audit_daily_volume"] > _REPAIR_LINK_FLOW_WARN]
+        if loaded.empty:
+            return {"n_repair_links_loaded": 0}
+
+        worst = loaded.nlargest(5, "audit_daily_volume")
+        detail = [
+            {
+                "link_id": int(r.link_id),
+                "link_type": str(getattr(r, "link_type", "")),
+                "volume": round(float(r.audit_daily_volume), 0),
+                "capacity": round(float(r.audit_hourly_capacity), 0),
+                "vc_ratio": round(float(r.vc_ratio), 2),
+            }
+            for r in worst.itertuples()
+        ]
+        logger.warning(
+            "  Repair-link load: %d penalised connector(s) carry >%.0f veh/day "
+            "(worst: link %d, %.0f veh/day at V/C %.1f). VHT, delay and skims "
+            "are distorted — treat them as unusable until this is fixed.",
+            len(loaded), _REPAIR_LINK_FLOW_WARN,
+            detail[0]["link_id"], detail[0]["volume"], detail[0]["vc_ratio"],
+        )
+        return {"n_repair_links_loaded": int(len(loaded)), "worst": detail}
+    except Exception:
+        logger.debug("repair-link load check skipped", exc_info=True)
+        return {"n_repair_links_loaded": None}
+
+
 def _compute_vc_diagnostics(
     output_dir: Path,
     db_path: Path,
@@ -289,6 +336,11 @@ def _compute_vc_diagnostics(
     merged.loc[is_oneway, "vc_ratio"] = vc_ab[is_oneway]
     merged.loc[~is_oneway, "vc_ratio"] = pd.concat([vc_ab[~is_oneway], vc_ba[~is_oneway]], axis=1).max(axis=1)
 
+    # Helper columns for the repair-link check below: hourly capacity and the
+    # daily volume actually assigned, regardless of direction.
+    merged["audit_hourly_capacity"] = pd.concat([cap_ab, cap_ba], axis=1).max(axis=1)
+    merged["audit_daily_volume"] = vol_ab + vol_ba
+
     total = len(merged)
     if total == 0:
         return {"available": False, "reason": "no_merged_links"}
@@ -313,6 +365,7 @@ def _compute_vc_diagnostics(
         "pct_vc_over_08": round(vc_over_08 / total * 100, 1),
         "pct_vc_over_05": round(vc_over_05 / total * 100, 1),
         "by_link_type": by_type,
+        "repair_link_load": _repair_link_load(merged),
     }
 
     if vc_over_1 / max(total, 1) > 0.05:
